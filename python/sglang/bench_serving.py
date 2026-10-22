@@ -103,6 +103,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    request_id: Optional[str] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -667,6 +668,12 @@ async def async_request_sglang_generate(
                                     f"SGLang request failed: {data['error']}"
                                 )
                             meta = data.get("meta_info", {})
+                            if isinstance(meta.get("id"), str):
+                                if output.request_id not in (None, meta["id"]):
+                                    raise ValueError(
+                                        "SGLang response request ID changed"
+                                    )
+                                output.request_id = meta["id"]
                             if "prompt_tokens" in meta:
                                 prompt_tokens = meta["prompt_tokens"]
                                 if type(prompt_tokens) is not int or prompt_tokens < 0:
@@ -1669,6 +1676,7 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "request_ids": [output.request_id for output in outputs],
     }
 
     # Append results to a JSONL file

@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -75,9 +76,52 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     else:
         extra_config = {}
 
+    if not isinstance(extra_config, dict):
+        raise ValueError("hisparse_config must be a JSON object")
+
+    backing_store = extra_config.pop("backing_store", "cpu")
+    if backing_store not in ("cpu", "mpu"):
+        raise ValueError("hisparse_config: backing_store must be 'cpu' or 'mpu'")
+    mpu_keys = {
+        "mpu_device_ids",
+        "mpu_capacity_ratio",
+        "mpu_memory_reserve_bytes",
+    }
+    if backing_store == "cpu" and mpu_keys.intersection(extra_config):
+        raise ValueError("hisparse_config: MPU options require backing_store='mpu'")
+    mpu_device_ids = extra_config.pop("mpu_device_ids", [1])
+    mpu_capacity_ratio = extra_config.pop("mpu_capacity_ratio", 2.0)
+    mpu_memory_reserve_bytes = extra_config.pop("mpu_memory_reserve_bytes", 1 << 30)
+    if backing_store == "mpu":
+        if not getattr(server_args, "enable_hisparse", False):
+            raise ValueError("MPU backing storage requires --enable-hisparse")
+        if (
+            not isinstance(mpu_device_ids, list)
+            or not 1 <= len(mpu_device_ids) <= 4
+            or any(type(i) is not int or i < 0 for i in mpu_device_ids)
+            or len(set(mpu_device_ids)) != len(mpu_device_ids)
+        ):
+            raise ValueError(
+                "hisparse_config: mpu_device_ids must contain 1 to 4 unique "
+                "nonnegative CUDA-visible ordinals"
+            )
+        if getattr(server_args, "base_gpu_id", 0) in mpu_device_ids:
+            raise ValueError("MPU storage devices must differ from --base-gpu-id")
+        if (
+            isinstance(mpu_capacity_ratio, bool)
+            or not isinstance(mpu_capacity_ratio, (int, float))
+            or not math.isfinite(mpu_capacity_ratio)
+            or mpu_capacity_ratio <= 0
+        ):
+            raise ValueError("mpu_capacity_ratio must be finite and positive")
+        if type(mpu_memory_reserve_bytes) is not int or mpu_memory_reserve_bytes < 0:
+            raise ValueError("mpu_memory_reserve_bytes must be a nonnegative integer")
+
     top_k = extra_config.pop("top_k", 2048)
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
+    if type(host_to_device_ratio) is not int or host_to_device_ratio <= 0:
+        raise ValueError("host_to_device_ratio must be a positive integer")
 
     if device_buffer_size < top_k:
         raise ValueError(
@@ -85,6 +129,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         )
 
     algorithm = extra_config.pop("algorithm", None)
+    if backing_store == "mpu" and algorithm != "quest":
+        raise ValueError("MPU backing storage requires algorithm='quest'")
     backend = extra_config.pop("backend", None)
     min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
     page_size = extra_config.pop("page_size", None)
@@ -104,6 +150,10 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         top_k=top_k,
         device_buffer_size=device_buffer_size,
         host_to_device_ratio=host_to_device_ratio,
+        backing_store=backing_store,
+        mpu_device_ids=mpu_device_ids,
+        mpu_capacity_ratio=float(mpu_capacity_ratio),
+        mpu_memory_reserve_bytes=mpu_memory_reserve_bytes,
         algorithm=algorithm,
         backend=backend,
         page_size=page_size,

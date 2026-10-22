@@ -540,6 +540,8 @@ class Envs:
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
+    # Opt-in batch CUDA traces for single-compute-GPU HiSparse benchmarks.
+    SGLANG_HISPARSE_TIMING_DIR = EnvStr("")
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).

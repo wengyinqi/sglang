@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import time
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.observability.hisparse_timing import HiSparseForwardTimer
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -98,6 +99,13 @@ class SchedulerMetricsMixin:
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
+        self.hisparse_forward_timer = HiSparseForwardTimer.create(
+            envs.SGLANG_HISPARSE_TIMING_DIR.get(),
+            self.server_args,
+            tp_rank,
+            pp_rank,
+            dp_rank,
+        )
 
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
@@ -921,17 +929,24 @@ class SchedulerMetricsMixin:
 
     @contextmanager
     def record_forward_metrics(self: Scheduler, batch: ScheduleBatch):
-        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+        metrics_enabled = self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER
+        timer = self.hisparse_forward_timer
+        if not (metrics_enabled or timer is not None):
             yield
             return
 
-        category = "forward_" + batch.forward_mode.name.lower()
-        with self.forward_pass_device_timer.wrap(
-            metadata=dict(
-                category=category,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            ),
-        ):
+        with ExitStack() as stack:
+            if metrics_enabled:
+                stack.enter_context(
+                    self.forward_pass_device_timer.wrap(
+                        metadata=dict(
+                            category="forward_" + batch.forward_mode.name.lower(),
+                            dp_cooperation_info=batch.dp_cooperation_info,
+                        ),
+                    )
+                )
+            if timer is not None:
+                stack.enter_context(timer.wrap(batch))
             yield
 
     @contextmanager

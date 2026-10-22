@@ -145,6 +145,17 @@ class TestNativeBenchmarkAccounting(unittest.TestCase):
         self.assertEqual(result.generated_text, "a")
         self.assertEqual(len(result.itl), 7)
 
+    def test_request_id_links_stream_to_scheduler_timing(self):
+        first, final = _frame(1), _frame(8, finished=True)
+        first["meta_info"]["id"] = final["meta_info"]["id"] = "request-a"
+        result = self._run([first, final])
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.request_id, "request-a")
+        final["meta_info"]["id"] = "request-b"
+        result = self._run([first, final])
+        self.assertFalse(result.success)
+        self.assertIn("request ID changed", result.error)
+
     def test_truncated_stream_is_not_a_completed_request(self):
         for frames in (
             [],

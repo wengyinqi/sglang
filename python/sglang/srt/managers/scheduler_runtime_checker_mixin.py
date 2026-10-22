@@ -49,6 +49,7 @@ class PoolStats:
     hisparse_device_token_usage: Optional[float] = None
     hisparse_host_tokens: Optional[int] = None
     hisparse_host_token_usage: Optional[float] = None
+    hisparse_backing_store: str = "cpu"
 
     def get_kv_token_stats(self) -> Tuple[int, float]:
         # NOTE: mamba pool is not included in the "token usage" calculation.
@@ -108,8 +109,8 @@ class PoolStats:
             parts += [
                 f"#gpu token: {self.hisparse_device_tokens}",
                 f"gpu token usage: {self.hisparse_device_token_usage:.2f}",
-                f"#cpu token: {self.hisparse_host_tokens}",
-                f"cpu token usage: {self.hisparse_host_token_usage:.2f}",
+                f"#{self.hisparse_backing_store} token: {self.hisparse_host_tokens}",
+                f"{self.hisparse_backing_store} token usage: {self.hisparse_host_token_usage:.2f}",
             ]
         if not parts:
             parts.append(
@@ -211,6 +212,7 @@ class SchedulerRuntimeCheckerMixin:
                 hisparse_device_token_usage=h.device_token_usage,
                 hisparse_host_tokens=h.host_tokens,
                 hisparse_host_token_usage=h.host_token_usage,
+                hisparse_backing_store=self.hisparse_coordinator.backing_store,
             )
         return pool_stats
 
@@ -537,6 +539,20 @@ class SchedulerRuntimeCheckerMixin:
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
             return
+
+        if self.hisparse_forward_timer is not None:
+            self.hisparse_forward_timer.flush_idle()
+
+        if self.hisparse_coordinator is not None:
+            capacity = self.hisparse_coordinator.get_mpu_capacity_info()
+            if capacity is not None and (
+                capacity["used_mpu_slots"] or capacity["reserved_mpu_slots"]
+            ):
+                self._report_leak(
+                    "MPU backing",
+                    f"Idle MPU has {capacity['used_mpu_slots']} allocated slots and "
+                    f"{capacity['reserved_mpu_slots']} reserved slots",
+                )
 
         # memory leak check
         has_leak, messages = self._check_all_pools(self.get_pool_stats())

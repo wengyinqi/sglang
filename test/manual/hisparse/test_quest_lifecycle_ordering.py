@@ -87,6 +87,7 @@ def _coordinator_type(device):
         "admit_request_into_staging",
         "collect_ready_reqs",
         "abort_staging_request",
+        "release_mpu_request",
     }
     cls.body = [
         n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names
@@ -170,6 +171,13 @@ class TestQuestStagingOrdering(unittest.TestCase):
         self.assertEqual(coord.collect_ready_reqs(), [req])
         self.assertEqual(coord.released, [("device", 10)])
         self.assertFalse(req.hisparse_staging)
+
+    def test_real_admission_clears_graph_capture_backing_sentinels(self):
+        _, coord, req = self._fixture()
+        coord.req_to_host_pool = torch.zeros(1, 128, dtype=torch.int64)
+        coord.admit_request_into_staging(req)
+        self.assertTrue(torch.equal(coord.req_to_host_pool[0, :64], torch.arange(64)))
+        self.assertTrue(torch.all(coord.req_to_host_pool[0, 64:] == -1))
 
     def test_non_quest_admission_waits_only_for_host_copy(self):
         device, coord, req = self._fixture(mode="dsa_native")

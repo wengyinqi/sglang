@@ -20,6 +20,7 @@ from sglang.srt.utils import get_device_module
 device_module = get_device_module()
 
 from sglang.jit_kernel.hisparse import (
+    load_cache_from_mpu_to_device_buffer_mha,
     load_cache_to_device_buffer_mha,
     load_cache_to_device_buffer_mla,
 )
@@ -64,7 +65,15 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         mode: str = MODE_DSA_NATIVE,
         quest_algorithm: Optional["QuestAlgorithm"] = None,
+        backing_store: str = "cpu",
+        mpu_device_ids: Optional[List[int]] = None,
+        mpu_capacity_ratio: float = 2.0,
+        mpu_memory_reserve_bytes: int = 1 << 30,
     ):
+        if backing_store not in ("cpu", "mpu"):
+            raise ValueError("HiSparse backing_store must be 'cpu' or 'mpu'")
+        if backing_store == "mpu" and mode != MODE_QUEST:
+            raise ValueError("MPU backing currently requires Quest MHA/GQA")
         if mode not in _VALID_MODES:
             raise ValueError(
                 f"Unknown HiSparseCoordinator mode {mode!r}; expected one of {_VALID_MODES}"
@@ -91,6 +100,7 @@ class HiSparseCoordinator:
             )
 
         self.mode = mode
+        self.backing_store = backing_store
         self.quest_algorithm = quest_algorithm
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -123,13 +133,33 @@ class HiSparseCoordinator:
                     f"mode='quest' requires HiSparseMHATokenToKVPool, got "
                     f"{type(self.mem_pool_device).__name__}"
                 )
-            self.mem_pool_host = MHATokenToKVPoolHost(
-                device_pool=self.mem_pool_device,
-                host_to_device_ratio=host_to_device_ratio,
-                host_size=0,
-                page_size=1,
-                layout="layer_first",
-            )
+            if backing_store == "mpu":
+                from sglang.srt.mem_cache.mpu_memory_pool import MPUMHATokenToKVPool
+
+                self.mem_pool_host = MPUMHATokenToKVPool(
+                    device_pool=self.mem_pool_device,
+                    storage_device_ids=mpu_device_ids or [],
+                    host_to_device_ratio=mpu_capacity_ratio,
+                    page_size=1,
+                    layout="layer_first",
+                    memory_reserve_bytes=mpu_memory_reserve_bytes,
+                )
+            else:
+                self.mem_pool_host = MHATokenToKVPoolHost(
+                    device_pool=self.mem_pool_device,
+                    host_to_device_ratio=host_to_device_ratio,
+                    host_size=0,
+                    page_size=1,
+                    layout="layer_first",
+                )
+
+        # Preserve the coordinator's historical host-pool names as the
+        # backing-store interface. In MPU mode no host KV pool is created.
+        self.mpu_budget = None
+        if backing_store == "mpu":
+            from sglang.srt.mem_cache.mpu_admission import MPUAdmissionBudget
+
+            self.mpu_budget = MPUAdmissionBudget(self.mem_pool_host.size)
 
         max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -209,6 +239,62 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    def mpu_request_error(self, req: Req) -> Optional[str]:
+        if self.mpu_budget is None:
+            return None
+        if getattr(req, "session", None) is not None:
+            return "MPU HiSparse currently requires independent, non-session requests"
+        needed = len(req.origin_input_ids) + req.sampling_params.max_new_tokens
+        if needed > self.mpu_budget.capacity:
+            return (
+                f"MPU KV capacity {self.mpu_budget.capacity} cannot hold this "
+                f"request's input + max_new_tokens ({needed})"
+            )
+        return None
+
+    def reserve_mpu_request(self, req: Req) -> bool:
+        if self.mpu_budget is None:
+            return True
+        if (
+            getattr(req, "to_finish", None) is not None
+            or getattr(req, "finished_reason", None) is not None
+        ):
+            # Validation errors use a dummy prefill to return the error. The
+            # original invalid length may leave a negative max_new_tokens;
+            # these requests never enter backing storage or need a lease.
+            return True
+        # Reserve the complete request before its first prefill chunk. Logical
+        # slots are early-freed after staging, so they cannot bound full KV.
+        return self.mpu_budget.reserve(
+            req.rid, len(req.origin_input_ids) + req.sampling_params.max_new_tokens
+        )
+
+    def release_mpu_request(self, req: Req) -> None:
+        if getattr(self, "mpu_budget", None) is not None:
+            self.mpu_budget.release(req.rid)
+
+    def get_mpu_capacity_info(self) -> Optional[dict]:
+        if self.backing_store != "mpu":
+            return None
+        pool = self.mem_pool_host
+        return {
+            **pool.capacity_info,
+            "backing_store": "mpu",
+            "compute_device_id": pool.compute_device.index,
+            "physical_compute_slots": self.mem_pool_device.size,
+            "usable_mpu_slots": pool.size,
+            "allocated_mpu_bytes": pool.capacity_info["allocated_bytes"],
+            "compute_kv_bytes": self.mem_pool_device.size * pool.size_per_token,
+            "requested_capacity_ratio": pool.capacity.requested_ratio,
+            "effective_capacity_ratio": pool.capacity.actual_ratio,
+            "reserved_mpu_slots": self.mpu_budget.reserved,
+            "used_mpu_slots": pool.size - pool.available_size(),
+        }
+
+    def close(self) -> None:
+        if self.backing_store == "mpu":
+            self.mem_pool_host.close()
+
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         device_capacity = device_allocator.size
@@ -247,6 +333,10 @@ class HiSparseCoordinator:
                 f"HiSparse host mem pool alloc failed for {prefill_len} tokens"
             )
         host_indices = host_indices.to(device=self.device)
+        # Graph capture seeds the whole row with pad slot 0. A real request's
+        # unbacked tail (including its newest decode token) must instead be -1
+        # so completion never frees a pad/another request's backing slot.
+        self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool[req.req_pool_idx, :prefill_len] = host_indices
 
         start_event = device_module.Event()
@@ -315,6 +405,10 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
+        if self.backing_store == "mpu":
+            raise RuntimeError(
+                "MPU supports NoPD staging only; no direct-host/RDMA path"
+            )
         self.alloc_device_buffer(req)
 
         if req.kv_allocated_len <= self.device_buffer_size:
@@ -839,6 +933,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
+        self.release_mpu_request(req)
 
     def retract_req(self, req: Req) -> None:
         if req.hisparse_staging:
@@ -889,6 +984,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self.release_mpu_request(req)
 
     def swap_in_selected_pages(
         self,
@@ -934,15 +1030,25 @@ class HiSparseCoordinator:
             num_real_reqs=self.num_real_reqs,
         )
         if self.mode == MODE_QUEST:
-            # MHA: separate K and V buffers on host (k_buffer/v_buffer
-            # properties on MHATokenToKVPoolHost) and on device.
-            load_cache_to_device_buffer_mha(
-                host_k_cache=self.mem_pool_host.k_buffer[layer_id],
-                host_v_cache=self.mem_pool_host.v_buffer[layer_id],
-                device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
-                device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
-                **common_kwargs,
-            )
+            if self.backing_store == "mpu":
+                common_kwargs["mpu_cache_locs"] = common_kwargs.pop("host_cache_locs")
+                load_cache_from_mpu_to_device_buffer_mha(
+                    peer_ptrs=self.mem_pool_host.peer_ptrs,
+                    shard_rows=self.mem_pool_host.shard_rows,
+                    peer_rows=self.mem_pool_host.size,
+                    layer_id=layer_id,
+                    device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
+                    device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
+                    **common_kwargs,
+                )
+            else:
+                load_cache_to_device_buffer_mha(
+                    host_k_cache=self.mem_pool_host.k_buffer[layer_id],
+                    host_v_cache=self.mem_pool_host.v_buffer[layer_id],
+                    device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
+                    device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
+                    **common_kwargs,
+                )
         else:
             # MLA: combined K/V in a single buffer.
             load_cache_to_device_buffer_mla(

@@ -53,6 +53,63 @@ def load_method(relative_path, class_name, method_name, parent=None):
     )
 
 
+class TestHiSparseCaptureState(unittest.TestCase):
+    def test_staging_slots_bound_new_request_admission(self):
+        available = load_method(
+            "python/sglang/srt/managers/scheduler.py",
+            "Scheduler",
+            "get_num_allocatable_reqs",
+        )
+        available.__globals__["get_global_server_args"] = lambda: SimpleNamespace(
+            pp_max_micro_batch_size=8
+        )
+        scheduler = SimpleNamespace(
+            pp_size=1,
+            enable_hisparse=True,
+            req_to_token_pool=SimpleNamespace(available_size=lambda: 0),
+        )
+        self.assertEqual(available(scheduler, 0), 0)
+        scheduler.req_to_token_pool.available_size = lambda: 2
+        self.assertEqual(available(scheduler, 1), 2)
+        scheduler.enable_hisparse = False
+        self.assertEqual(available(scheduler, 1), 7)
+
+    def test_capture_initializes_the_table_consumed_by_resolver(self):
+        capture = load_method(
+            "python/sglang/srt/layers/attention/flashinfer_hisparse_backend.py",
+            "FlashInferHiSparseDecodeBackend",
+            "init_forward_metadata_capture_cuda_graph",
+        )
+        coord = SimpleNamespace(
+            req_to_host_pool=torch.full((3, 128), -1, dtype=torch.int64),
+            req_to_device_buffer=torch.zeros(3, 65, dtype=torch.int64),
+            req_device_buffer_token_locs=torch.full((2, 3, 65), -1, dtype=torch.int32),
+            num_real_reqs=torch.zeros(1, dtype=torch.int32),
+        )
+        backend = SimpleNamespace(
+            coord=coord,
+            quest=SimpleNamespace(prepare_step=Mock()),
+            _get_or_create_wrapper=Mock(),
+            _plan_for_step=Mock(),
+            _cached_sm_scale=None,
+            _cached_logits_soft_cap=None,
+            head_dim=128,
+        )
+        capture(
+            backend,
+            2,
+            2,
+            torch.tensor([0, 1]),
+            torch.ones(2, dtype=torch.int32),
+            None,
+            None,
+            None,
+        )
+        self.assertTrue(torch.all(coord.req_device_buffer_token_locs[:, :2] == 0))
+        self.assertTrue(torch.all(coord.req_device_buffer_token_locs[:, 2] == -1))
+        self.assertEqual(coord.num_real_reqs.item(), 2)
+
+
 class TestQuestConfiguration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -5742,7 +5742,11 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
-            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
+            "backing_store defaults to cpu; mpu supports algorithm=quest with "
+            "mpu_device_ids (1-4 CUDA-visible storage ordinals), mpu_capacity_ratio "
+            "(total backing slots / physical compute slots, default 2.0), and "
+            "mpu_memory_reserve_bytes (per storage GPU, default 1073741824). "
+            'Example: \'{"algorithm": "quest", "backing_store": "mpu", "mpu_device_ids": [1]}\'',
         )
 
         # LMCache
@@ -6622,6 +6626,14 @@ class ServerArgs:
         return max(FLA_CHUNK_SIZE, self.page_size)
 
     def check_server_args(self):
+        # Parse even with HiSparse disabled: MPU options must never be silently
+        # accepted while the server uses a different KV backing store.
+        if self.hisparse_config is not None:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            if parse_hisparse_config(self).backing_store == "mpu":
+                self._check_mpu_server_args()
+
         # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size
@@ -6861,6 +6873,48 @@ class ServerArgs:
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
+
+    def _check_mpu_server_args(self):
+        """MPU simulation currently has one CUDA compute rank and MHA/GQA KV."""
+        from sglang.srt.configs.model_config import AttentionArch
+
+        if not self.enable_hisparse:
+            raise ValueError("MPU backing storage requires --enable-hisparse")
+        if self.device is None or not self.device.startswith("cuda"):
+            raise ValueError("MPU backing storage requires a CUDA compute device")
+        for name in ("tp_size", "dp_size", "pp_size", "ep_size", "nnodes"):
+            if getattr(self, name) != 1:
+                raise ValueError(
+                    f"MPU backing storage requires --{name.replace('_', '-')} 1"
+                )
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "MPU backing storage does not support speculative decoding"
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "MPU backing storage requires colocated prefill and decode"
+            )
+        if self.kv_cache_dtype != "bfloat16":
+            raise ValueError("MPU backing storage requires bfloat16 KV cache")
+        if self.cpu_offload_gb > 0 or self.offload_group_size > 0:
+            raise ValueError(
+                "MPU backing storage does not support CPU weight offloading"
+            )
+        if (
+            self.enable_hierarchical_cache
+            or self.enable_lmcache
+            or self.disaggregation_decode_enable_offload_kvcache
+        ):
+            raise ValueError("MPU backing storage does not support CPU KV offloading")
+        model_config = self.get_model_config()
+        if (
+            model_config.attention_arch != AttentionArch.MHA
+            or model_config.is_hybrid_swa
+            or get_linear_attn_spec_by_arch(model_config.hf_config.architectures[0])
+            is not None
+        ):
+            raise ValueError("MPU backing storage requires ordinary MHA/GQA KV pools")
 
     def _check_quest_server_args(self):
         """Validate the serving paths with Quest bounds lifecycle hooks."""

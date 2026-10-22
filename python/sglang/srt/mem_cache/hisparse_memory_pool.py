@@ -262,9 +262,20 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: NSATokenToKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
+        logical_token_capacity: Optional[int] = None,
     ):
         self._kvcache = kvcache
-        self._size_full = size * host_to_device_ratio
+        if logical_token_capacity is None:
+            logical_token_capacity = size * host_to_device_ratio
+        elif (
+            type(logical_token_capacity) is not int
+            or logical_token_capacity <= 0
+            or logical_token_capacity % page_size
+        ):
+            raise ValueError(
+                "HiSparse logical_token_capacity must contain a positive whole number of pages"
+            )
+        self._size_full = logical_token_capacity
         self._size_hisparse = size
         self.dtype = dtype
         self.device = device

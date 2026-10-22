@@ -1998,6 +1998,13 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if self.hisparse_coordinator is not None:
+            error_msg = self.hisparse_coordinator.mpu_request_error(req)
+            if error_msg:
+                prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                self.stream_output([req], req.return_logprob)
+                return
+
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
             recv_req.logprob_start_len = -1
@@ -2418,7 +2425,9 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        if self.pp_size > 1:
+        if self.pp_size > 1 or self.enable_hisparse:
+            # Staging owns request slots while absent from running_batch.
+            # Existing chunked prefills bypass new-request admission below.
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -2562,12 +2571,23 @@ class Scheduler(
                     req.rid
                 )
 
+            if self.hisparse_coordinator is not None:
+                if not self.hisparse_coordinator.reserve_mpu_request(req):
+                    # Full backing KV survives logical-slot early release.
+                    # Leave this request queued until a complete lease fits.
+                    continue
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if self.hisparse_coordinator is not None and (
+                not adder.can_run_list or req is not adder.can_run_list[-1]
+            ):
+                self.hisparse_coordinator.release_mpu_request(req)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3265,6 +3285,12 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        # The benchmark needs actual capacity after memory profiling/clamping.
+        ret["max_total_num_tokens"] = int(self.max_total_num_tokens)
+        if self.hisparse_coordinator is not None:
+            capacity = self.hisparse_coordinator.get_mpu_capacity_info()
+            if capacity is not None:
+                ret["hisparse_mpu_capacity"] = capacity
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
@@ -3355,6 +3381,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.release_mpu_request(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -3383,6 +3411,17 @@ class Scheduler(
         # The request will still run one prefill forward pass.
         # In this case, we change the input_ids to be only one token to make this prefill cheap.
         self.grammar_manager.abort_requests(recv_req)
+
+        if self.hisparse_coordinator is not None:
+            # A staged request is in neither waiting_queue nor running_batch.
+            # Drain peer stores before recycling its backing and compute slots.
+            for act in list(self.hisparse_coordinator.ack_staging_queue):
+                req = act.req
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    self.hisparse_coordinator.abort_staging_request(req)
+                    release_kv_cache(req, self.tree_cache)
+                    prepare_abort(req, "Request aborted during HiSparse staging")
+                    self.stream_output([req], req.return_logprob)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

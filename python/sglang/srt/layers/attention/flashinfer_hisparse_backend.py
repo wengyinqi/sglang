@@ -111,9 +111,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         # kv_indices_buf has +1 slot at the end used as a scatter scratch
         # by the graph-safe scatter-pack (writes for invalid positions
         # land here harmlessly).
-        self._kv_indptr_buf = torch.zeros(
-            max_bs + 1, dtype=torch.int32, device=device
-        )
+        self._kv_indptr_buf = torch.zeros(max_bs + 1, dtype=torch.int32, device=device)
         self._kv_indices_buf = torch.zeros(
             max_bs * self.top_k + 1, dtype=torch.int32, device=device
         )
@@ -139,12 +137,16 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         # hooks and read per layer for the scatter mask.  Stable buffer
         # so cuda graph sees the same tensor across capture/replay.
         self._actual_lens_buf = torch.zeros(
-            max_bs, dtype=torch.int32, device=device,
+            max_bs,
+            dtype=torch.int32,
+            device=device,
         )
         # Pre-built [0, top_k) range used in the scatter mask; allocated
         # once to keep forward_decode allocation-free.
         self._range_top_k = torch.arange(
-            self.top_k, dtype=torch.int32, device=device,
+            self.top_k,
+            dtype=torch.int32,
+            device=device,
         )
 
         # FlashInfer wrapper class kept as an instance attribute so that
@@ -152,6 +154,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         self._WrapperCls = BatchDecodeWithPagedKVCacheWrapper
 
         from flashinfer import fast_decode_plan
+
         self._fast_decode_plan = fast_decode_plan
         # Capture-time sm_scale + logits_soft_cap (set on first plan).
         self._cached_sm_scale: Optional[float] = None
@@ -257,7 +260,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             page_size=1,
-            sm_scale=1.0 / (self.head_dim ** 0.5),
+            sm_scale=1.0 / (self.head_dim**0.5),
             data_type=self.kv_data_type,
             q_data_type=self.q_data_type,
             non_blocking=True,
@@ -284,7 +287,9 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         """
         if worst_case:
             actual_lens_cpu = torch.full(
-                (bs,), self.top_k, dtype=torch.int32,
+                (bs,),
+                self.top_k,
+                dtype=torch.int32,
             )
         else:
             if seq_lens_cpu is None:
@@ -348,7 +353,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         sm_scale = (
             self._cached_sm_scale
             if self._cached_sm_scale is not None
-            else 1.0 / (self.head_dim ** 0.5)
+            else 1.0 / (self.head_dim**0.5)
         )
         self._plan_for_step(
             bs=bs,
@@ -409,6 +414,9 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
             unique_slots = req_pool_indices[:bs_int].long().unique()
             self.coord.req_to_host_pool[unique_slots] = 0
             self.coord.req_to_device_buffer[unique_slots] = 0
+            # The resolver reads this per-layer table, not req_to_device_buffer.
+            # Capture must use the valid pad row even before any real admission.
+            self.coord.req_device_buffer_token_locs[:, unique_slots, :] = 0
             self.coord.num_real_reqs[0] = bs_int
 
         # Cache step-level state with placeholder seq_lens for capture.
@@ -419,7 +427,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         sm_scale = (
             self._cached_sm_scale
             if self._cached_sm_scale is not None
-            else 1.0 / (self.head_dim ** 0.5)
+            else 1.0 / (self.head_dim**0.5)
         )
         self._plan_for_step(
             bs=bs_int,
@@ -461,14 +469,12 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         sm_scale = (
             self._cached_sm_scale
             if self._cached_sm_scale is not None
-            else 1.0 / (self.head_dim ** 0.5)
+            else 1.0 / (self.head_dim**0.5)
         )
         self._plan_for_step(
             bs=bs_int,
             seq_lens=seq_lens[:bs_int],
-            seq_lens_cpu=(
-                seq_lens_cpu[:bs_int] if seq_lens_cpu is not None else None
-            ),
+            seq_lens_cpu=(seq_lens_cpu[:bs_int] if seq_lens_cpu is not None else None),
             sm_scale=sm_scale,
             logits_soft_cap=self._cached_logits_soft_cap,
             worst_case=False,

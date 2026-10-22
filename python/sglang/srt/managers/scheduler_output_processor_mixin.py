@@ -196,6 +196,10 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
+                        if self.hisparse_coordinator is not None:
+                            # A request can finish on its prefill token before
+                            # it ever owns a hot buffer or backing KV slots.
+                            self.hisparse_coordinator.release_mpu_request(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:

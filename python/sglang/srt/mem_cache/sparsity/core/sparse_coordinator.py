@@ -1,4 +1,5 @@
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -58,6 +59,10 @@ class SparseConfig:
     top_k: int = 2048
     device_buffer_size: int = 4096
     host_to_device_ratio: int = 2
+    backing_store: str = "cpu"
+    mpu_device_ids: list[int] = field(default_factory=lambda: [1])
+    mpu_capacity_ratio: float = 2.0
+    mpu_memory_reserve_bytes: int = 1 << 30
     algorithm: Optional[str] = None
     backend: Optional[str] = None
     page_size: Optional[int] = None
@@ -69,6 +74,24 @@ class SparseConfig:
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm
+
+    @property
+    def backing_capacity_ratio(self) -> float:
+        """Backing slots per physical compute slot, across all storage GPUs."""
+        return (
+            self.mpu_capacity_ratio
+            if self.backing_store == "mpu"
+            else self.host_to_device_ratio
+        )
+
+    def logical_token_capacity(self, physical_tokens: int, page_size: int) -> int:
+        """Logical address capacity; MPU shard padding is never exposed."""
+        if self.backing_store == "cpu":
+            return physical_tokens * self.host_to_device_ratio
+        capacity = math.ceil(physical_tokens * self.mpu_capacity_ratio)
+        # The allocator consumes complete pages, but the backing pool exposes
+        # exactly ceil(physical_tokens * ratio) slots before shard padding.
+        return capacity // page_size * page_size
 
 
 class SparseCoordinator:

@@ -754,6 +754,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                     mode=MODE_QUEST,
                     quest_algorithm=quest,
+                    backing_store=hisparse_cfg.backing_store,
+                    mpu_device_ids=hisparse_cfg.mpu_device_ids,
+                    mpu_capacity_ratio=hisparse_cfg.mpu_capacity_ratio,
+                    mpu_memory_reserve_bytes=hisparse_cfg.mpu_memory_reserve_bytes,
                 )
             else:
                 self.hisparse_coordinator = HiSparseCoordinator(

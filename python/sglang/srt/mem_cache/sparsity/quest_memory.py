@@ -45,6 +45,7 @@ def estimate_quest_auxiliary_bytes(
     device_token_capacity: int = 0,
     host_to_device_ratio: int = 1,
     kv_page_size: int = 64,
+    logical_token_capacity: int | None = None,
 ) -> int:
     """Reserve Quest tensors and request/address tables outside the KV pool.
 
@@ -85,7 +86,13 @@ def estimate_quest_auxiliary_bytes(
         total += 2 * (layers * max_reqs + 1) * device_buffer_size  # LRU
         total += 4 * (max_reqs * top_k + 1)  # swap-in output and real BS
         # The address map scales with logical capacity; K/V tensors do not.
-        total += 8 * (device_token_capacity * host_to_device_ratio + kv_page_size + 1)
+        if logical_token_capacity is None:
+            logical_token_capacity = device_token_capacity * host_to_device_ratio
+        if type(logical_token_capacity) is not int or logical_token_capacity < 0:
+            raise ValueError(
+                "HiSparse logical token capacity must be a nonnegative integer"
+            )
+        total += 8 * (logical_token_capacity + kv_page_size + 1)
     else:
         total += max_reqs  # Quest-only first-decode update mask (bool)
     return total

@@ -22,8 +22,21 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
   return ((uint32_t)key * 2654435761u) % (uint32_t)hash_size;
 }
 
+template <bool IsPeer = false>
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
+  if constexpr (IsPeer) {
+    // Peer rows can be overwritten by earlier compute-GPU write-throughs.
+    // Scalar 64-bit accesses also cover records whose stride is 8 mod 16.
+    const auto* src = static_cast<const uint64_t*>(src_addr);
+    auto* dst = static_cast<uint64_t*>(dst_addr);
+    for (int64_t j = lane_id; j < item_size_bytes / 8; j += WARP_SIZE) {
+      uint64_t value;
+      asm volatile("ld.global.cg.b64 %0,[%1];" : "=l"(value) : "l"(src + j) : "memory");
+      asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(value) : "memory");
+    }
+    return;
+  }
   // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
   const int total_pairs = item_size_bytes / 16;  // number of 16-byte chunks
   {
@@ -50,9 +63,14 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
   }
 }
 
-__device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {
+__device__ __forceinline__ int
+warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator, int active_chunks) {
   int idx = lane_id + offset;
-  int val = (idx < count) ? s_data[idx] : 0;
+  // Only NUM_WARPS chunk counts were produced in this iteration. Scanning a
+  // whole warp would overwrite future counts with prefixes, then sum those
+  // stale prefixes again in the next iteration (buffers/top-k > BLOCK_SIZE).
+  const bool active = lane_id < active_chunks && idx < count;
+  int val = active ? s_data[idx] : 0;
 
 #pragma unroll
   for (int i = 1; i < 32; i *= 2) {
@@ -60,7 +78,7 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
     if (lane_id >= i) val += n;
   }
   val += accumulator;
-  if (idx < count) {
+  if (active) {
     s_data[idx] = val;
   }
   accumulator = __shfl_sync(0xffffffff, val, 31);
@@ -84,7 +102,7 @@ struct SmemLayout {
 // req_pool_indices are int64_t (pool indices can be large), seq_lens can be int32_t or int64_t
 // Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
 // newest_slot is at HOT_BUFFER_SIZE (first position of extra page)
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, typename SeqLensT>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer, typename SeqLensT>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -105,13 +123,28 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t page_size,
-    int64_t item_size_bytes) {
+    int64_t item_size_bytes,
+    const int64_t* __restrict__ peer_ptrs,
+    int64_t shard_rows,
+    int64_t num_shards,
+    int64_t num_layers,
+    int64_t layer_id,
+    int64_t peer_rows,
+    int64_t local_rows,
+    int64_t req_count,
+    int64_t cache_columns) {
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
   constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
 
   const int bid = blockIdx.x;
+  if constexpr (IsPeer) {
+    if (num_real_reqs[0] < 0 || num_real_reqs[0] > gridDim.x) {
+      asm volatile("trap;");
+      return;
+    }
+  }
   // Early exit for padded blocks (CUDA graph pads batch to a captured size)
   if (bid >= num_real_reqs[0]) return;
 
@@ -122,6 +155,12 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   const int64_t rid = req_pool_indices[bid];
   const int64_t seq_len = seq_lens[bid];
+  if constexpr (IsPeer) {
+    if (rid < 0 || rid >= req_count || seq_len < 0 || seq_len > cache_columns) {
+      asm volatile("trap;");
+      return;
+    }
+  }
 
   // Calculate offsets for this request
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
@@ -138,8 +177,21 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < count; i += BLOCK_SIZE) {
       int32_t token_pos = req_top_k_tokens[i];
+      if constexpr (IsPeer) {
+        if (token_pos >= seq_len) {
+          asm volatile("trap;");
+          return;
+        }
+      }
       if (token_pos >= 0) {
-        req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
+        const int32_t device_loc = req_device_buffer_locs[token_pos];
+        if constexpr (IsPeer) {
+          if (device_loc < 0 || device_loc >= local_rows) {
+            asm volatile("trap;");
+            return;
+          }
+        }
+        req_top_k_device_locs[i] = device_loc;
       }
     }
     return;
@@ -189,11 +241,24 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
+    if constexpr (IsPeer) {
+      if (token_idx < 0 || token_idx >= seq_len) {
+        asm volatile("trap;");
+        return;
+      }
+    }
     if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
-      req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
+      const int32_t device_loc = req_device_buffer_locs[newest_slot];
+      if constexpr (IsPeer) {
+        if (device_loc < 0 || device_loc >= local_rows) {
+          asm volatile("trap;");
+          return;
+        }
+      }
+      req_top_k_device_locs[i] = device_loc;
       s_newest_hit = 1;
     } else {
       int slot = hash_slot(token_idx, HASH_SIZE);
@@ -220,6 +285,12 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
     const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
     const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
+    if constexpr (IsPeer) {
+      if (has_valid_slot && (buf_slot < 0 || buf_slot >= HOT_BUFFER_SIZE)) {
+        asm volatile("trap;");
+        return;
+      }
+    }
     int32_t my_buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
     int my_found_top_k_idx = -1;
     if (my_buffer_token >= 0) {
@@ -240,7 +311,14 @@ __global__ void load_cache_to_device_buffer_kernel(
     // Record hits
     if (is_hit) {
       s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
-      req_top_k_device_locs[my_found_top_k_idx] = req_device_buffer_locs[buf_slot];
+      const int32_t device_loc = req_device_buffer_locs[buf_slot];
+      if constexpr (IsPeer) {
+        if (device_loc < 0 || device_loc >= local_rows) {
+          asm volatile("trap;");
+          return;
+        }
+      }
+      req_top_k_device_locs[my_found_top_k_idx] = device_loc;
     }
 
     int local_hit_offset = 0;
@@ -258,10 +336,10 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
-      total_hit_count =
-          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
-      total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
+      total_hit_count = warp_inclusive_scan(
+          s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count, NUM_WARPS);
+      total_evict_count = warp_inclusive_scan(
+          s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count, NUM_WARPS);
       if (tid == 0) {
         s_total_hits = total_hit_count;
       }
@@ -320,7 +398,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
+      total_misses =
+          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses, NUM_WARPS);
     }
     __syncthreads();
 
@@ -362,18 +441,119 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int64_t src_loc = req_host_cache_locs[miss_token];
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
-    const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+    const char* src_k;
+    const char* src_v = nullptr;
+    if constexpr (IsPeer) {
+      if (src_loc < 0 || src_loc >= peer_rows || dst_loc < 0 || dst_loc >= local_rows) {
+        asm volatile("trap;");
+        return;
+      }
+      const int64_t shard = src_loc / shard_rows;
+      const int64_t offset = (src_loc % shard_rows) * item_size_bytes;
+      src_k = reinterpret_cast<const char*>(peer_ptrs[(shard * 2) * num_layers + layer_id]) + offset;
+      if constexpr (!IsMLA) {
+        src_v = reinterpret_cast<const char*>(peer_ptrs[(shard * 2 + 1) * num_layers + layer_id]) + offset;
+      }
+    } else {
+      src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+      if constexpr (!IsMLA) src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
+    }
     auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
-    transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
+    transfer_item_warp<IsPeer>(lane_id, src_k, dst_k, item_size_bytes);
 
     if constexpr (!IsMLA) {
-      const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
       auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
-      transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+      transfer_item_warp<IsPeer>(lane_id, src_v, dst_v, item_size_bytes);
     }
   }
 }
 
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer>
+void launch_load_cache_to_device_buffer(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    const void* host_cache_k,
+    const void* host_cache_v,
+    tvm::ffi::TensorView device_buffer_k,
+    tvm::ffi::TensorView device_buffer_v,
+    tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView num_real_reqs,
+    int64_t page_size,
+    int64_t item_size_bytes,
+    const int64_t* peer_ptrs,
+    int64_t shard_rows,
+    int64_t num_shards,
+    int64_t num_layers,
+    int64_t layer_id,
+    int64_t peer_rows) {
+  using namespace host;
+
+  const int64_t bs = top_k_tokens.shape()[0];
+  const int64_t host_stride = host_cache_locs.strides()[0];
+  const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
+  const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
+  const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
+  const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
+  const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
+
+  // Generic lambda: both int32 and int64 kernel variants are compiled;
+  // the correct one is selected at runtime based on seq_lens dtype.
+  auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr) {
+    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+    if constexpr (smem_bytes > 48u * 1024u) {
+      RuntimeDeviceCheck(cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    }
+    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+        kernel_fn,
+        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+        host_cache_k,
+        host_cache_v,
+        device_buffer_k.data_ptr(),
+        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+        seq_lens_ptr,
+        static_cast<int16_t*>(lru_slots.data_ptr()),
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        buffer_stride_0,
+        host_stride,
+        lru_slot_stride_0,
+        top_k_tokens_stride,
+        top_k_device_locs_stride,
+        page_size,
+        item_size_bytes,
+        peer_ptrs,
+        shard_rows,
+        num_shards,
+        num_layers,
+        layer_id,
+        peer_rows,
+        device_buffer_k.shape()[0],
+        device_buffer_tokens.shape()[0],
+        host_cache_locs.shape()[1]);
+  };
+
+  const auto dtype = seq_lens.dtype();
+  if (dtype.code == kDLInt && dtype.bits == 64) {
+    launch(
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int64_t>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()));
+  } else {
+    launch(
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int32_t>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()));
+  }
+}
+
+// Preserve the pinned-host public ABI and its original cache/load behavior.
 template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
@@ -391,57 +571,72 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView num_real_reqs,
     int64_t page_size,
     int64_t item_size_bytes) {
-  using namespace host;
+  launch_load_cache_to_device_buffer<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, false>(
+      top_k_tokens,
+      device_buffer_tokens,
+      host_cache_locs,
+      device_buffer_locs,
+      host_cache_k.data_ptr(),
+      IsMLA ? nullptr : host_cache_v.data_ptr(),
+      device_buffer_k,
+      device_buffer_v,
+      top_k_device_locs,
+      req_pool_indices,
+      seq_lens,
+      lru_slots,
+      num_real_reqs,
+      page_size,
+      item_size_bytes,
+      nullptr,
+      0,
+      0,
+      0,
+      0,
+      0);
+}
 
-  const int64_t bs = top_k_tokens.shape()[0];
-  const int64_t host_stride = host_cache_locs.shape()[1];
-  const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
-  const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
-  const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
-  const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
-  const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
-
-  // Generic lambda: both int32 and int64 kernel variants are compiled;
-  // the correct one is selected at runtime based on seq_lens dtype.
-  auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr) {
-    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
-    if constexpr (smem_bytes > 48u * 1024u) {
-      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-    }
-    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
-        kernel_fn,
-        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
-        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
-        host_cache_k.data_ptr(),
-        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
-        device_buffer_k.data_ptr(),
-        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
-        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
-        static_cast<const int64_t*>(req_pool_indices.data_ptr()),
-        seq_lens_ptr,
-        static_cast<int16_t*>(lru_slots.data_ptr()),
-        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-        buffer_stride_0,
-        host_stride,
-        lru_slot_stride_0,
-        top_k_tokens_stride,
-        top_k_device_locs_stride,
-        page_size,
-        item_size_bytes);
-  };
-
-  const auto dtype = seq_lens.dtype();
-  if (dtype.code == kDLInt && dtype.bits == 64) {
-    launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int64_t>,
-        static_cast<const int64_t*>(seq_lens.data_ptr()));
-  } else {
-    launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int32_t>,
-        static_cast<const int32_t*>(seq_lens.data_ptr()));
-  }
+// Pointer metadata lives on the compute GPU. No storage tensor is dispatched.
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE>
+void load_cache_from_mpu_to_device_buffer(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView mpu_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView peer_ptrs,
+    tvm::ffi::TensorView device_buffer_k,
+    tvm::ffi::TensorView device_buffer_v,
+    tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView num_real_reqs,
+    int64_t page_size,
+    int64_t item_size_bytes,
+    int64_t shard_rows,
+    int64_t layer_id,
+    int64_t peer_rows) {
+  launch_load_cache_to_device_buffer<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, false, true>(
+      top_k_tokens,
+      device_buffer_tokens,
+      mpu_cache_locs,
+      device_buffer_locs,
+      nullptr,
+      nullptr,
+      device_buffer_k,
+      device_buffer_v,
+      top_k_device_locs,
+      req_pool_indices,
+      seq_lens,
+      lru_slots,
+      num_real_reqs,
+      page_size,
+      item_size_bytes,
+      static_cast<const int64_t*>(peer_ptrs.data_ptr()),
+      shard_rows,
+      peer_ptrs.shape()[0],
+      peer_ptrs.shape()[2],
+      layer_id,
+      peer_rows);
 }
 
 }  // namespace

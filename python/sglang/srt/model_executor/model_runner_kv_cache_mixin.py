@@ -667,6 +667,13 @@ class ModelRunnerKVCacheMixin:
                                 kvcache=self.token_to_kv_pool,
                                 need_sort=need_sort,
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                                logical_token_capacity=(
+                                    hisparse_cfg.logical_token_capacity(
+                                        self.max_total_num_tokens, self.page_size
+                                    )
+                                    if hisparse_cfg.backing_store == "mpu"
+                                    else None
+                                ),
                             )
                         )
                     elif self.page_size == 1:
@@ -795,6 +802,11 @@ class ModelRunnerKVCacheMixin:
             device_token_capacity=token_capacity,
             host_to_device_ratio=cfg.host_to_device_ratio,
             kv_page_size=self.page_size,
+            logical_token_capacity=(
+                cfg.logical_token_capacity(token_capacity, self.page_size)
+                if cfg.backing_store == "mpu"
+                else None
+            ),
         )
 
     def _resolve_memory_pool_config(
