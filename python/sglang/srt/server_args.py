@@ -6745,25 +6745,17 @@ class ServerArgs:
             if quest_cfg.algorithm != "quest":
                 raise ValueError(
                     "--attention-backend flashinfer_quest requires "
-                    "--hisparse-config '{\"algorithm\": \"quest\", ...}'."
+                    '--hisparse-config \'{"algorithm": "quest", ...}\'.'
                 )
-            assert self.disable_radix_cache, (
-                "flashinfer_quest currently requires --disable-radix-cache."
-            )
+            assert (
+                self.disable_radix_cache
+            ), "flashinfer_quest currently requires --disable-radix-cache."
             if self.kv_cache_dtype != "bfloat16":
                 raise ValueError(
                     f"flashinfer_quest requires bfloat16 KV cache, got "
                     f"--kv-cache-dtype={self.kv_cache_dtype}."
                 )
-            # Quest's prefill bounds bookkeeping recomputes from scratch
-            # under chunked prefill — wasteful and not validated.  Force
-            # chunked-prefill off for cleaner accounting.
-            if self.chunked_prefill_size > 0:
-                logger.warning(
-                    "flashinfer_quest disables chunked prefill (was "
-                    f"--chunked-prefill-size {self.chunked_prefill_size})."
-                )
-                self.chunked_prefill_size = -1
+            self._check_quest_server_args()
 
         # Check hisparse
         if self.enable_hisparse:
@@ -6781,7 +6773,7 @@ class ServerArgs:
                     "--enable-hisparse without algorithm='quest' requires a DSA "
                     "(DeepSeek Sparse Attention) model (e.g., DeepSeek V3.2, "
                     "GLM-5).  For non-DSA models pass "
-                    "--hisparse-config '{\"algorithm\": \"quest\"}'."
+                    '--hisparse-config \'{"algorithm": "quest"}\'.'
                 )
                 for attr, label in [
                     ("nsa_prefill_backend", "prefill"),
@@ -6802,6 +6794,7 @@ class ServerArgs:
                     "algorithm='quest' is intended for non-DSA MHA models; "
                     "drop the algorithm setting to use the DSA-native hisparse path."
                 )
+                self._check_quest_server_args()
                 # HiSparseTokenToKVPoolAllocator's alloc_extend requires
                 # page_size > 1 (paged storage).  Default to 64 here so the
                 # user doesn't need to know the constraint.
@@ -6868,6 +6861,59 @@ class ServerArgs:
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
+
+    def _check_quest_server_args(self):
+        """Validate the serving paths with Quest bounds lifecycle hooks."""
+        if self.max_running_requests is None or self.max_running_requests <= 0:
+            raise ValueError(
+                "Quest requires an explicit positive --max-running-requests. "
+                "Page bounds are allocated per request and context position; "
+                "the generic request-pool default can exhaust HBM at long context."
+            )
+        prefill_backend, decode_backend = self.get_attention_backends()
+        if self.enable_hisparse:
+            if (prefill_backend, decode_backend) != (
+                "flashinfer",
+                "flashinfer_hisparse",
+            ):
+                raise ValueError(
+                    "Quest + HiSparse requires --prefill-attention-backend flashinfer "
+                    "--decode-attention-backend flashinfer_hisparse."
+                )
+        elif (prefill_backend, decode_backend) != (
+            "flashinfer_quest",
+            "flashinfer_quest",
+        ):
+            raise ValueError(
+                "Quest without offloading requires --attention-backend flashinfer_quest "
+                "for both prefill and decode so prefill builds the page bounds."
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError("Quest does not support speculative decoding.")
+        if self.enable_mixed_chunk:
+            raise ValueError("Quest does not support --enable-mixed-chunk.")
+        # TboAttnBackend creates a primary plus two child backends; PDMux
+        # creates separate prefill/decode backends per stream.  Quest bounds
+        # and first-decode flags currently belong to one backend instance,
+        # and the memory budget reserves one copy of that state.
+        if self.enable_two_batch_overlap:
+            raise ValueError("Quest does not support --enable-two-batch-overlap.")
+        if self.enable_pdmux:
+            raise ValueError("Quest does not support --enable-pdmux.")
+        if self.pp_size != 1:
+            raise ValueError(
+                "Quest currently requires --pp-size 1; its bounds and cache "
+                "kernels do not remap pipeline-local layer indices."
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError("Quest currently requires colocated prefill and decode.")
+        if self.enforce_piecewise_cuda_graph:
+            raise ValueError(
+                "Quest prefill bounds do not support piecewise CUDA graphs."
+            )
+        # The prefill bounds hook enumerates request lengths on the host.
+        # Keep chunked prefill eager while retaining decode CUDA graphs.
+        self.disable_piecewise_cuda_graph = True
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

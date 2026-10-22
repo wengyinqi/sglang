@@ -32,10 +32,8 @@ Plan/run separation (so cuda graph capture works):
     ``_plan_for_step`` to invoke FlashInfer's plan().  plan() does CPU work
     + a host roundtrip that is incompatible with cuda graph capture, so it
     must happen OUTSIDE the captured forward window.
-  * ``init_forward_metadata_replay_cuda_graph`` does NOT re-plan — the
-    captured kernels reuse the capture-time plan_info (which was computed
-    for the worst-case workload, so any smaller actual workload at replay
-    is safe).
+  * ``init_forward_metadata_replay_cuda_graph`` re-plans outside the graph
+    with the current request lengths.
   * ``forward_decode`` (called per layer, inside the captured graph) only
     does graph-safe ops: Quest scoring + scatter-pack into the kv_indices
     buffer + ``wrapper.run()``.
@@ -44,8 +42,7 @@ Hardcoded for v1:
   * MHA pool only (regular MHATokenToKVPool, not the hisparse variant).
   * Inherits dense extend (forward_extend) from FlashInferAttnBackend; only
     forward_decode is overridden for sparse selection.
-  * No chunked-prefill: server_args validation forces chunked_prefill_size
-    such that bounds bookkeeping stays one-shot per request.
+  * Chunked prefill recomputes bounds for the resident prefix at each chunk.
   * Skip-first-decode tracked on the backend (mirrors what HiSparseCoordinator
     does for the hisparse path).
   * Invalidation on request finish is best-effort (no scheduler hook in
@@ -89,6 +86,7 @@ class _StageProfiler:
 
     def dump(self):
         import sys
+
         torch.cuda.synchronize()
         lines = [f"### Quest stage profile (over {self.calls} forward_decode calls):"]
         # Order tags alphabetically for stable output.
@@ -185,7 +183,9 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         self.num_qo_heads = (
             runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        self.num_kv_heads = runner.model_config.get_num_kv_heads(get_attention_tp_size())
+        self.num_kv_heads = runner.model_config.get_num_kv_heads(
+            get_attention_tp_size()
+        )
         self.head_dim = runner.model_config.head_dim
         self.req_to_token = runner.req_to_token_pool.req_to_token
 
@@ -200,14 +200,20 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         # lengths so FlashInfer doesn't see padding duplicates (which
         # would over-weight the tail token in softmax).
         self._kv_indptr_buf = torch.zeros(
-            max_reqs + 1, dtype=torch.int32, device=self.device,
+            max_reqs + 1,
+            dtype=torch.int32,
+            device=self.device,
         )
         self._kv_indices_buf = torch.zeros(
-            max_reqs * self.top_k + 1, dtype=torch.int32, device=self.device,
+            max_reqs * self.top_k + 1,
+            dtype=torch.int32,
+            device=self.device,
         )
         self._scatter_scratch_idx = max_reqs * self.top_k  # last slot
         self._kv_last_page_len_buf = torch.ones(
-            max_reqs, dtype=torch.int32, device=self.device,
+            max_reqs,
+            dtype=torch.int32,
+            device=self.device,
         )
         self._kv_indptr_template = torch.arange(
             0,
@@ -221,15 +227,20 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         # forward_decode for the scatter mask.  Stable buffer address so
         # cuda graph sees the same tensor across capture/replay.
         self._actual_lens_buf = torch.zeros(
-            max_reqs, dtype=torch.int32, device=self.device,
+            max_reqs,
+            dtype=torch.int32,
+            device=self.device,
         )
         # Pre-built [0, top_k) range used in the scatter mask; allocated
         # once to keep forward_decode allocation-free (graph-friendly).
         self._range_top_k = torch.arange(
-            self.top_k, dtype=torch.int32, device=self.device,
+            self.top_k,
+            dtype=torch.int32,
+            device=self.device,
         )
 
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper, fast_decode_plan
+
         self._WrapperCls = BatchDecodeWithPagedKVCacheWrapper
         self._fast_decode_plan = fast_decode_plan
 
@@ -238,8 +249,9 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         self._sparse_workspace = (
             self.workspace_buffer
             if hasattr(self, "workspace_buffer") and self.workspace_buffer is not None
-            else torch.empty(_DEFAULT_WORKSPACE_BYTES, dtype=torch.uint8,
-                             device=self.device)
+            else torch.empty(
+                _DEFAULT_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device
+            )
         )
 
         self._sparse_wrappers: dict = {}
@@ -255,7 +267,9 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         # bounds are computed for a request; cleared on the first decode step
         # for that request.  Mirrors HiSparseCoordinator._skip_first_backup.
         self._skip_first_decode_update = torch.zeros(
-            max_reqs, dtype=torch.bool, device=self.device,
+            max_reqs,
+            dtype=torch.bool,
+            device=self.device,
         )
 
         self.kv_data_type = runner.kv_cache_dtype
@@ -294,7 +308,7 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             page_size=1,
-            sm_scale=1.0 / (self.head_dim ** 0.5),
+            sm_scale=1.0 / (self.head_dim**0.5),
             data_type=self.kv_data_type,
             q_data_type=self.q_data_type,
             non_blocking=True,
@@ -328,7 +342,9 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         """
         if worst_case:
             actual_lens_cpu = torch.full(
-                (bs,), self.top_k, dtype=torch.int32,
+                (bs,),
+                self.top_k,
+                dtype=torch.int32,
             )
         else:
             if seq_lens_cpu is None:
@@ -381,7 +397,8 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
             self._sparse_wrapper = self._get_or_create_sparse_wrapper(bs)
             self._current_bs = bs
             self._do_quest_decode_step_update(
-                forward_batch.req_pool_indices, forward_batch.seq_lens,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
             )
             # Cache step-level state once per step (used by every layer's
             # retrieve_topk).  Saves ~6 redundant ops per layer in the
@@ -394,7 +411,7 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
             sm_scale = (
                 self._cached_sm_scale
                 if self._cached_sm_scale is not None
-                else 1.0 / (self.head_dim ** 0.5)
+                else 1.0 / (self.head_dim**0.5)
             )
             self._plan_for_step(
                 bs=bs,
@@ -420,11 +437,15 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         Skips requests flagged "first decode after prefill" — for those,
         bounds were already seeded by ``update_prefill_representations``
         and no decode token has been generated yet."""
+        # Graph padding repeats request slots with seq_len=1.  Those rows
+        # must not clear a live request's skip flag or advance its bounds.
+        # A real decode has at least one prefilled token plus the new token.
+        real_mask = seq_lens > 1
         skip_mask = self._skip_first_decode_update[req_pool_indices]
-        active_mask = ~skip_mask
+        active_mask = real_mask & ~skip_mask
         # Always clear the skip flag for the requests we just saw so the
         # NEXT decode step does update.
-        self._skip_first_decode_update[req_pool_indices] = False
+        self._skip_first_decode_update[req_pool_indices[real_mask]] = False
 
         # No host-device sync here: if all reqs are skipped, ``active_idx``
         # is empty and the fused kernel + finalize below are no-ops.  The
@@ -474,21 +495,22 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         out = super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
         # Bounds depend on K for all Quest layers; run after the last Quest
         # layer's K has been written to its buffer.
-        if save_kv_cache and layer.layer_id == self.quest.end_layer - 1:
+        # Qwen's fused RoPE may have already written K/V before attention,
+        # in which case save_kv_cache=False only skips the duplicate write.
+        # Bounds still need to be built from the pool in that path.
+        if layer.layer_id == self.quest.end_layer - 1:
             self._update_quest_for_extend(forward_batch)
         return out
 
-    def _update_quest_for_extend(
-        self, forward_batch: "ForwardBatch"
-    ) -> None:
+    def _update_quest_for_extend(self, forward_batch: "ForwardBatch") -> None:
         """Compute Quest prefill bounds for each request in this extend call.
 
         Called ONCE per extend (at the last Quest layer's forward_extend),
         not per layer.  For each request we recompute bounds from positions
         ``0 .. seq_len - 1`` (pulled via ``req_to_token``).  This is correct
-        under chunked prefill (each chunk recomputes from scratch — wasteful
-        but accurate); the backend forces chunked_prefill off so each request
-        sees exactly one extend call.
+        under chunked prefill: each chunk recomputes from the resident prefix.
+        This bounds the dense prefill workspace at the cost of repeated
+        bounds computation.  The final chunk seeds the state used by decode.
         """
         # One .tolist() per extend (vs. 2 × num_layers previously).  Lists
         # are needed for Python-level iteration over the per-req fused kernel.
@@ -531,9 +553,7 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         on ``self`` so subsequent eager-mode plans use the right values.
         """
         if self._current_bs is None:
-            raise RuntimeError(
-                "init_forward_metadata must run before forward_decode"
-            )
+            raise RuntimeError("init_forward_metadata must run before forward_decode")
         bs = self._current_bs
 
         # Lazy-cache layer scaling on first call so eager-mode init can plan
@@ -551,7 +571,10 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
                 if save_kv_cache and k is not None:
                     assert v is not None
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, forward_batch.out_cache_loc, k, v,
+                        layer,
+                        forward_batch.out_cache_loc,
+                        k,
+                        v,
                         getattr(layer, "k_scale", None),
                         getattr(layer, "v_scale", None),
                     )
@@ -559,7 +582,10 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
             if save_kv_cache and k is not None:
                 assert v is not None
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v,
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
                     getattr(layer, "k_scale", None),
                     getattr(layer, "v_scale", None),
                 )
@@ -568,13 +594,15 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         if prof is not None:
             with prof.time("2_retrieve_topk"):
                 topk_token_positions, _ = self.quest.retrieve_topk(
-                    queries=q, layer_id=layer.layer_id,
+                    queries=q,
+                    layer_id=layer.layer_id,
                     req_pool_indices=forward_batch.req_pool_indices,
                     seq_lens=forward_batch.seq_lens,
                 )
         else:
             topk_token_positions, _ = self.quest.retrieve_topk(
-                queries=q, layer_id=layer.layer_id,
+                queries=q,
+                layer_id=layer.layer_id,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
             )
@@ -585,6 +613,7 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         from sglang.srt.mem_cache.sparsity.algorithms.quest_scatter_pack_kernel import (
             quest_only_gather_scatter,
         )
+
         if prof is not None:
             with prof.time("3_4_gather_scatter"):
                 quest_only_gather_scatter(
@@ -658,8 +687,13 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         spec_info: Optional["SpecInput"],
     ) -> None:
         super().init_forward_metadata_capture_cuda_graph(
-            bs, num_tokens, req_pool_indices, seq_lens,
-            encoder_lens, forward_mode, spec_info,
+            bs,
+            num_tokens,
+            req_pool_indices,
+            seq_lens,
+            encoder_lens,
+            forward_mode,
+            spec_info,
         )
         if forward_mode.is_decode():
             bs_int = int(bs)
@@ -672,7 +706,7 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
             sm_scale = (
                 self._cached_sm_scale
                 if self._cached_sm_scale is not None
-                else 1.0 / (self.head_dim ** 0.5)
+                else 1.0 / (self.head_dim**0.5)
             )
             self._plan_for_step(
                 bs=bs_int,
@@ -695,8 +729,14 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
         seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         super().init_forward_metadata_replay_cuda_graph(
-            bs, req_pool_indices, seq_lens, seq_lens_sum,
-            encoder_lens, forward_mode, spec_info, seq_lens_cpu=seq_lens_cpu,
+            bs,
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+            seq_lens_cpu=seq_lens_cpu,
         )
         if forward_mode.is_decode():
             bs_int = int(bs)
@@ -710,7 +750,8 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
             # Real per-step decode: update Quest bounds for the previous
             # token before the captured graph replays.
             self._do_quest_decode_step_update(
-                req_pool_indices[:bs_int], seq_lens[:bs_int],
+                req_pool_indices[:bs_int],
+                seq_lens[:bs_int],
             )
             # Cache step-level state once (instead of per-layer in retrieve_topk).
             self.quest.prepare_step(seq_lens[:bs_int])
@@ -720,7 +761,7 @@ class FlashInferQuestDecodeBackend(FlashInferAttnBackend):
             sm_scale = (
                 self._cached_sm_scale
                 if self._cached_sm_scale is not None
-                else 1.0 / (self.head_dim ** 0.5)
+                else 1.0 / (self.head_dim**0.5)
             )
             self._plan_for_step(
                 bs=bs_int,

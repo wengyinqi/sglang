@@ -17,8 +17,8 @@ Replaces this PyTorch op chain in the decode forward path
     )
 
 The kernel writes ``page_table[i, j]`` (clamped to ≥0) into
-``kv_indices_buf[kv_indptr[i] + j]`` for ``j < actual_lens[i]``, and into
-``kv_indices_buf[scratch_idx]`` (a harmless throwaway slot) otherwise.
+``kv_indices_buf[kv_indptr[i] + j]`` for ``j < actual_lens[i]``. Unused
+entries are masked, avoiding conflicting writes to the scratch slot.
 One launch per layer per step replaces ~7 small PyTorch ops, mostly
 helping at small bs where launch overhead dominates the work.
 """
@@ -32,11 +32,11 @@ import triton.language as tl
 
 @triton.jit
 def _quest_scatter_pack_kernel(
-    page_table_ptr,        # [bs, TOP_K] int32 (any signed int)
-    actual_lens_ptr,       # [bs] int32
-    kv_indptr_ptr,         # [bs + 1] int32 (cumsum of actual_lens)
-    kv_indices_buf_ptr,    # [scratch_idx + 1] int32
-    scratch_idx,           # int (target for invalid positions)
+    page_table_ptr,  # [bs, TOP_K] int32 (any signed int)
+    actual_lens_ptr,  # [bs] int32
+    kv_indptr_ptr,  # [bs + 1] int32 (cumsum of actual_lens)
+    kv_indices_buf_ptr,  # [scratch_idx + 1] int32
+    scratch_idx,  # retained for compatibility; masked entries do not write
     NUM_REQS,
     TOP_K: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -51,7 +51,7 @@ def _quest_scatter_pack_kernel(
     indptr = tl.load(kv_indptr_ptr + pid_b)
 
     j_off = pid_k * BLOCK + tl.arange(0, BLOCK)
-    j_mask = j_off < TOP_K
+    j_mask = (j_off < TOP_K) & (j_off < actual_len)
 
     src = tl.load(
         page_table_ptr + pid_b * TOP_K + j_off,
@@ -61,19 +61,19 @@ def _quest_scatter_pack_kernel(
     # Clamp to ≥0 (the caller used to do this with a separate op).
     src = tl.maximum(src, 0)
 
-    valid = j_off < actual_len
-    dst = tl.where(valid, indptr + j_off, scratch_idx)
-    tl.store(kv_indices_buf_ptr + dst, src, mask=j_mask)
+    # Unused entries do not need a destination. Masking them avoids many
+    # threads racing on the same scratch slot during CUDA graph replay.
+    tl.store(kv_indices_buf_ptr + indptr + j_off, src, mask=j_mask)
 
 
 @triton.jit
 def _quest_only_gather_scatter_kernel(
-    topk_positions_ptr,    # [bs, TOP_K] int32
+    topk_positions_ptr,  # [bs, TOP_K] int32
     req_pool_indices_ptr,  # [bs] int64
-    req_to_token_ptr,      # [max_reqs, max_context_len] int32
-    actual_lens_ptr,       # [bs] int32
-    kv_indptr_ptr,         # [bs + 1] int32
-    kv_indices_buf_ptr,    # int32
+    req_to_token_ptr,  # [max_reqs, max_context_len] int32
+    actual_lens_ptr,  # [bs] int32
+    kv_indptr_ptr,  # [bs + 1] int32
+    kv_indices_buf_ptr,  # int32
     scratch_idx,
     NUM_REQS,
     REQ_TO_TOKEN_STRIDE: tl.constexpr,  # max_context_len
@@ -103,7 +103,7 @@ def _quest_only_gather_scatter_kernel(
     indptr = tl.load(kv_indptr_ptr + pid_b)
 
     j_off = pid_k * BLOCK + tl.arange(0, BLOCK)
-    j_mask = j_off < TOP_K
+    j_mask = (j_off < TOP_K) & (j_off < actual_len)
 
     # Load the top-k logical positions for this req.
     topk_pos = tl.load(
@@ -120,11 +120,8 @@ def _quest_only_gather_scatter_kernel(
         other=0,
     )
 
-    # Scatter-pack: write to kv_indices_buf[kv_indptr[i] + j] (or scratch_idx
-    # if j >= actual_lens[i]).
-    valid = j_off < actual_len
-    dst = tl.where(valid, indptr + j_off, scratch_idx)
-    tl.store(kv_indices_buf_ptr + dst, pool_idx, mask=j_mask)
+    # Scatter-pack only the actual entries; padded rows do not read or write.
+    tl.store(kv_indices_buf_ptr + indptr + j_off, pool_idx, mask=j_mask)
 
 
 def quest_only_gather_scatter(
@@ -154,7 +151,7 @@ def quest_only_gather_scatter(
     assert topk_positions.shape[1] == top_k
     assert req_to_token.dim() == 2
 
-    BLOCK = min(top_k, 256)
+    BLOCK = triton.next_power_of_2(min(top_k, 256))
     grid = (bs, triton.cdiv(top_k, BLOCK))
 
     _quest_only_gather_scatter_kernel[grid](
@@ -192,20 +189,19 @@ def quest_scatter_pack(
         prefix-sum target slot for each request in kv_indices_buf).
       kv_indices_buf: ``[scratch_idx + 1]`` int32 — destination buffer.
         Will be written at positions ``[kv_indptr[i] : kv_indptr[i] +
-        actual_lens[i])`` for each ``i``, plus ``scratch_idx`` for any
-        residual positions ``j ∈ [actual_lens[i], top_k)``.
-      scratch_idx: int — index of the throwaway slot in kv_indices_buf
-        (callers reserve ``max_bs * top_k`` for this).
+        actual_lens[i])`` for each ``i``. Residual positions are untouched.
+      scratch_idx: retained for compatibility with caller buffer allocation;
+        the kernel does not write to this slot.
       top_k: int — must match ``page_table.shape[1]``.
     """
     bs = int(page_table.shape[0])
     if bs == 0:
         return
-    assert page_table.shape[1] == top_k, (
-        f"page_table.shape[1]={page_table.shape[1]} != top_k={top_k}"
-    )
+    assert (
+        page_table.shape[1] == top_k
+    ), f"page_table.shape[1]={page_table.shape[1]} != top_k={top_k}"
 
-    BLOCK = min(top_k, 256)
+    BLOCK = triton.next_power_of_2(min(top_k, 256))
     grid = (bs, triton.cdiv(top_k, BLOCK))
 
     _quest_scatter_pack_kernel[grid](

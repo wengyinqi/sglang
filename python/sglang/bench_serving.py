@@ -635,7 +635,12 @@ async def async_request_sglang_generate(
         output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
-        output_len = request_func_input.output_len
+        # Count only tokens reported by the server, including metadata-only
+        # frames (e.g. special tokens whose decoded text is empty).
+        output_len = 0
+        observed_completion = False
+        observed_prompt = False
+        finish_reason = None
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -657,14 +662,44 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = json.loads(chunk)
-
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
+                            if "error" in data:
+                                raise RuntimeError(
+                                    f"SGLang request failed: {data['error']}"
+                                )
+                            meta = data.get("meta_info", {})
+                            if "prompt_tokens" in meta:
+                                prompt_tokens = meta["prompt_tokens"]
+                                if type(prompt_tokens) is not int or prompt_tokens < 0:
+                                    raise ValueError(
+                                        "Invalid prompt_tokens in SGLang response"
+                                    )
+                                output.prompt_len = prompt_tokens
+                                observed_prompt = True
+                            if "completion_tokens" in meta:
+                                completion_tokens = meta["completion_tokens"]
+                                if (
+                                    type(completion_tokens) is not int
+                                    or completion_tokens < output_len
+                                ):
+                                    raise ValueError(
+                                        "Invalid completion_tokens in SGLang response"
+                                    )
+                                output_len = completion_tokens
+                                observed_completion = True
+                            if meta.get("finish_reason") is not None:
+                                finish_reason = meta["finish_reason"]
+                                if (
+                                    isinstance(finish_reason, dict)
+                                    and finish_reason.get("type") == "abort"
+                                ):
+                                    raise RuntimeError(
+                                        f"SGLang request aborted: {finish_reason}"
+                                    )
+                            if "text" in data:
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+
+                            if output_len > last_output_len:
+                                timestamp = time.perf_counter()
 
                                 # First token
                                 if ttft == 0.0:
@@ -674,8 +709,6 @@ async def async_request_sglang_generate(
                                 # Decoding phase
                                 else:
                                     num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
                                     chunk_gap = timestamp - most_recent_timestamp
                                     adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
@@ -683,6 +716,18 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
 
+                    # Native /generate includes finish_reason and actual token
+                    # counts in its final response, in both streaming and JSON
+                    # modes. A closed HTTP body or [DONE] alone is insufficient:
+                    # the stream may have ended with an error or partial output.
+                    if (
+                        not observed_completion
+                        or not observed_prompt
+                        or finish_reason is None
+                    ):
+                        raise RuntimeError(
+                            "SGLang response ended without final token accounting"
+                        )
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency

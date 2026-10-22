@@ -154,12 +154,9 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
-        # Quest mode only: parallel stream for prefill bounds compute so
-        # ``finish_event`` can fire as soon as the host backup is done,
-        # without waiting for the (fused but still ~1s for 16K-token reqs)
-        # bounds work.  Decode start waits on the bounds event explicitly via
-        # ``wait_for_pending_bounds`` in the decode backend's
-        # ``init_forward_metadata``.
+        # Quest bounds and host backup can run concurrently, but both read
+        # the prefill KV slots.  Staging completion must join both readers
+        # before alloc_device_buffer releases slots for another request.
         self.quest_bounds_stream = (
             device_module.Stream() if mode == MODE_QUEST else None
         )
@@ -260,21 +257,14 @@ class HiSparseCoordinator:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, io_backend="kernel"
             )
-            # finish_event gates collect_ready_reqs admission.  Record it
-            # right after the host backup completes — we no longer wait on
-            # the (potentially expensive) Quest bounds compute, which is
-            # consumed only at decode start (see wait_for_pending_bounds).
-            finish_event.record()
             if host_indices.is_cuda:
                 host_indices.record_stream(self.write_staging_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        # Quest mode: compute per-page K bounds in parallel on a dedicated
-        # bounds_stream.  The bounds are needed only at decode start (read
-        # by retrieve_topk); init_forward_metadata in the hisparse decode
-        # backend waits on bounds_event before the first layer's
-        # retrieve_topk runs.
+        # Compute bounds concurrently with D2H, then join their completion.
+        # Waiting only at decode is too late: collect_ready_reqs can already
+        # return surplus physical prefill pages to the allocator.
         if self.mode == MODE_QUEST:
             bounds_event = device_module.Event()
             with device_module.stream(self.quest_bounds_stream):
@@ -285,6 +275,11 @@ class HiSparseCoordinator:
                     device_indices.record_stream(self.quest_bounds_stream)
             self._pending_bounds_events[req.req_pool_idx] = bounds_event
 
+        with device_module.stream(self.write_staging_stream):
+            if self.mode == MODE_QUEST:
+                bounds_event.wait(self.write_staging_stream)
+            finish_event.record()
+
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
     def _update_quest_prefill_representations(
@@ -293,7 +288,7 @@ class HiSparseCoordinator:
         """Quest-mode hook: populate page bounds from prefill K (on device).
 
         Called from inside ``admit_request_into_staging``'s
-        ``write_staging_stream`` block.  Issues a SINGLE fused Triton kernel
+        ``quest_bounds_stream`` block.  Issues a SINGLE fused Triton kernel
         launch that processes all Quest layers and all pages in this
         request's prefill, replacing the previous num_layers Python loop
         (which dominated p50 TTFT in quest_hisparse mode at long context).
@@ -468,9 +463,7 @@ class HiSparseCoordinator:
             # without losing alloc_decode's last_loc reference.
             return
         req_to_token = self.req_to_token_pool.req_to_token
-        early_indices = req_to_token[
-            req.req_pool_idx, :keep_start
-        ].clone()
+        early_indices = req_to_token[req.req_pool_idx, :keep_start].clone()
         # Filter out any pad-row sentinels that may already be present.
         valid = early_indices > 0
         to_free = early_indices[valid]
@@ -647,7 +640,9 @@ class HiSparseCoordinator:
             # _backup_done_event (recorded after the DMA), so retrieve_topk
             # in the next step sees fully-updated bounds.
             if self.mode == MODE_QUEST:
-                self._update_quest_decode_representations(backup_req_indices, device_locs)
+                self._update_quest_decode_representations(
+                    backup_req_indices, device_locs
+                )
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
                 host_locs,
@@ -696,7 +691,7 @@ class HiSparseCoordinator:
         """Wait on Quest prefill bounds events for any reqs in this batch.
 
         Quest mode runs prefill bounds on ``quest_bounds_stream`` in parallel
-        with the host backup (so admission isn't gated on bounds).  Decode
+        with the host backup.  Staging completion joins both readers. Decode
         start must wait on those events before retrieve_topk reads
         ``page_k_bounds``.  Called once per decode step from the hisparse
         decode backend's ``init_forward_metadata`` family.
@@ -834,6 +829,7 @@ class HiSparseCoordinator:
             pending = self._pending_bounds_events.pop(req.req_pool_idx, None)
             if pending is not None:
                 pending.synchronize()
+            self.quest_algorithm.invalidate_request(req.req_pool_idx)
 
         # Free host memory that was allocated during admit_request_into_staging
         host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]

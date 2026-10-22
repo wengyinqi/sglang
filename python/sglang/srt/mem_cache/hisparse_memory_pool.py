@@ -130,35 +130,13 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
 class HiSparseMHATokenToKVPool(MHATokenToKVPool):
     """MHA counterpart of :class:`HiSparseNSATokenToKVPool`.
 
-    Sizes its physical K/V buffers to hold BOTH:
-
-      * the ``size * host_to_device_ratio`` "logical" rows that the
-        ``logical_attn_allocator`` hands out during prefill (so FlashInfer's
-        regular prefill kernel can read prefill K/V at logical addresses
-        without any translation), and
-      * the ``size`` decode-time hot-buffer rows that the
-        ``hisparse_attn_allocator`` carves out for swap-in.
-
-    Both ranges are non-overlapping inside one MHA tensor.  ``set_kv_buffer``
-    runs every write through ``_resolve_write_loc``: when the coordinator
-    has reserved a hot-buffer slot for ``loc`` (mapping > 0) the write is
-    redirected there; otherwise it lands at the original logical row.
-
-    Trade-off vs the NSA-style "small device pool" design: this wastes
-    ``ratio * size * head_num * head_dim * 2 bytes`` of device memory
-    (because logical rows are duplicated on host), but lets us reuse
-    FlashInfer's standard paged prefill backend without modification.  In
-    practice, set ``host_to_device_ratio`` low (e.g., 1 or 2) for MHA to
-    minimise the waste.
-
-    NOTE: an earlier attempt to align with NSA's "small device pool + mapping
-    table + translated FlashInfer prefill" design (commit log under tag
-    ``v5_q3``) introduced a correctness regression that took GSM8K from 0.84
-    back to 0.0 in production at long context (small-model repros stayed
-    bit-exact, suggesting an interaction between chunked prefill, the
-    mapping table, and the translated kv_indices that doesn't surface at
-    small scale).  Reverted to the inflated design.  The right fix needs
-    a deeper trace of the chunked-prefill K/V write-vs-read path.
+    Physical K/V storage contains ``size`` token rows plus the normal pad
+    page, independently of ``host_to_device_ratio``.  The allocator keeps
+    a larger logical address space and maps prefill writes and FlashInfer
+    prefill reads to these physical slots.  On staging completion, surplus
+    prefill slots are released and the retained slots become the bounded
+    decode buffer.  Host KV storage and the logical mapping grow with the
+    ratio; the physical K/V buffers do not.
     """
 
     def __init__(
@@ -177,12 +155,7 @@ class HiSparseMHATokenToKVPool(MHATokenToKVPool):
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
     ):
-        # v5 redo: physical_size = size (no inflation).  All accesses go
-        # through the mapping table — set_kv_buffer translates writes,
-        # and FlashInfer's prefill backend translates kv_indices reads
-        # via a hook that mirrors the SWA pool pattern.  See module
-        # docstring for the chunked-prefill / overlap-schedule / cuda-graph
-        # bisection that motivated re-enabling this design.
+        # Writes and FlashInfer prefill reads both translate logical indices.
         del host_to_device_ratio  # not used here; allocator owns the ratio
         super().__init__(
             size=size,
@@ -418,7 +391,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_attn_allocator.is_not_in_free_group = True
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
 
-    def translate_loc_from_full_to_hisparse(self, kv_indices: torch.Tensor) -> torch.Tensor:
+    def translate_loc_from_full_to_hisparse(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
         """Map logical kv_indices (in [0, size_full)) → physical slots in
         the small device pool (in [0, size_hisparse)).
 
@@ -432,9 +407,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """
         assert self.full_to_hisparse_device_index_mapping is not None
         mapped = self.full_to_hisparse_device_index_mapping[kv_indices]
-        return torch.where(
-            mapped > 0, mapped, torch.zeros_like(mapped)
-        ).to(torch.int32)
+        return torch.where(mapped > 0, mapped, torch.zeros_like(mapped)).to(torch.int32)
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         hisparse_last_locs = self._kvcache._translate_loc_to_hisparse_device(last_locs)

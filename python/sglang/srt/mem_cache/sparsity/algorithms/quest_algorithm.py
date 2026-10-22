@@ -33,14 +33,6 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.sparsity.algorithms.quest_decode_bounds_kernel import (
-    quest_decode_bounds,
-)
-from sglang.srt.mem_cache.sparsity.algorithms.quest_prefill_bounds_kernel import (
-    quest_prefill_bounds,
-)
-from sglang.srt.mem_cache.sparsity.algorithms.quest_score_kernel import quest_score
-
 logger = logging.getLogger(__name__)
 
 # Toggle for the Triton fused score kernel.  Default on; set
@@ -80,6 +72,8 @@ class QuestAlgorithm:
     def __init__(self, top_k: int, page_size: int, device: torch.device):
         if page_size <= 0:
             raise ValueError(f"quest page_size must be > 0, got {page_size}")
+        if top_k <= 0:
+            raise ValueError(f"quest top_k must be > 0, got {top_k}")
         if top_k % page_size != 0:
             raise ValueError(
                 f"top_k ({top_k}) must be divisible by quest_page_size ({page_size}); "
@@ -102,8 +96,8 @@ class QuestAlgorithm:
         # Per-page bounds, keyed by (layer_offset, req, page_in_req).
         # Combined into ``page_k_bounds`` (last axis indexes [min, max])
         # so a single gather brings both during retrieve_topk.  Invalid
-        # pages carry sentinel values (+inf for min, -inf for max) so the
-        # Quest score formula naturally yields -inf — no separate valid bit.
+        # pages carry sentinel values (largest bf16 for min, smallest for
+        # max). Scoring explicitly masks reversed bounds to negative infinity.
         self.page_k_bounds: Optional[torch.Tensor] = None
         self.page_k_min: Optional[torch.Tensor] = None  # view of page_k_bounds[..., 0]
         self.page_k_max: Optional[torch.Tensor] = None  # view of page_k_bounds[..., 1]
@@ -141,6 +135,8 @@ class QuestAlgorithm:
         head_dim: int,
     ) -> None:
         num_layers = end_layer - start_layer
+        if min(num_layers, max_reqs, max_context_len, kv_heads, head_dim) <= 0:
+            raise ValueError("Quest storage dimensions must all be positive")
         max_pages_per_req = (max_context_len + self.page_size - 1) // self.page_size
 
         self.start_layer = start_layer
@@ -152,14 +148,13 @@ class QuestAlgorithm:
         self.head_dim = head_dim
 
         # Combined per-page bounds tensor: last axis indexes [min, max].
-        # Sentinel-initialised: invalid pages have min=+inf, max=-inf so the
-        # Quest score formula (which picks q*max for q≥0 and q*min for q<0)
-        # naturally yields -inf for them.  This drops the separate page_valid
-        # tensor and the in_range mask in retrieve_topk — fewer kernels per
-        # layer (cuda-graph-replay overhead is what limits Mode 2 perf).
+        # Sentinel-initialised with reversed min/max for invalid pages.
+        # Both scoring paths check validity explicitly before arithmetic.
         bounds_shape = (num_layers, max_reqs, max_pages_per_req, kv_heads, head_dim, 2)
         self.page_k_bounds = torch.empty(
-            bounds_shape, dtype=torch.bfloat16, device=self.device,
+            bounds_shape,
+            dtype=torch.bfloat16,
+            device=self.device,
         )
         # Initialise: [..., 0] = +inf (min sentinel), [..., 1] = -inf (max sentinel).
         self.page_k_bounds[..., 0].fill_(_BF16_POS_INF)
@@ -185,48 +180,88 @@ class QuestAlgorithm:
 
         # Total static memory:
         bounds_mb = (
-            bounds_shape[0] * bounds_shape[1] * bounds_shape[2]
-            * bounds_shape[3] * bounds_shape[4] * bounds_shape[5] * 2
-        ) / (1024 ** 2)
+            bounds_shape[0]
+            * bounds_shape[1]
+            * bounds_shape[2]
+            * bounds_shape[3]
+            * bounds_shape[4]
+            * bounds_shape[5]
+            * 2
+        ) / (1024**2)
         running_mb = (
-            2 * running_shape[0] * running_shape[1] * running_shape[2]
-            * running_shape[3] * 2
-        ) / (1024 ** 2)
+            2
+            * running_shape[0]
+            * running_shape[1]
+            * running_shape[2]
+            * running_shape[3]
+            * 2
+        ) / (1024**2)
         logger.info(
             "Quest storage initialised: %d layers × %d reqs × %d pages/req × "
             "%d KV heads × %d dim (page=%d, top_k=%d) → bounds %.1f MB, running %.1f MB",
-            num_layers, max_reqs, max_pages_per_req, kv_heads, head_dim,
-            self.page_size, self.top_k, bounds_mb, running_mb,
+            num_layers,
+            max_reqs,
+            max_pages_per_req,
+            kv_heads,
+            head_dim,
+            self.page_size,
+            self.top_k,
+            bounds_mb,
+            running_mb,
         )
 
         # Step-level state buffers (sized for max_reqs as upper bound on bs).
         self._step_last_valid_buf = torch.zeros(
-            (max_reqs, 1), dtype=torch.int64, device=self.device,
+            (max_reqs, 1),
+            dtype=torch.int64,
+            device=self.device,
         )
         self._step_recent_positions_buf = torch.zeros(
-            (max_reqs, self.page_size), dtype=torch.int32, device=self.device,
+            (max_reqs, self.page_size),
+            dtype=torch.int32,
+            device=self.device,
         )
         self._step_short_layout_buf = torch.zeros(
-            (max_reqs, self.top_k), dtype=torch.int32, device=self.device,
+            (max_reqs, self.top_k),
+            dtype=torch.int32,
+            device=self.device,
         )
         self._step_is_short_buf = torch.zeros(
-            (max_reqs, 1), dtype=torch.bool, device=self.device,
+            (max_reqs, 1),
+            dtype=torch.bool,
+            device=self.device,
         )
         self._step_actual_lens_buf = torch.zeros(
-            (max_reqs,), dtype=torch.int32, device=self.device,
+            (max_reqs,),
+            dtype=torch.int32,
+            device=self.device,
         )
         # Constants used by prepare_step + retrieve_topk.
         self._recent_offsets_const = torch.arange(
-            self.page_size, device=self.device, dtype=torch.int64,
-        ).unsqueeze(0)  # [1, page_size]
+            self.page_size,
+            device=self.device,
+            dtype=torch.int64,
+        ).unsqueeze(
+            0
+        )  # [1, page_size]
         self._all_positions_const = torch.arange(
-            self.top_k, device=self.device, dtype=torch.int64,
-        ).unsqueeze(0)  # [1, top_k]
+            self.top_k,
+            device=self.device,
+            dtype=torch.int64,
+        ).unsqueeze(
+            0
+        )  # [1, top_k]
         self._page_offsets_const = torch.arange(
-            self.page_size, device=self.device, dtype=torch.int64,
-        ).view(1, 1, -1)  # [1, 1, page_size]
+            self.page_size,
+            device=self.device,
+            dtype=torch.int64,
+        ).view(
+            1, 1, -1
+        )  # [1, 1, page_size]
         self._page_idx_const = torch.arange(
-            self.max_pages_per_req, device=self.device, dtype=torch.int64,
+            self.max_pages_per_req,
+            device=self.device,
+            dtype=torch.int64,
         )  # [max_pages_per_req] — used by retrieve_topk to mask OOB pages
 
     # ---------------------------------------------------------- prefill update
@@ -267,24 +302,28 @@ class QuestAlgorithm:
             paged = full_k.view(
                 num_full_pages, self.page_size, self.kv_heads, self.head_dim
             )
-            self.page_k_min[layer_offset, req_pool_idx, :num_full_pages] = (
-                paged.amin(dim=1).to(torch.bfloat16)
-            )
-            self.page_k_max[layer_offset, req_pool_idx, :num_full_pages] = (
-                paged.amax(dim=1).to(torch.bfloat16)
-            )
+            self.page_k_min[layer_offset, req_pool_idx, :num_full_pages] = paged.amin(
+                dim=1
+            ).to(torch.bfloat16)
+            self.page_k_max[layer_offset, req_pool_idx, :num_full_pages] = paged.amax(
+                dim=1
+            ).to(torch.bfloat16)
 
         partial_count = prefill_len - num_full_pages * self.page_size
         if partial_count > 0:
             partial_indices = prefill_indices[num_full_pages * self.page_size :]
             partial_k = k_buffer[partial_indices]
-            self.running_k_min[layer_offset, req_pool_idx] = (
-                partial_k.amin(dim=0).to(torch.bfloat16)
+            self.running_k_min[layer_offset, req_pool_idx] = partial_k.amin(dim=0).to(
+                torch.bfloat16
             )
-            self.running_k_max[layer_offset, req_pool_idx] = (
-                partial_k.amax(dim=0).to(torch.bfloat16)
+            self.running_k_max[layer_offset, req_pool_idx] = partial_k.amax(dim=0).to(
+                torch.bfloat16
             )
-        # else: running buffers remain at (+inf, -inf), correct for an empty page.
+        else:
+            # Chunked prefill can previously have left a partial page here.
+            # Rebuilding a prefix ending on a page boundary must clear it.
+            self.running_k_min[layer_offset, req_pool_idx] = _BF16_POS_INF
+            self.running_k_max[layer_offset, req_pool_idx] = _BF16_NEG_INF
 
         if layer_id == self.end_layer - 1:
             # Per-request scalars: written once per admit, on the last layer.
@@ -326,6 +365,10 @@ class QuestAlgorithm:
         if prefill_indices.numel() == 0:
             return
 
+        from sglang.srt.mem_cache.sparsity.algorithms.quest_prefill_bounds_kernel import (
+            quest_prefill_bounds,
+        )
+
         quest_prefill_bounds(
             k_data_ptrs=k_data_ptrs,
             prefill_indices=prefill_indices,
@@ -341,6 +384,9 @@ class QuestAlgorithm:
         num_full_pages = prefill_len // self.page_size
         partial_count = prefill_len - num_full_pages * self.page_size
 
+        if partial_count == 0:
+            self.running_k_min[:, req_pool_idx] = _BF16_POS_INF
+            self.running_k_max[:, req_pool_idx] = _BF16_NEG_INF
         self.running_token_count[req_pool_idx] = partial_count
         self.running_page_idx[req_pool_idx] = num_full_pages
 
@@ -401,6 +447,10 @@ class QuestAlgorithm:
             )
         if req_indices.numel() == 0:
             return
+        from sglang.srt.mem_cache.sparsity.algorithms.quest_decode_bounds_kernel import (
+            quest_decode_bounds,
+        )
+
         quest_decode_bounds(
             k_data_ptrs=k_data_ptrs,
             device_locs=device_locs,
@@ -432,24 +482,23 @@ class QuestAlgorithm:
         counts = self.running_token_count[req_indices]
         will_complete = counts == (self.page_size - 1)
 
-        # Run unconditionally on the device — when no req is completing,
-        # ``completing_reqs`` is empty and the advanced-indexing assignments
-        # below are no-ops.  This avoids a host-device sync from
-        # ``will_complete.any().item()`` on the critical decode-step path
-        # (the sync was the dominant per-step cost in cuda-graph replay).
-        completing_reqs = req_indices[will_complete]
-        page_indices = self.running_page_idx[completing_reqs].to(torch.int64)
-        self.page_k_min[:, completing_reqs, page_indices] = (
-            self.running_k_min[:, completing_reqs]
-        )
-        self.page_k_max[:, completing_reqs, page_indices] = (
-            self.running_k_max[:, completing_reqs]
-        )
-        self.running_k_min[:, completing_reqs] = _BF16_POS_INF
-        self.running_k_max[:, completing_reqs] = _BF16_NEG_INF
-        self.running_page_idx[completing_reqs] = (
-            self.running_page_idx[completing_reqs] + 1
-        )
+        # Boolean advanced indexing invokes nonzero(), whose output shape
+        # depends on device data and therefore cannot be captured in a CUDA
+        # graph. Keep the batch shape fixed and mask the writes instead.
+        page_indices = self.running_page_idx[req_indices].to(torch.int64)
+        in_storage = page_indices < self.max_pages_per_req
+        page_indices = page_indices.clamp(max=self.max_pages_per_req - 1)
+        complete = (will_complete & in_storage).view(1, -1, 1, 1)
+        for page_bounds, running_bounds, sentinel in (
+            (self.page_k_min, self.running_k_min, _BF16_POS_INF),
+            (self.page_k_max, self.running_k_max, _BF16_NEG_INF),
+        ):
+            running = running_bounds[:, req_indices]
+            page_bounds[:, req_indices, page_indices] = torch.where(
+                complete, running, page_bounds[:, req_indices, page_indices]
+            )
+            running_bounds[:, req_indices] = torch.where(complete, sentinel, running)
+        self.running_page_idx[req_indices] += will_complete.to(torch.int32)
 
         # Increment counters for ALL reqs, wrap to 0 on completion.
         self.running_token_count[req_indices] = (counts + 1) % self.page_size
@@ -472,28 +521,36 @@ class QuestAlgorithm:
             raise RuntimeError(
                 f"prepare_step bs={bs} > max_reqs={self._step_last_valid_buf.shape[0]}"
             )
-        seq_lens_i64 = seq_lens.to(torch.int64)
+        # Graph padding may contain zero-length requests. They must emit no
+        # attention entries and only safe dummy positions in unused slots.
+        seq_lens_i64 = seq_lens.to(torch.int64).clamp(min=0)
         last_valid = (seq_lens_i64 - 1).clamp(min=0).unsqueeze(1)  # [bs, 1]
         self._step_last_valid_buf[:bs].copy_(last_valid, non_blocking=True)
 
         recent_start = (seq_lens_i64 - self.page_size).clamp(min=0).unsqueeze(1)
         recent_positions = torch.minimum(
-            recent_start + self._recent_offsets_const, last_valid,
+            recent_start + self._recent_offsets_const,
+            last_valid,
         )  # [bs, page_size]
         self._step_recent_positions_buf[:bs].copy_(
-            recent_positions.to(torch.int32), non_blocking=True,
+            recent_positions.to(torch.int32),
+            non_blocking=True,
         )
 
         short_layout = torch.minimum(
-            self._all_positions_const, last_valid,
-        ).to(torch.int32)  # [bs, top_k]
+            self._all_positions_const,
+            last_valid,
+        ).to(
+            torch.int32
+        )  # [bs, top_k]
         self._step_short_layout_buf[:bs].copy_(short_layout, non_blocking=True)
 
         is_short = (seq_lens_i64 <= self.top_k).unsqueeze(1)
         self._step_is_short_buf[:bs].copy_(is_short, non_blocking=True)
 
         actual_lens = torch.minimum(
-            seq_lens_i64, torch.full_like(seq_lens_i64, self.top_k),
+            seq_lens_i64,
+            torch.full_like(seq_lens_i64, self.top_k),
         ).to(torch.int32)
         self._step_actual_lens_buf[:bs].copy_(actual_lens, non_blocking=True)
 
@@ -506,8 +563,8 @@ class QuestAlgorithm:
         tensor: ``[num_layers, max_reqs, max_pages_per_req]``, dtype bool.
 
         This is for tests that introspect Quest state.  The retrieve_topk
-        hot path does NOT call this — it reads page_k_bounds directly and
-        relies on the sentinel score (-inf) to filter invalid pages.
+        hot path does NOT call this: its scoring kernel checks min <= max
+        and assigns negative infinity to invalid pages.
         """
         # ``page_k_max`` is a view of page_k_bounds[..., 1].
         # Reduce over (kv_heads, head_dim) — a page is valid iff at least
@@ -559,7 +616,8 @@ class QuestAlgorithm:
 
         Layout per request (long sequences, ``seq_len >= top_k``):
             slots ``[0, top_k - page_size)``: top-``(top_k_pages - 1)``
-              best-scoring full pages, expanded to token positions.
+            best-scoring full pages strictly before the recent window,
+              expanded to token positions (no overlap with the tail).
             slots ``[top_k - page_size, top_k)``: most-recent
               ``page_size`` token positions ("recent window"), which
               always covers the partial last page plus possibly a tail
@@ -583,11 +641,15 @@ class QuestAlgorithm:
 
         # Read step-level cached state (set by prepare_step before this step).
         recent_positions = self._step_recent_positions_buf[:bs]  # [bs, page_size] int32
-        short_layout = self._step_short_layout_buf[:bs]        # [bs, top_k] int32
-        is_short = self._step_is_short_buf[:bs]                # [bs, 1] bool
-        actual_lens = self._step_actual_lens_buf[:bs]          # [bs] int32
+        short_layout = self._step_short_layout_buf[:bs]  # [bs, top_k] int32
+        is_short = self._step_is_short_buf[:bs]  # [bs, 1] bool
+        actual_lens = self._step_actual_lens_buf[:bs]  # [bs] int32
 
-        # Align query shape to KV heads.
+        # Keep all query heads until AFTER their sign-dependent bounds have
+        # been scored. Averaging Q first can cancel opposing GQA heads and
+        # discard a page that either head needs. Both backends intentionally
+        # use one shared selection: average upper bounds within each KV group,
+        # then sum across KV groups, rather than per-head token selections.
         if queries.dim() == 2:
             hidden = queries.shape[1]
             if hidden % self.head_dim != 0:
@@ -601,34 +663,34 @@ class QuestAlgorithm:
         else:
             raise ValueError(f"Unsupported query shape {queries.shape}")
 
-        if q.shape[1] != self.kv_heads:
-            if q.shape[1] % self.kv_heads != 0:
-                raise ValueError(
-                    f"q_heads {q.shape[1]} not divisible by kv_heads {self.kv_heads}"
-                )
-            group = q.shape[1] // self.kv_heads
-            q = q.view(bs, self.kv_heads, group, self.head_dim).mean(dim=2)
+        if q.shape[2] != self.head_dim or q.shape[1] % self.kv_heads != 0:
+            raise ValueError(
+                f"Query shape {q.shape} incompatible with "
+                f"{self.kv_heads} KV heads of dimension {self.head_dim}"
+            )
 
         # Quest criticality: per-page upper bound on Σ q·k under the
         # bounding box [k_min, k_max].  Invalid pages → -inf (sentinel).
-        if _USE_TRITON_SCORE:
+        if _USE_TRITON_SCORE and q.is_cuda:
+            from sglang.srt.mem_cache.sparsity.algorithms.quest_score_kernel import (
+                quest_score,
+            )
+
             # Fused Triton kernel: gather + where + multiply + sum in ONE
             # kernel launch.  Replaces ~7 PyTorch ops, saving cuda graph
             # replay overhead.  Q must be float32 + contiguous.
             q_f32 = q.contiguous().float()
             scores = quest_score(
-                q_f32, self.page_k_bounds, req_pool_indices, layer_offset,
+                q_f32,
+                self.page_k_bounds,
+                req_pool_indices,
+                layer_offset,
             )  # [bs, max_pages_per_req] float32
         else:
             # Reference PyTorch path (for debug + correctness comparison).
-            k_bounds = self.page_k_bounds[layer_offset, req_pool_indices]
-            q_unsq = q.unsqueeze(1)
-            k_chosen = torch.where(
-                (q_unsq >= 0).unsqueeze(-1),
-                k_bounds[..., 1:2],
-                k_bounds[..., 0:1],
-            ).squeeze(-1)
-            scores = (q_unsq.float() * k_chosen.float()).sum(dim=(2, 3))
+            scores = quest_score_reference(
+                q, self.page_k_bounds, req_pool_indices, layer_offset
+            )
 
         # Long-sequence layout:
         #   first (top_k - page_size) slots: top (top_k_pages - 1) page expansions
@@ -643,10 +705,25 @@ class QuestAlgorithm:
             # the invalidation (or bf16 sentinel rounds badly under the score
             # formula), we'd otherwise silently pick OOB pages and read
             # garbage K/V.  Cost: ~3 ops/layer; arange constant is cached.
-            num_pages_per_req = (seq_lens.to(torch.int64) // self.page_size).unsqueeze(1)
+            # A recent window can straddle two physical Quest pages. Exclude
+            # every page that overlaps it; otherwise repeated tokens change
+            # softmax weights and violate the HiSparse resolver's set input.
+            num_pages_per_req = (
+                (seq_lens.to(torch.int64) - self.page_size).clamp(min=0)
+                // self.page_size
+            ).unsqueeze(1)
             page_idx = self._page_idx_const[: scores.shape[1]].unsqueeze(0)
             scores = scores.masked_fill(page_idx >= num_pages_per_req, float("-inf"))
-            topk_pages = torch.topk(scores, k=select_pages, dim=1).indices  # [bs, select_pages] int64
+            if scores.shape[1] < select_pages:
+                # All requests are necessarily short when the configured
+                # context is below top_k. Keep a safe fixed-size layout;
+                # torch.where below selects the dense branch for every row.
+                scores = torch.nn.functional.pad(
+                    scores, (0, select_pages - scores.shape[1]), value=float("-inf")
+                )
+            topk_pages = torch.topk(
+                scores, k=select_pages, dim=1
+            ).indices  # [bs, select_pages] int64
             # Expand pages to token positions.  No need to clamp — for
             # long-seq (where this layout is used), num_full_pages ≥
             # top_k_pages so topk picks valid in-range pages.
@@ -658,8 +735,39 @@ class QuestAlgorithm:
                 (bs, 0), dtype=torch.int64, device=self.device
             )
 
-        long_layout = torch.cat([select_positions, recent_positions], dim=1)  # [bs, top_k]
+        long_layout = torch.cat(
+            [select_positions, recent_positions], dim=1
+        )  # [bs, top_k]
 
         token_positions = torch.where(is_short, short_layout, long_layout)
 
         return token_positions.to(torch.int32), actual_lens
+
+
+def quest_score_reference(
+    q: torch.Tensor,
+    page_k_bounds: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    layer_offset: int,
+) -> torch.Tensor:
+    """PyTorch reference for the shared GQA page score used by both backends.
+
+    Take each query head's bounding-box upper bound first, average within
+    its KV group, then sum groups. Splitting positive/negative Q before the
+    reduction preserves that rule without materializing a page-by-Q-head
+    tensor. This is a shared-page Quest variant, not per-head selection.
+    """
+    bs, q_heads, head_dim = q.shape
+    kv_heads = page_k_bounds.shape[3]
+    grouped = q.float().reshape(bs, kv_heads, q_heads // kv_heads, head_dim)
+    q_positive = grouped.clamp(min=0).mean(dim=2).unsqueeze(1)
+    q_negative = grouped.clamp(max=0).mean(dim=2).unsqueeze(1)
+    bounds = page_k_bounds[layer_offset, req_pool_indices].float()
+    valid = (bounds[..., 0] <= bounds[..., 1]).all(dim=(-1, -2))
+    # Never rely on sentinel arithmetic: zero queries score invalid pages as
+    # zero, and extreme bounds may overflow even though the page is invalid.
+    bounds = torch.where(valid[..., None, None, None], bounds, 0)
+    scores = (q_positive * bounds[..., 1] + q_negative * bounds[..., 0]).sum(
+        dim=(-1, -2)
+    )
+    return scores.masked_fill(~valid, float("-inf"))

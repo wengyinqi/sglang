@@ -758,6 +758,45 @@ class ModelRunnerKVCacheMixin:
 
         self._init_pools()
 
+    def _quest_auxiliary_memory_bytes(
+        self: ModelRunner, max_num_reqs: int, token_capacity: int
+    ) -> int:
+        """Memory allocated after KV profiling by the two Quest backends."""
+        args = self.server_args
+        quest_backend = "flashinfer_quest" in (
+            args.attention_backend,
+            args.prefill_attention_backend,
+            args.decode_attention_backend,
+        )
+        if not (quest_backend or self.enable_hisparse):
+            return 0
+
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+        from sglang.srt.mem_cache.sparsity.quest_memory import (
+            estimate_quest_auxiliary_bytes,
+        )
+
+        cfg = parse_hisparse_config(args)
+        if not quest_backend and cfg.algorithm != "quest":
+            return 0
+        # Matches the colocated ReqToTokenPool in _init_pools. Quest rejects
+        # speculative decoding and disaggregated pools during argument validation.
+        max_context_len = self.model_config.context_len + 4
+        return estimate_quest_auxiliary_bytes(
+            top_k=cfg.top_k,
+            quest_page_size=cfg.quest_page_size,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            max_reqs=max_num_reqs,
+            max_context_len=max_context_len,
+            kv_heads=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_dim=self.model_config.head_dim,
+            device_buffer_size=cfg.device_buffer_size if self.enable_hisparse else 0,
+            device_token_capacity=token_capacity,
+            host_to_device_ratio=cfg.host_to_device_ratio,
+            kv_page_size=self.page_size,
+        )
+
     def _resolve_memory_pool_config(
         self: ModelRunner, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
@@ -782,6 +821,37 @@ class ModelRunnerKVCacheMixin:
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
         )
+        # Quest bounds scale with (request slots * configured context), not
+        # with device KV capacity. Reserve them before allocating K/V so a
+        # 200K context cannot silently consume the entire runtime headroom.
+        auxiliary_bytes = self._quest_auxiliary_memory_bytes(
+            config.max_running_requests, config.max_total_num_tokens
+        )
+        if auxiliary_bytes:
+            if auxiliary_bytes >= available_bytes:
+                raise RuntimeError(
+                    f"Quest auxiliary tensors require {auxiliary_bytes / (1 << 30):.2f} "
+                    f"GiB, but only {available_bytes / (1 << 30):.2f} GiB is available "
+                    "for KV and metadata. Reduce --max-running-requests or "
+                    "--context-length."
+                )
+            logger.info(
+                "Reserving %.2f GiB for Quest auxiliary tensors before KV allocation",
+                auxiliary_bytes / (1 << 30),
+            )
+            config = configurator.calculate_pool_sizes(
+                available_bytes - auxiliary_bytes, page_size
+            )
+            constrained = self._apply_token_constraints(config.max_total_num_tokens)
+            if constrained != config.max_total_num_tokens:
+                config = configurator.calculate_pool_sizes_from_max_tokens(
+                    constrained, page_size
+                )
+            # Shrinking KV capacity can only reduce this count, so metadata
+            # estimated from the initial capacity remains a conservative bound.
+            config.max_running_requests = self._resolve_max_num_reqs(
+                config.max_total_num_tokens
+            )
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
 
