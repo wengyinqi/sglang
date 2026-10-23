@@ -227,6 +227,23 @@ class TestStagePlanning(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same sparse selector"):
             self.parse(invalid, ["--include-hbm"])
 
+    def test_new_main_graph_batch_flag_is_explicit_and_old_checkout_keeps_default(self):
+        for flag in ("--cuda-graph-max-bs", "--cuda-graph-max-bs-decode"):
+            value = recipe()
+            if flag.endswith("-decode"):
+                value["graph_max_bs_flag"] = flag
+            stage, args = self.parse(value)
+            cmd = RUN.make_plan(stage, args)[0]["server_command"]
+            self.assertEqual(cmd[cmd.index(flag) + 1], "2")
+            other = (
+                "--cuda-graph-max-bs"
+                if flag.endswith("-decode")
+                else "--cuda-graph-max-bs-decode"
+            )
+            self.assertNotIn(other, cmd)
+        with self.assertRaisesRegex(ValueError, "graph_max_bs_flag"):
+            self.parse(recipe() | {"graph_max_bs_flag": "--wrong-flag"})
+
     def test_correctness_compares_cpu_first_and_reuses_slots(self):
         stage, args = self.parse(recipe(), correctness=True)
         groups = CORRECT.make_plan(stage, args)

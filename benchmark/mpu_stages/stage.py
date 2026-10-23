@@ -28,6 +28,11 @@ def load_stage(path):
         raise ValueError("Stages support TP1/TP4 and CPU or MPU backing")
     if "cpu" not in stage["variants"] or stage["variant"] not in stage["variants"]:
         raise ValueError("Every stage requires its CPU HiSparse reference recipe")
+    if stage.get("graph_max_bs_flag", "--cuda-graph-max-bs") not in (
+        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
+    ):
+        raise ValueError("Unsupported stage graph_max_bs_flag")
     for name, variant in stage["variants"].items():
         if name not in ("cpu", "mpu", "hbm") or not isinstance(variant, dict):
             raise ValueError("Unknown stage variant")
@@ -285,7 +290,7 @@ def server_command(stage, args, variant, input_len, ratio, *, eager=None):
         "--context-length": input_len + args.output_len,
         "--chunked-prefill-size": args.chunked_prefill_size,
         "--mem-fraction-static": args.mem_fraction_static,
-        "--cuda-graph-max-bs": max(args.concurrencies),
+        stage.get("graph_max_bs_flag", "--cuda-graph-max-bs"): max(args.concurrencies),
         "--random-seed": args.seed,
     }
     if args.revision:

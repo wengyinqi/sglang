@@ -128,6 +128,9 @@ recipe 中同名参数必须一致。可选 defaults 包括 `input_lens`、`outp
 token 数。模型的 index_topk 等原生设置仍是权威，recipe 必须与实际 checkpoint 一致。
 新 main 的 graph 验收读取 resolved `cuda_graph_config.decode.backend`；仅旧分支
 没有该结构时读取 `disable_cuda_graph`，避免 legacy 标志与自动关闭的实际 backend 不一致。
+新 main recipe 还必须设置 `"graph_max_bs_flag":"--cuda-graph-max-bs-decode"`，
+因为它分别注册 decode/prefill 的最大 graph batch size，旧的 `--cuda-graph-max-bs`
+会成为歧义参数。旧 Qwen recipe 不设置此属性，继续使用旧分支注册的原始参数名。
 
 运行时使用 `SGLANG_MPU_STAGE_TIMING_DIR` 与
 `sglang.srt.observability.mpu_stage_timing.MPUStageForwardTimer`：
