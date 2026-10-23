@@ -630,6 +630,7 @@ class Scheduler(
             c.attach_radix_cache(self.tree_cache)
 
         self.init_hisparse_coordinator()
+        self.init_mpu_stage_timing()
 
         if (
             get_disagg().disaggregation_mode == "decode"
@@ -1294,6 +1295,33 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+    def init_mpu_stage_timing(self) -> None:
+        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.observability.mpu_stage_timing import (
+            MPUStageForwardTimer,
+            collect_stage_capacity,
+        )
+
+        directory = os.environ.get("SGLANG_MPU_STAGE_TIMING_DIR")
+        parallel = get_parallel()
+        self.mpu_stage_timer = MPUStageForwardTimer.create(
+            directory,
+            resolving_view(self.server_args),
+            parallel.tp_rank,
+            parallel.pp_rank,
+            parallel.dp_rank,
+            capacity_provider=lambda: collect_stage_capacity(
+                self.token_to_kv_pool_allocator,
+                self.hisparse_coordinator,
+                parallel.tp_rank,
+                parallel.tp_size,
+            ),
+        )
+
+    def record_mpu_stage_forward(self, batch):
+        timer = self.mpu_stage_timer
+        return timer.wrap(batch) if timer is not None else nullcontext()
 
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
@@ -4177,8 +4205,9 @@ class Scheduler(
                 running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 
@@ -4643,9 +4672,10 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        with self.record_mpu_stage_forward(batch):
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4809,9 +4839,10 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
+                with self.record_mpu_stage_forward(batch):
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
+                    )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
@@ -5205,6 +5236,9 @@ class Scheduler(
             return
         self.metrics_reporter.record_scheduler_idle()
 
+        if self.mpu_stage_timer is not None:
+            self.mpu_stage_timer.flush_idle()
+
         if self.enable_unified_memory:
             try:
                 self.token_to_kv_pool_allocator.flush_opportunistic()
@@ -5311,7 +5345,9 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+                idle &= (
+                    not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+                )
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
