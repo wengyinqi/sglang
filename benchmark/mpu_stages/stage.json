@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "id": "04-deepseek-v4-flash-4gpu-4mpu",
+  "id": "03-deepseek-v4-flash-4gpu-0mpu",
   "family": "deepseek-v4-flash",
   "tp_size": 4,
   "default_model": "deepseek-ai/DeepSeek-V4-Flash",
   "default_revision": "60d8d70770c6776ff598c94bb586a859a38244f1",
-  "variant": "mpu",
+  "variant": "cpu",
   "selector": "deepseek-v4-c4-indexer",
   "physical_budget_exact": false,
   "frozen_host_budget": true,
