@@ -873,6 +873,13 @@ class HiSparseCoordinator:
     def prepare_for_graph_capture(self) -> None:
         if not self.is_dsv4_hisparse:
             return
+        if self.mem_pool_host.available_size() != self.mem_pool_host.size or (
+            self.backing_budget is not None and self.backing_budget.reserved
+        ):
+            raise RuntimeError(
+                "DeepSeek-V4 HiSparse graph capture requires an idle backing pool "
+                "with no active request leases"
+            )
         # Startup warmup/capture has no admitted request. Kernels must access
         # valid dummy slots; real staging resets its backing row before alloc.
         self.req_to_device_buffer.zero_()
@@ -897,13 +904,63 @@ class HiSparseCoordinator:
         if self.backing_budget is not None:
             self.backing_budget.release(req.rid)
 
+    def _retained_gpu_pool_tensors(self) -> dict:
+        """Frozen compute-pool payloads, including hot C4; preserve storage aliases.
+
+        The signature's total includes compute_kv_bytes; consumers must not add
+        them together as disjoint memory categories.
+        """
+        if not self.is_dsv4_hisparse:
+            return {}
+        full_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        return {
+            "c4_hot": self.mem_pool_device.kv_buffer,
+            "swa": (
+                full_pool.swa_kv_pool.kv_buffer
+                if full_pool.swa_kv_pool is not None
+                else None
+            ),
+            "c128": (
+                full_pool.c128_kv_pool.kv_buffer
+                if full_pool.c128_kv_pool is not None
+                else None
+            ),
+            "indexer": {
+                str(ratio): {
+                    "key_with_scale": pool.index_k_with_scale_buffer,
+                    "payload": getattr(pool, "index_k_payload_buffer", None),
+                    "scale": getattr(pool, "index_k_scale_buffer", None),
+                }
+                for ratio, pool in sorted(full_pool.index_pools.items())
+            },
+            "compress_state": {
+                str(layer): pool.kv_score_buffer.kv_score
+                for layer, pool in enumerate(full_pool.compress_state_pools)
+                if pool is not None
+            },
+            "indexer_compress_state": {
+                str(layer): pool.kv_score_buffer.kv_score
+                for layer, pool in enumerate(full_pool.indexer_compress_state_pools)
+                if pool is not None
+            },
+        }
+
     def get_stage_capacity_info(self) -> dict:
         """Per-rank cache accounting for the controlled NoPD experiment."""
+        from sglang.srt.observability.mpu_stage_timing import (
+            describe_retained_gpu_pools,
+        )
         from sglang.srt.runtime_context import get_schedule
 
         physical = self.token_to_kv_pool_allocator.hisparse_attn_allocator.size
         backing = self.mem_pool_host.size
         return {
+            **describe_retained_gpu_pools(self._retained_gpu_pool_tensors()),
+            "retained_gpu_pool_scope": (
+                "Frozen compute-pool fingerprint including c4_hot, SWA, C128, "
+                "indexer and both compression-state pools. Its bytes overlap "
+                "compute_kv_bytes and must not be added to it."
+            ),
             "backing_store": "mpu" if self.is_mpu else "cpu",
             "physical_compute_slots": physical,
             "requested_compute_token_budget": get_schedule().max_total_tokens,

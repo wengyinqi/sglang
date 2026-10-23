@@ -214,6 +214,8 @@ def test_capture_initializes_real_pointer_maps_and_empty_finish_releases():
         {"prepare_for_graph_capture", "release_backing", "request_finished"}
     )
     c.is_dsv4_hisparse = True
+    c.mem_pool_host = SimpleNamespace(size=128, available_size=lambda: 128)
+    c.backing_budget = admission.HiSparseBackingBudget(128, 64, 4)
     for name in (
         "req_to_device_buffer",
         "req_device_buffer_token_locs",
@@ -226,3 +228,104 @@ def test_capture_initializes_real_pointer_maps_and_empty_finish_releases():
     c.backing_budget.reserve("a", 64)
     c.request_finished(SimpleNamespace(rid="a", kv=SimpleNamespace(req_pool_idx=None)))
     assert c.backing_budget.reserved == 0
+
+
+@pytest.mark.parametrize(
+    "occupied,leased", [(True, False), (False, True), (True, True)]
+)
+def test_live_capture_rejected_without_overwriting_maps(occupied, leased):
+    c = coordinator({"prepare_for_graph_capture"})
+    c.is_dsv4_hisparse = True
+    c.mem_pool_host = SimpleNamespace(
+        size=128, available_size=lambda: 64 if occupied else 128
+    )
+    c.backing_budget = admission.HiSparseBackingBudget(128, 64, 4)
+    if leased:
+        c.backing_budget.reserve("active", 64)
+    names = ("req_to_device_buffer", "req_device_buffer_token_locs", "req_to_host_pool")
+    for name in names:
+        setattr(c, name, torch.full((2, 10), 7))
+    with pytest.raises(RuntimeError, match="idle backing pool"):
+        c.prepare_for_graph_capture()
+    for name in names:
+        assert torch.all(getattr(c, name) == 7)
+
+
+def test_retained_signature_collects_compute_pools_and_preserves_aliases():
+    from types import ModuleType
+
+    tensors = [torch.empty((i + 1, 2), dtype=torch.uint8) for i in range(7)]
+
+    def state(t):
+        return SimpleNamespace(kv_score_buffer=SimpleNamespace(kv_score=t))
+
+    full = SimpleNamespace(
+        c4_logical_size=128,
+        swa_kv_pool=SimpleNamespace(kv_buffer=[tensors[0]]),
+        c128_kv_pool=SimpleNamespace(kv_buffer=[tensors[1]]),
+        index_pools={
+            4: SimpleNamespace(index_k_with_scale_buffer=[tensors[2]]),
+            2: SimpleNamespace(
+                index_k_with_scale_buffer=None,
+                index_k_payload_buffer=[tensors[3]],
+                index_k_scale_buffer=[tensors[4]],
+            ),
+        },
+        compress_state_pools=[None, state(tensors[5]), state(tensors[5])],
+        indexer_compress_state_pools=[state(tensors[6]), None],
+    )
+    c = coordinator({"_retained_gpu_pool_tensors", "get_stage_capacity_info"})
+    c.is_dsv4_hisparse = True
+    c.is_mpu = True
+    c.page_size = 64
+    c.requested_backing_ratio = 2
+    c.token_to_kv_pool_allocator = SimpleNamespace(
+        get_kvcache=lambda: full,
+        size_full=512,
+        hisparse_attn_allocator=SimpleNamespace(size=64),
+    )
+    c.mem_pool_device = SimpleNamespace(
+        kv_buffer=[torch.empty((2, 37440), dtype=torch.uint8)]
+    )
+    c.mem_pool_host = SimpleNamespace(
+        size=128,
+        available_size=lambda: 128,
+        kv_buffer=[torch.empty((2, 37440), dtype=torch.uint8)],
+        storage_device_ids=[4],
+    )
+    c.backing_budget = admission.HiSparseBackingBudget(128, 64, 4)
+    seen = []
+
+    def describe(tree):
+        seen.append(tree)
+        return {
+            "retained_gpu_pool_bytes": 56,
+            "retained_gpu_pool_shapes": {"fixture": True},
+        }
+
+    timer = ModuleType("sglang.srt.observability.mpu_stage_timing")
+    timer.describe_retained_gpu_pools = describe
+    runtime = ModuleType("sglang.srt.runtime_context")
+    runtime.get_schedule = lambda: SimpleNamespace(max_total_tokens=512)
+    with patch.dict(sys.modules, {timer.__name__: timer, runtime.__name__: runtime}):
+        info = c.get_stage_capacity_info()
+    assert info["retained_gpu_pool_bytes"] == 56
+    assert "c4_hot" in info["retained_gpu_pool_scope"]
+    assert "must not be added" in info["retained_gpu_pool_scope"]
+    assert info["retained_gpu_pool_shapes"] == {"fixture": True}
+    tree = seen[0]
+    assert set(tree) == {
+        "c4_hot",
+        "swa",
+        "c128",
+        "indexer",
+        "compress_state",
+        "indexer_compress_state",
+    }
+    assert tree["c4_hot"] is c.mem_pool_device.kv_buffer
+    assert tree["swa"][0] is tensors[0] and tree["c128"][0] is tensors[1]
+    assert tree["indexer"]["4"]["key_with_scale"][0] is tensors[2]
+    assert tree["indexer"]["2"]["payload"][0] is tensors[3]
+    assert tree["indexer"]["2"]["scale"][0] is tensors[4]
+    assert tree["compress_state"]["1"] is tree["compress_state"]["2"] is tensors[5]
+    assert tree["indexer_compress_state"]["0"] is tensors[6]
