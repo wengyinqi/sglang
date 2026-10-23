@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "id": "01-qwen-quest-1gpu-0mpu",
+  "id": "02-qwen-quest-1gpu-1mpu",
   "family": "qwen",
   "tp_size": 1,
   "default_model": "Qwen/Qwen3-30B-A3B-Thinking-2507",
   "default_revision": "144afc2f379b542fdd4e85a1fcd5e1f79112d95d",
-  "variant": "cpu",
+  "variant": "mpu",
   "selector": "quest",
   "physical_budget_exact": true,
   "hbm_preserves_selector": true,
