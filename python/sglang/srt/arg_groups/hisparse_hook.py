@@ -86,6 +86,15 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
 
 def validate_glm_hisparse_scope(cfg) -> None:
     """Scope the hybrid DSA/KDA path to colocated, non-speculative serving."""
+    import json
+
+    from sglang.srt.mem_cache.mpu_glm import glm_backing_options
+
+    glm_backing_options(
+        json.loads(cfg.hisparse_config or "{}"),
+        tp_size=cfg.tp_size,
+        compute_device=0,
+    )
     if cfg.disaggregation_mode != "null":
         raise ValueError("GLM hybrid HiSparse currently requires NoPD serving")
     if cfg.speculative_algorithm not in (None, "NONE"):

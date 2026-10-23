@@ -101,6 +101,29 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._spec_scratch_capacity = capacity
         self._spec_device_buffer_size = device_buffer_size if capacity else 0
 
+    def limit_logical_capacity(self, backing_slots: int) -> None:
+        """Cap lifetime history by backing without resizing the GPU index pool.
+
+        Called once before serving. Existing full-to-hot/index address storage
+        keeps its original size, so an MPU capacity sweep does not resize it.
+        """
+        logical = self.logical_attn_allocator
+        if logical.available_size() != logical.size:
+            raise RuntimeError(
+                "Cannot resize HiSparse logical capacity with live requests"
+            )
+        if type(backing_slots) is not int or backing_slots <= 0:
+            raise ValueError("Backing capacity must be a positive slot count")
+        capacity = (
+            min(self._size_full, backing_slots) // self.page_size * self.page_size
+        )
+        if capacity <= 0:
+            raise ValueError("Backing capacity cannot hold one logical page")
+        self._size_full = capacity
+        logical.size = capacity
+        logical.num_pages = capacity // self.page_size
+        logical.clear()
+
     def request_slot_reserve(
         self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
     ) -> int:

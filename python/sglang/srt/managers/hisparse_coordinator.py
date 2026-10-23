@@ -557,6 +557,8 @@ class HiSparseCoordinator:
         self.num_tail_slots = 0
         self.backing_store = "cpu"
         self.backing_capacity_ratio = host_to_device_ratio
+        self.is_mpu = False
+        self.logical_address_capacity = token_to_kv_pool_allocator.size_full
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.swap_in_block_size = swap_in_block_size
@@ -573,6 +575,37 @@ class HiSparseCoordinator:
 
         self.full_attention_layer_id_mapping = None
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        from sglang.srt.mem_cache.mpu_glm import (
+            glm_backing_options,
+            resolve_compute_ordinal,
+        )
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        backing_extra = parse_hisparse_config().sparse_extra_config
+        compute_ordinal = None
+        if backing_extra.get("backing_store", "cpu") == "mpu":
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            compute_ordinal = resolve_compute_ordinal(
+                device, tp_rank=get_tensor_model_parallel_rank()
+            )
+        mode, storage_ids, mpu_ratio, mpu_reserve = glm_backing_options(
+            backing_extra,
+            tp_size=get_parallel().tp_size,
+            compute_device=compute_ordinal,
+        )
+        self.is_mpu = mode == "mpu"
+        if self.is_mpu:
+            if not isinstance(kvcache, HybridLinearKVPool):
+                raise ValueError(
+                    "This MPU branch requires GLM-5.3-Flash hybrid DSA/KDA"
+                )
+            if _is_xpu or num_draft_tokens or self.skip_io:
+                raise ValueError(
+                    "GLM MPU rejects XPU, speculation and skip-I/O debug mode"
+                )
+            self.backing_store = mode
+            self.backing_capacity_ratio = mpu_ratio
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
@@ -646,24 +679,37 @@ class HiSparseCoordinator:
                     raise ValueError(
                         "HiSparse device_buffer_size must cover top-k and tail columns."
                     )
-                self.mem_pool_host = MLATokenToKVPoolHost(
-                    buffer_info=self.mem_pool_device.get_device_pool_infos()[
-                        0
-                    ].buffer_info,
-                    device_capacity_tokens=(
-                        self.mem_pool_device.size
-                        if self.mem_pool_device.host_capacity_tokens is None
-                        else self.mem_pool_device.host_capacity_tokens
-                    ),
-                    start_layer=self.mem_pool_device.start_layer,
-                    end_layer=self.mem_pool_device.end_layer,
-                    target_layer_num=self.mem_pool_device.layer_num,
-                    host_to_device_ratio=host_to_device_ratio,
-                    host_size=0,
-                    page_size=self.mem_pool_device.page_size,
-                    layout="layer_first",
-                    override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
-                )
+                if self.is_mpu:
+                    from sglang.srt.mem_cache.mpu_glm import HiSparseMLAMPUPool
+
+                    self.mem_pool_host = HiSparseMLAMPUPool(
+                        self.mem_pool_device,
+                        storage_device_ids=storage_ids,
+                        capacity_ratio=mpu_ratio,
+                        memory_reserve_bytes=mpu_reserve,
+                    )
+                    self.token_to_kv_pool_allocator.limit_logical_capacity(
+                        self.mem_pool_host.size
+                    )
+                else:
+                    self.mem_pool_host = MLATokenToKVPoolHost(
+                        buffer_info=self.mem_pool_device.get_device_pool_infos()[
+                            0
+                        ].buffer_info,
+                        device_capacity_tokens=(
+                            self.mem_pool_device.size
+                            if self.mem_pool_device.host_capacity_tokens is None
+                            else self.mem_pool_device.host_capacity_tokens
+                        ),
+                        start_layer=self.mem_pool_device.start_layer,
+                        end_layer=self.mem_pool_device.end_layer,
+                        target_layer_num=self.mem_pool_device.layer_num,
+                        host_to_device_ratio=host_to_device_ratio,
+                        host_size=0,
+                        page_size=self.mem_pool_device.page_size,
+                        layout="layer_first",
+                        override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+                    )
                 self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
 
@@ -769,6 +815,8 @@ class HiSparseCoordinator:
             layer_num=layer_num,
             max_num_req_slots=max_num_req_slots,
         )
+        if self.is_mpu and not self.enable_prefetch:
+            self._allocate_miss_plan(max_num_req_slots)
 
     def _init_shared_index_prefetch(
         self,
@@ -812,6 +860,16 @@ class HiSparseCoordinator:
         # Plan recorded by the current anchor, replayed by its skip layers. One
         # buffer set suffices: the last skip layer's event wait orders the next
         # anchor's writes after this group's copies.
+        self._allocate_miss_plan(max_num_req_slots)
+        logger.info(
+            "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
+            "group(s), %d skip layer(s) of %d total.",
+            len(self._prefetch_groups),
+            sum(self._is_shared_index_layer),
+            layer_num,
+        )
+
+    def _allocate_miss_plan(self, max_num_req_slots: int) -> None:
         miss_plan_capacity = self.spec_swap.miss_plan_capacity
         self._miss_src = torch.zeros(
             (max_num_req_slots, miss_plan_capacity),
@@ -825,13 +883,6 @@ class HiSparseCoordinator:
         )
         self._miss_count = torch.zeros(
             (max_num_req_slots,), dtype=torch.int32, device=self.device
-        )
-        logger.info(
-            "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
-            "group(s), %d skip layer(s) of %d total.",
-            len(self._prefetch_groups),
-            sum(self._is_shared_index_layer),
-            layer_num,
         )
 
     def set_decode_producer_stream(self, stream) -> None:
@@ -868,8 +919,50 @@ class HiSparseCoordinator:
             ),
         )
 
+    def prepare_for_graph_capture(self) -> None:
+        if self.full_attention_layer_id_mapping is None:
+            return
+        if self.mem_pool_host.available_size() != self.mem_pool_host.size:
+            raise RuntimeError(
+                "GLM HiSparse graph capture requires an idle backing pool"
+            )
+        # Capture has no real request. Slot zero is initialized storage, and
+        # prevents dummy selections from addressing an unallocated -1 location.
+        self.req_to_device_buffer.zero_()
+        self.req_device_buffer_token_locs.zero_()
+        self.req_to_host_pool.zero_()
+
+    def get_retained_gpu_pool_tensors(self) -> dict:
+        """Tensor references for metadata-only accounting; never copy KV/state."""
+        wrapper = self.token_to_kv_pool_allocator.get_kvcache()
+        if not isinstance(wrapper, HybridLinearKVPool):
+            return {}
+        dsa = wrapper.full_kv_pool
+        mamba = wrapper.mamba_pool
+        return {
+            "dsa.hot_main_kv": dsa.kv_buffer,
+            "dsa.index_k_with_scale_buffer": dsa.index_k_with_scale_buffer,
+            "dsa.compress_tail_k": dsa._compress_tail_k,
+            "dsa.compress_tail_score": dsa._compress_tail_score,
+            # vars keeps every dataclass tensor/list field without deep copies.
+            "kda.state": dict(vars(mamba.mamba_cache)),
+            "kda.slot_metadata": {
+                name: getattr(mamba, name, None)
+                for name in (
+                    "replayssm_write_pos",
+                    "replayssm_spec_write_pos",
+                    "replayssm_cache_base",
+                    "replayssm_is_flush",
+                )
+            },
+        }
+
     def get_stage_capacity_info(self) -> dict:
         """Per-rank main KV capacity; excludes index K and GPU KDA state."""
+        from sglang.srt.observability.mpu_stage_timing import (
+            describe_retained_gpu_pools,
+        )
+
         compute_slots = self.token_to_kv_pool_allocator.hisparse_attn_allocator.size
         backing_slots = self.mem_pool_host.size
         buffers = self.mem_pool_device.kv_buffer
@@ -879,30 +972,39 @@ class HiSparseCoordinator:
             compute_bytes = sum(t.numel() * t.element_size() for t in buffers)
         backing = self.mem_pool_host.kv_buffer
         logical_slots = self.token_to_kv_pool_allocator.size_full
-        return {
+        result = {
             "backing_store": self.backing_store,
             "physical_compute_slots": compute_slots,
             "backing_slots": backing_slots,
             "compute_kv_bytes": compute_bytes,
             "backing_kv_bytes": backing.numel() * backing.element_size(),
-            "storage_device_ids": [],
+            "storage_device_ids": getattr(self.mem_pool_host, "storage_device_ids", []),
             "requested_capacity_ratio": self.backing_capacity_ratio,
             "effective_capacity_ratio": backing_slots / compute_slots,
             "reserved_slots": 0,
             "logical_admission_slots": logical_slots,
+            "logical_address_slots": self.logical_address_capacity,
+            "usable_capacity_ratio": logical_slots / compute_slots,
             "padding_slots": {
                 "compute": self.mem_pool_device.page_size,
-                "backing": max(0, backing_slots - logical_slots),
+                "backing": 0 if self.is_mpu else max(0, backing_slots - logical_slots),
             },
+            "unaddressable_backing_slots": (
+                max(0, backing_slots - logical_slots) if self.is_mpu else 0
+            ),
             "used_slots": backing_slots - self.mem_pool_host.available_size(),
             "excluded_components": [
                 "DSA index K",
                 "KDA recurrent and convolution state",
             ],
         }
+        result.update(describe_retained_gpu_pools(self.get_retained_gpu_pool_tensors()))
+        return result
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
+        if self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] == 0:
+            self.req_to_host_pool[req.kv.req_pool_idx].fill_(-1)
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : req.extend_end
@@ -1535,6 +1637,7 @@ class HiSparseCoordinator:
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
         """
         num_reqs = req_pool_indices.size(0)
+        record_plan = record_plan or self.is_mpu
         plan = (
             dict(
                 miss_src=self._miss_src[:num_reqs],
@@ -1564,13 +1667,18 @@ class HiSparseCoordinator:
         )
         if not self.is_dsv4_hisparse and not _is_xpu:
             plan["num_tail_slots"] = self.num_tail_slots
-        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io)
+        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io or self.is_mpu)
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
             host_cache_locs=self.req_to_host_pool,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            # MPU planning uses a compute placeholder and performs no payload I/O.
+            host_cache=(
+                self.mem_pool_device.kv_buffer[layer_id]
+                if self.is_mpu
+                else self.mem_pool_host.kv_buffer[layer_id]
+            ),
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
@@ -1585,6 +1693,14 @@ class HiSparseCoordinator:
             **skip_io_kwargs,
             **plan,
         )
+        if self.is_mpu:
+            self.mem_pool_host.replay_misses(
+                self._miss_src[:num_reqs],
+                self._miss_dst[:num_reqs],
+                self._miss_count[:num_reqs],
+                self.num_real_reqs,
+                layer_id,
+            )
         return top_k_indices
 
     def swap_in_selected_blocks(
@@ -1630,6 +1746,15 @@ class HiSparseCoordinator:
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
         (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
+        if self.is_mpu:
+            self.mem_pool_host.replay_misses(
+                self._miss_src[:num_reqs],
+                self._miss_dst[:num_reqs],
+                self._miss_count[:num_reqs],
+                self.num_real_reqs,
+                skip_layer,
+            )
+            return
         copy_cache_planned_mla(
             miss_src=self._miss_src[:num_reqs],
             miss_dst=self._miss_dst[:num_reqs],

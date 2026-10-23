@@ -1482,11 +1482,17 @@ class ModelRunner:
     @property
     def logical_max_total_num_tokens(self):
         """Request-token capacity in logical tokens, not per-rank DCP rows."""
-        return self.req_to_token_pool.schedulable_token_capacity(
-            self.kv_cache_configurator.logical_token_capacity(
-                max_total_num_tokens=self.max_total_num_tokens
-            )
+        capacity = self.kv_cache_configurator.logical_token_capacity(
+            max_total_num_tokens=self.max_total_num_tokens
         )
+        if (
+            self.enable_hisparse
+            and getattr(self.model_config.hf_config, "model_type", None) == "glm5_next"
+        ):
+            # MPU can cap history below the fixed index budget. Retain the
+            # physical prefill limit: NoPD stages only after prefill completes.
+            capacity = min(capacity, self.token_to_kv_pool_allocator.size_full)
+        return self.req_to_token_pool.schedulable_token_capacity(capacity)
 
     @property
     def effective_logical_max_total_num_tokens(self):

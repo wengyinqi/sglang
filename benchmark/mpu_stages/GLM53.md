@@ -52,18 +52,98 @@ capacity, and the logical admission limit. Logical history slots remain reserved
 when their hot-cache mapping is released; the paged logical allocator rejects
 decode growth at capacity and releases those slots only at request cleanup.
 
+## 4+4 MPU backing
+
+Use the same command above, expose `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`,
+and replace the HiSparse JSON with:
+
+```json
+{"top_k":2048,"device_buffer_size":4096,"host_to_device_ratio":2,"backing_store":"mpu","mpu_device_ids":[4,5,6,7],"mpu_capacity_ratio":2.0,"mpu_memory_reserve_bytes":1073741824}
+```
+
+Each rank `i` executes on compute ordinal `i` and stores its complete DSA main
+KV history on ordinal `4+i`. The standalone MPU pool uses one native allocation
+of `[11, backing_slots, 1, 512]` BF16 per rank. Compute kernels initialize and
+read/write the peer allocation through CUDA UVA/P2P; storage GPUs launch no KV
+kernels. CPU holds page-allocation metadata only. P2P/allocator/layout failures
+abort startup; they never construct a CPU KV fallback.
+
+The existing HiSparse kernel computes the same selection/LRU miss plan with
+payload I/O disabled, then a compute-GPU peer kernel replays that plan. Prefill
+and decode append use the same peer record-copy interface. Shared-index
+prefetch replays on the compute prefetch stream. Request free conservatively
+synchronizes compute streams before returning backing pages, and pool destroy
+drains them before dropping the allocation. These synchronization choices may
+affect throughput and require hardware measurement.
+
+Linux/NVIDIA CUDA, the native non-expandable allocator, an accessible directional
+P2P pair and enough storage memory are required. Each storage allocation leaves
+the configured reserve (default 1 GiB) unallocated. The tested local environment
+has no CUDA device, so the CUDA modules have not been compiled or executed here.
+
+### Capacity sweep contract
+
+Set one fixed `--max-total-tokens` compute budget for every sweep point; do not
+let free-memory profiling choose a new compute KV allocation between runs.
+`host_to_device_ratio` fixes the logical-address/DSA-index budget on compute
+GPUs, while `mpu_capacity_ratio` independently sizes the exposed MPU payload.
+Select a fixed address ratio at least as large as the largest MPU ratio in the
+sweep and use it for **all** CPU/MPU variants. For example, a 1x/2x/4x MPU sweep
+uses `host_to_device_ratio=4` throughout and varies only `mpu_capacity_ratio`.
+This increases fixed GPU index storage, so first validate that that fixed budget
+fits; it does not increase the physical main-KV hot pool.
+The provider also supplies the common metadata-only retained-pool signature:
+hot main KV, DSA index K, KPool tail K/score, every KDA `mamba_cache` tensor and ReplaySSM
+cursor buffers. The common timer records storage-deduplicated bytes and each
+tensor's shape, dtype, strides, offset and alias group so the benchmark can
+reject compute-state drift between CPU/MPU runs and capacity points.
+Those retained bytes overlap `compute_kv_bytes`; do not add the two counters.
+
+The MPU allocation rounds down to a whole page. Actual logical admission is
+`min(fixed logical/index slots, MPU slots)`. Increasing MPU allocation beyond
+the fixed index limit cannot improve usable history capacity; the provider
+reports those bytes as `unaddressable_backing_slots`, not padding. Plot usable
+capacity using `logical_admission_slots`/`usable_capacity_ratio`, and retain
+`backing_slots`/`effective_capacity_ratio` as allocated-capacity measurements.
+Serving request-length limits are capped by this logical admission limit and
+retain the original physical prefill limit. NoPD stages KV only after the final
+prefill chunk, so one input must still fit compute KV; additional backing does
+not implement streaming prefill beyond that limit. The CPU
+baseline has its existing extra backing page and reports it as padding.
+
+For a full-HBM correctness oracle, omit `--enable-hisparse` and
+`--hisparse-config`, keep BF16 KV, model revision, KPool attention backend and
+parallelism identical, and choose an input size that fits its full GPU history.
+That oracle is a separate validation variant; the requested `4+0` stage is CPU
+DDR-backed HiSparse.
+
 ## Validation
 
 Portable checks (run from the repository root):
 
 ```bash
-python -m unittest discover -s test/manual/mpu_stages -p 'test_glm53_cpu.py'
+python -m unittest discover -s test/manual/mpu_stages -p 'test_glm53*.py'
 ```
 
 The tests execute production AST definitions with CPU tensors: compact DSA
 construction, wrapper/KDA ownership, mapping, KPool tails, kernel-call ABI,
 scope rejection, capacity accounting, and real paged-allocator history lifetime,
 decode exhaustion and release. They do not compile CUDA kernels.
+MPU tests additionally cover exact ordinal pairing, invalid configuration,
+fixed-address capacity clamping, the standalone peer-allocation geometry,
+chunk/append metadata allocation, exhaustion/reuse, compute pointer tables,
+peer transfer/replay dispatch, shutdown ordering and capture dummy locations.
+
+The opt-in GPU transfer test is:
+
+```bash
+SGLANG_TEST_GLM53_MPU=1 python -m unittest discover -s test/manual/mpu_stages -p 'test_glm53_gpu.py'
+```
+
+It exercises one compute/storage pair from the eight-device topology, BF16
+all-layer writeback, per-layer load, fixed-size miss replay with invalid padded
+rows, and CUDA graph replay. It does not load the model or establish TP4 model
+equivalence. It is skipped in the local CPU test run.
 
 Hardware acceptance must check startup, logits/selected locations versus the
 same checkpoint and dense-history oracle, long-context hot-buffer eviction,

@@ -32,7 +32,8 @@ def definition(path, name, namespace=None, owner=None):
         ],
         type_ignores=[],
     )
-    ns = dict(torch=torch, weakref=weakref, **(namespace or {}))
+    ns = dict(torch=torch, weakref=weakref)
+    ns.update(namespace or {})
     exec(compile(ast.fix_missing_locations(module), str(ROOT / path), "exec"), ns)
     return ns[name]
 
@@ -369,6 +370,7 @@ class TestScopeAndCapacity(unittest.TestCase):
             kv_cache_dtype="bfloat16",
             enable_hierarchical_cache=False,
             enable_lmcache=False,
+            hisparse_config=None,
         )
 
     def test_supported_cpu_ddr_scope(self):
@@ -376,7 +378,11 @@ class TestScopeAndCapacity(unittest.TestCase):
             "python/sglang/srt/arg_groups/hisparse_hook.py",
             "validate_glm_hisparse_scope",
         )
-        validate(self.config())
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.mem_cache.mpu_glm": NS(glm_backing_options=Mock())},
+        ):
+            validate(self.config())
 
     def test_unvalidated_modes_fail_closed(self):
         validate = definition(
@@ -396,7 +402,10 @@ class TestScopeAndCapacity(unittest.TestCase):
         ):
             cfg = self.config()
             setattr(cfg, field, value)
-            with self.subTest(field=field), self.assertRaises(ValueError):
+            with self.subTest(field=field), self.assertRaises(ValueError), patch.dict(
+                sys.modules,
+                {"sglang.srt.mem_cache.mpu_glm": NS(glm_backing_options=Mock())},
+            ):
                 validate(cfg)
 
     def test_capacity_reports_payload_bytes_and_actual_occupancy(self):
@@ -406,6 +415,9 @@ class TestScopeAndCapacity(unittest.TestCase):
         coordinator = NS(
             backing_store="cpu",
             backing_capacity_ratio=2,
+            is_mpu=False,
+            logical_address_capacity=256,
+            get_retained_gpu_pool_tensors=lambda: {"test": []},
             token_to_kv_pool_allocator=NS(
                 hisparse_attn_allocator=NS(size=128), size_full=256
             ),
@@ -419,7 +431,19 @@ class TestScopeAndCapacity(unittest.TestCase):
                 available_size=lambda: 256,
             ),
         )
-        result = info(coordinator)
+        describe = Mock(
+            return_value={"retained_gpu_pool_bytes": {}, "retained_gpu_pool_shapes": {}}
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.observability.mpu_stage_timing": NS(
+                    describe_retained_gpu_pools=describe
+                )
+            },
+        ):
+            result = info(coordinator)
+        describe.assert_called_once_with({"test": []})
         self.assertEqual(result["compute_kv_bytes"], 11 * 192 * 1024)
         self.assertEqual(result["backing_kv_bytes"], 11 * 320 * 1024)
         self.assertEqual(result["used_slots"], 64)
