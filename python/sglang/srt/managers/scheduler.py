@@ -4202,6 +4202,17 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            if self.enable_hisparse:
+                # Staging requests still occupy req rows but are absent from
+                # running_batch. Count the actual remaining row capacity.
+                fresh_rows = sum(r.kv.req_pool_idx is None for r in adder.can_run_list)
+                if (
+                    req.kv.req_pool_idx is None
+                    and fresh_rows >= self.req_to_token_pool.available_size()
+                ):
+                    break
+                if not self.hisparse_coordinator.reserve_backing(req):
+                    continue
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
@@ -4218,6 +4229,8 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
+            if self.enable_hisparse and req not in adder.can_run_list:
+                self.hisparse_coordinator.release_backing(req)
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 

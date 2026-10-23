@@ -1236,6 +1236,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # graph; backends read it from self.model_runner.hisparse_coordinator.
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator.prepare_for_graph_capture()
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
 
         if buffers.ngram_embedding_info is not None:

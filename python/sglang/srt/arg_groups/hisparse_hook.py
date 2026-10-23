@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -100,6 +101,17 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     hf_config = model_config_of(server_args).hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_m3_hisparse = is_minimax_sparse(hf_config)
+    from sglang.srt.mem_cache.mpu_c4_config import (
+        c4_backing_options,
+        validate_c4_mpu_launch,
+    )
+
+    extra = json.loads(cfg.hisparse_config or "{}")
+    mode, _, _, _ = c4_backing_options(extra)
+    if mode == "mpu":
+        if not is_v4_hisparse:
+            raise ValueError("This MPU experiment supports DeepSeek-V4 C4 only")
+        validate_c4_mpu_launch(cfg, extra)
     is_hip = get_platform().is_hip
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse or is_m3_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "

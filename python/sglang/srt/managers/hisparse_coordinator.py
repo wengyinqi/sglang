@@ -546,6 +546,7 @@ class HiSparseCoordinator:
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
         num_draft_tokens: int = 0,
+        backing_options: Optional[dict] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -562,6 +563,15 @@ class HiSparseCoordinator:
                 "ops do not accept skip_io, so timings would silently include the KV "
                 "copy."
             )
+        from sglang.srt.mem_cache.mpu_c4_config import c4_backing_options
+
+        mode, storage_ids, capacity_ratio, reserve = c4_backing_options(
+            backing_options or {}
+        )
+        self.is_mpu = mode == "mpu"
+        self.requested_backing_ratio = (
+            capacity_ratio if self.is_mpu else host_to_device_ratio
+        )
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
@@ -577,19 +587,37 @@ class HiSparseCoordinator:
                 + page_size
                 - 1
             ) // page_size
-            self.mem_pool_host = DeepSeekV4PagedHostPool(
-                pool_name="dsv4_hisparse_c4",
-                device_buffers=self.mem_pool_device.kv_buffer,
-                item_bytes=self.mem_pool_device.bytes_per_page_padded,
-                num_host_pages=num_host_pages,
-                slot_page_size=page_size,
-                layout="layer_first",
-            )
+            if self.is_mpu:
+                from sglang.srt.mem_cache.mpu_c4_pool import DeepSeekV4MPUPagedPool
+
+                if get_parallel().tp_size != 4 or num_draft_tokens or self.skip_io:
+                    raise ValueError(
+                        "C4 MPU requires TP4 without speculation or skip-IO"
+                    )
+                self.mem_pool_host = DeepSeekV4MPUPagedPool(
+                    self.mem_pool_device,
+                    storage_ids[get_parallel().tp_rank],
+                    capacity_ratio,
+                    reserve,
+                )
+            else:
+                self.mem_pool_host = DeepSeekV4PagedHostPool(
+                    pool_name="dsv4_hisparse_c4",
+                    device_buffers=self.mem_pool_device.kv_buffer,
+                    item_bytes=self.mem_pool_device.bytes_per_page_padded,
+                    num_host_pages=num_host_pages,
+                    slot_page_size=page_size,
+                    layout="layer_first",
+                )
             self.item_size_bytes = (
                 self.mem_pool_device.kv_cache_total_dim
                 * self.mem_pool_device.store_dtype.itemsize
             )
         else:
+            if self.is_mpu:
+                raise ValueError(
+                    "This experiment's MPU backing supports DeepSeek-V4 C4 only"
+                )
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
             )
@@ -741,6 +769,26 @@ class HiSparseCoordinator:
             max_num_req_slots=max_num_req_slots,
         )
 
+        if self.is_mpu:
+            if self.enable_prefetch:
+                raise ValueError(
+                    "C4 MPU initially requires independent per-layer index plans"
+                )
+            self._mpu_miss_src = torch.empty(
+                (max_num_req_slots, self.top_k), dtype=torch.int64, device=device
+            )
+            self._mpu_miss_dst = torch.empty_like(self._mpu_miss_src, dtype=torch.int32)
+            self._mpu_miss_count = torch.zeros(
+                max_num_req_slots, dtype=torch.int32, device=device
+            )
+        self.backing_budget = None
+        if self.is_dsv4_hisparse:
+            from sglang.srt.mem_cache.hisparse_admission import HiSparseBackingBudget
+
+            self.backing_budget = HiSparseBackingBudget(
+                self.mem_pool_host.size, self.page_size, 4
+            )
+
     def _init_shared_index_prefetch(
         self,
         shared_index_layers: Optional[List[bool]],
@@ -822,20 +870,70 @@ class HiSparseCoordinator:
             self.prefetch_stream.synchronize()
         self.mem_pool_host.destroy()
 
+    def prepare_for_graph_capture(self) -> None:
+        if not self.is_dsv4_hisparse:
+            return
+        # Startup warmup/capture has no admitted request. Kernels must access
+        # valid dummy slots; real staging resets its backing row before alloc.
+        self.req_to_device_buffer.zero_()
+        self.req_device_buffer_token_locs.zero_()
+        self.req_to_host_pool.zero_()
+
+    def reserve_backing(self, req: Req) -> bool:
+        if self.backing_budget is None or req.to_finish is not None:
+            return True
+        slots = self.backing_budget.slots_for(
+            len(req.origin_input_ids), req.sampling_params.max_new_tokens
+        )
+        if slots > self.backing_budget.capacity:
+            req.set_finish_with_abort(
+                f"HiSparse request requires {slots} C4 backing slots, capacity is {self.backing_budget.capacity}",
+                status_code=400,
+            )
+            return True
+        return self.backing_budget.reserve(req.rid, slots)
+
+    def release_backing(self, req: Req) -> None:
+        if self.backing_budget is not None:
+            self.backing_budget.release(req.rid)
+
     def get_stage_capacity_info(self) -> dict:
         """Per-rank cache accounting for the controlled NoPD experiment."""
+        from sglang.srt.runtime_context import get_schedule
+
         physical = self.token_to_kv_pool_allocator.hisparse_attn_allocator.size
         backing = self.mem_pool_host.size
         return {
-            "backing_store": "cpu",
+            "backing_store": "mpu" if self.is_mpu else "cpu",
             "physical_compute_slots": physical,
+            "requested_compute_token_budget": get_schedule().max_total_tokens,
             "backing_slots": backing,
+            "addressable_backing_slots": (
+                min(
+                    backing,
+                    self.token_to_kv_pool_allocator.size_full // 4,
+                    self.token_to_kv_pool_allocator.get_kvcache().c4_logical_size,
+                )
+                if self.is_dsv4_hisparse
+                else backing
+            ),
             "compute_kv_bytes": sum(x.nbytes for x in self.mem_pool_device.kv_buffer),
             "backing_kv_bytes": sum(x.nbytes for x in self.mem_pool_host.kv_buffer),
-            "storage_device_ids": [],
-            "requested_capacity_ratio": backing / physical,
+            "storage_device_ids": getattr(self.mem_pool_host, "storage_device_ids", []),
+            "requested_capacity_ratio": self.requested_backing_ratio,
             "effective_capacity_ratio": backing / physical,
-            "reserved_slots": 0,
+            "reserved_slots": (
+                self.backing_budget.reserved if self.backing_budget else 0
+            ),
+            "logical_full_slots": getattr(
+                self.token_to_kv_pool_allocator, "size_full", physical
+            ),
+            "padding_slots": (
+                self.mem_pool_device.kv_buffer[0].shape[0] * self.page_size - physical
+                if self.is_dsv4_hisparse
+                else self.page_size
+            ),
+            "compute_slots_divisor": 4 if self.is_dsv4_hisparse else 1,
             "used_slots": backing - self.mem_pool_host.available_size(),
             "scope": (
                 "C4 compressed slots only" if self.is_dsv4_hisparse else "MLA KV slots"
@@ -877,6 +975,8 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
+        self.req_to_host_pool[req.kv.req_pool_idx].fill_(-1)
+        self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
@@ -1414,6 +1514,7 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.kv.req_pool_idx] = False
         self.spec_swap.free_unrotated_scratch(req.kv.req_pool_idx)
         req.hisparse_staging = False
+        self.release_backing(req)
 
     def retract_req(self, req: Req) -> None:
         if req.hisparse_staging:
@@ -1422,6 +1523,9 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
+        self.release_backing(req)
+        if req.kv.req_pool_idx is None:
+            return
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
@@ -1500,15 +1604,22 @@ class HiSparseCoordinator:
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
         """
         num_reqs = req_pool_indices.size(0)
-        plan = (
-            dict(
-                miss_src=self._miss_src[:num_reqs],
-                miss_dst=self._miss_dst[:num_reqs],
-                miss_count=self._miss_count[:num_reqs],
+        if self.is_mpu:
+            plan = dict(
+                miss_src=self._mpu_miss_src[:num_reqs],
+                miss_dst=self._mpu_miss_dst[:num_reqs],
+                miss_count=self._mpu_miss_count[:num_reqs],
             )
-            if record_plan
-            else {}
-        )
+        else:
+            plan = (
+                dict(
+                    miss_src=self._miss_src[:num_reqs],
+                    miss_dst=self._miss_dst[:num_reqs],
+                    miss_count=self._miss_count[:num_reqs],
+                )
+                if record_plan
+                else {}
+            )
 
         if top_k_result.ndim == 3:
             return self.spec_swap.swap_in(
@@ -1527,13 +1638,19 @@ class HiSparseCoordinator:
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
-        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io)
+        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io or self.is_mpu)
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
             host_cache_locs=self.req_to_host_pool,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            # Planner-only MPU path passes a compute-local sentinel. It never
+            # dispatches an operation using a storage device tensor.
+            host_cache=(
+                self.mem_pool_device.kv_buffer[layer_id]
+                if self.is_mpu
+                else self.mem_pool_host.kv_buffer[layer_id]
+            ),
             device_buffer=self.mem_pool_device.kv_buffer[layer_id],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
@@ -1548,6 +1665,10 @@ class HiSparseCoordinator:
             **skip_io_kwargs,
             **plan,
         )
+        if self.is_mpu:
+            self.mem_pool_host.replay_misses(
+                **plan, num_real_reqs=self.num_real_reqs, layer_id=layer_id
+            )
         return top_k_indices
 
     def swap_in_selected_blocks(

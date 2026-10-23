@@ -425,7 +425,7 @@ __global__ void load_cache_to_device_buffer_kernel(
         if (token_pos >= 0 && token_pos < seq_len) {
           device_loc = req_device_buffer_locs[token_pos];
         }
-      } else if (i < count && token_pos >= 0) {
+      } else if (i < count && token_pos >= 0 && token_pos < seq_len) {
         device_loc = req_device_buffer_locs[token_pos];
       }
       req_top_k_device_locs[i] = device_loc;
@@ -483,12 +483,10 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K_TOKENS; i += BLOCK_SIZE) {
     const int32_t token_idx = resolve_selected_token<SPARSE_BLOCK_SIZE, TopKIsBlocks>(req_top_k, i);
-    if constexpr (TopKIsBlocks) {
-      if (token_idx < 0 || token_idx >= seq_len) {
-        s_top_k_tokens[i] = TOKEN_HIT;
-        req_top_k_device_locs[i] = -1;
-        continue;
-      }
+    if (token_idx < 0 || token_idx >= seq_len) {
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_top_k_device_locs[i] = -1;
+      continue;
     }
     if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
