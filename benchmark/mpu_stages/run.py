@@ -125,12 +125,37 @@ def verify_capacities(capacities, stage, args, variant, ratio):
             # CPU pools can add allocator padding. Keep reported usable/allocated
             # sizes, ratios and scope; do not pretend the requested ratio is exact.
         if variant == "mpu":
+            if (
+                capacity.get("addressable_backing_slots", capacity["backing_slots"])
+                < capacity["backing_slots"]
+            ):
+                raise ValueError(
+                    "Allocated MPU capacity exceeds the addressable backing budget; refusing a false capacity plateau"
+                )
             config = STAGE.config_for(stage, args, variant, ratio)
             devices = config["mpu_device_ids"]
             expected = devices if stage["tp_size"] == 1 else [devices[rank]]
             if capacity.get("storage_device_ids") != expected:
                 raise ValueError("Actual per-rank MPU storage map differs from plan")
     return capacities
+
+
+def decode_graph_enabled(server_info):
+    """The new phase backend is authoritative; legacy bool is old-checkout fallback."""
+    config = server_info.get("cuda_graph_config")
+    if isinstance(config, dict):
+        backend = config.get("decode", {}).get("backend")
+        if backend not in ("disabled", "full", "breakable"):
+            raise ValueError(
+                "Server did not expose a recognized resolved decode CUDA graph backend"
+            )
+        return backend != "disabled"
+    legacy = server_info.get("disable_cuda_graph")
+    if type(legacy) is not bool:
+        raise ValueError(
+            "Server did not expose its effective decode CUDA graph configuration"
+        )
+    return not legacy
 
 
 def wait_capacities(

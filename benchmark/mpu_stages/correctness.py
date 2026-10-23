@@ -96,7 +96,7 @@ def execute(stage, args, manifest, path):
                 RUN.COMMON.write_manifest(
                     args.output_dir / f'{group["id"]}-server-info.json', info
                 )
-                if info.get("disable_cuda_graph") is not group["eager"]:
+                if RUN.decode_graph_enabled(info) == group["eager"]:
                     raise ValueError(
                         "Actual CUDA graph setting differs from the acceptance case"
                     )
