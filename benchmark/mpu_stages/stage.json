@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "id": "04-deepseek-v4-flash-4gpu-4mpu",
+  "family": "deepseek-v4-flash",
+  "tp_size": 4,
+  "default_model": "deepseek-ai/DeepSeek-V4-Flash",
+  "default_revision": "60d8d70770c6776ff598c94bb586a859a38244f1",
+  "variant": "mpu",
+  "selector": "deepseek-v4-c4-indexer",
+  "physical_budget_exact": false,
+  "frozen_host_budget": true,
+  "graph_max_bs_flag": "--cuda-graph-max-bs-decode",
+  "hbm_preserves_selector": true,
+  "sparse_context_multiplier": 4,
+  "page_size": 256,
+  "server_args": [
+    "--trust-remote-code", "--moe-runner-backend", "marlin",
+    "--attention-backend", "dsv4", "--dsv4-attn-backend", "flashmla",
+    "--attn-dp-size", "1", "--base-gpu-id", "0"
+  ],
+  "variants": {
+    "cpu": {
+      "server_args": ["--enable-hisparse"],
+      "hisparse_config": {
+        "top_k": 512, "device_buffer_size": 1024,
+        "host_to_device_ratio": 2, "swap_in_block_size": 960, "backing_store": "cpu"
+      },
+      "ratio_key": "host_to_device_ratio"
+    },
+    "mpu": {
+      "server_args": ["--enable-hisparse"],
+      "hisparse_config": {
+        "top_k": 512, "device_buffer_size": 1024,
+        "host_to_device_ratio": 2, "swap_in_block_size": 960, "backing_store": "mpu",
+        "mpu_device_ids": [4, 5, 6, 7], "mpu_memory_reserve_bytes": 1073741824
+      },
+      "ratio_key": "mpu_capacity_ratio"
+    },
+    "hbm": {"server_args": [], "hisparse_config": {}}
+  },
+  "defaults": {
+    "input_lens": [8192, 32768],
+    "output_len": 256,
+    "correctness_output_len": 257,
+    "concurrencies": [1, 2, 4],
+    "num_prompts": 32,
+    "repeats": 3,
+    "max_total_tokens": 131072,
+    "chunked_prefill_size": 4096,
+    "mem_fraction_static": 0.8,
+    "capacity_ratios": [2],
+    "cpu_capacity_ratio": 2
+  }
+}

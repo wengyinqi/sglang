@@ -82,9 +82,23 @@ The code uses conservative input + maximum output lifetime page leases for
 both CPU and MPU runs; waiting requests cannot consume more backing than the
 pool. This policy must stay identical between variants.
 
-Use the official model ID above, or a local snapshot of exactly that checkpoint;
-record its resolved Hugging Face revision and tokenizer revision before model
-acceptance. No checkpoint was downloaded and no revision was guessed here.
+The stage recipe pins official checkpoint revision
+`60d8d70770c6776ff598c94bb586a859a38244f1`. The Hugging Face model API and
+that revision's config were checked on 2026-10-23: `index_topk=512`,
+`expert_dtype=fp4`, 43 base layers. Its general quantization config says FP8;
+the explicit expert dtype is why the H200 recipe uses Marlin for FP4 experts.
+Weights were not downloaded. A local snapshot override must preserve the
+checkpoint and tokenizer identity in the recorded evidence.
+
+The default `--max-total-tokens=131072`, input lengths 8192/32768, and concurrency
+1/2/4 are unmeasured starting settings. Correctness generates 257 tokens and
+uses original-token page boundaries of 256 (64 compressed C4 rows). Prefill
+still needs compute KV capacity before staging; an allocation/startup failure
+is a failed setup, not evidence of low throughput. Calibrate fit on H200.
+For a 1/2/4/8 MPU sweep, set `--cpu-capacity-ratio 8 --capacity-ratios 1 2 4 8`
+before running the complete CPU/MPU comparison. This freezes the shared host
+index/address budget at 8; enlarge the common total token budget if needed,
+then require identical measured compute pool sizes across every point.
 
 ```bash
 python -m pytest test/manual/mpu/test_dsv4_cpu.py -q
