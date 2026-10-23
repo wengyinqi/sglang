@@ -127,6 +127,17 @@ def capacity(rank=0, tp=1, variant="mpu", ratio=2):
         ),
         "reserved_slots": 0,
         "used_slots": 0,
+        "retained_gpu_pool_bytes": 512,
+        "retained_gpu_pool_shapes": {
+            "indexer[0]": {
+                "shape": [4, 128],
+                "dtype": "torch.uint8",
+                "stride": [128, 1],
+                "storage_offset": 0,
+                "storage_bytes": 512,
+                "allocation_group": 0,
+            }
+        },
     }
 
 
@@ -291,6 +302,27 @@ class TestStagePlanning(unittest.TestCase):
                 {"disable_cuda_graph": False, "cuda_graph_config": {}}
             )
 
+    def test_retained_pool_evidence_and_layout_drift_are_enforced(self):
+        stage, args = self.parse(recipe() | {"frozen_host_budget": True})
+        actual = capacity()
+        RUN.verify_capacities([actual], stage, args, "mpu", 2)
+        fixed = RUN.enforce_fixed_compute(None, [actual])
+        # Same total bytes can hide different page or per-request capacity.
+        actual["retained_gpu_pool_shapes"]["indexer[0]"]["shape"] = [8, 64]
+        actual["retained_gpu_pool_shapes"]["indexer[0]"]["stride"] = [64, 1]
+        with self.assertRaisesRegex(ValueError, "drifted"):
+            RUN.enforce_fixed_compute(fixed, [actual])
+        # The baseline signature is a snapshot, not a reference to provider data.
+        self.assertEqual(fixed[0][3]["indexer[0]"]["shape"], [4, 128])
+        actual = capacity()
+        del actual["retained_gpu_pool_shapes"]
+        with self.assertRaisesRegex(ValueError, "signature"):
+            RUN.verify_capacities([actual], stage, args, "mpu", 2)
+        actual = capacity()
+        actual["retained_gpu_pool_bytes"] += 1
+        with self.assertRaisesRegex(ValueError, "deduplicated"):
+            RUN.verify_capacities([actual], stage, args, "mpu", 2)
+
     def test_new_runner_finishes_analysis_before_owned_server_shutdown(self):
         stage, args = self.parse(recipe(variant="cpu"))
         args.input_lens, args.concurrencies, args.num_prompts, args.output_len = (
@@ -403,6 +435,40 @@ class TestTPAccounting(unittest.TestCase):
 
 
 class TestTimerCapacity(unittest.TestCase):
+    def test_retained_pool_helper_deduplicates_aliases_without_tensor_reads(self):
+        def tensor(pointer, storage_size, shape, stride, offset=0):
+            return SimpleNamespace(
+                device=SimpleNamespace(type="cuda"),
+                dtype="torch.bfloat16",
+                shape=shape,
+                stride=lambda: stride,
+                storage_offset=lambda: offset,
+                untyped_storage=lambda: SimpleNamespace(
+                    data_ptr=lambda: pointer, nbytes=lambda: storage_size
+                ),
+            )
+
+        original = tensor(1000, 1024, (4, 128), (128, 1))
+        alias = tensor(1000, 1024, (2, 128), (128, 1), 256)
+        separate = tensor(2000, 64, (32,), (1,))
+        values = {"swa": [original, alias], "state": separate, "unused": None}
+        actual = TIMER.describe_retained_gpu_pools(values)
+        self.assertEqual(actual["retained_gpu_pool_bytes"], 1088)
+        self.assertEqual(
+            actual["retained_gpu_pool_shapes"]["swa[0]"]["allocation_group"],
+            actual["retained_gpu_pool_shapes"]["swa[1]"]["allocation_group"],
+        )
+        # Reordered dictionary input preserves the serialized signature.
+        self.assertEqual(
+            actual,
+            TIMER.describe_retained_gpu_pools(dict(reversed(list(values.items())))),
+        )
+        self.assertNotIn("1000", json.dumps(actual))
+        RUN.verify_retained_pools(actual, required=True)
+        separate.device.type = "cpu"
+        with self.assertRaisesRegex(TypeError, "CUDA tensors"):
+            TIMER.describe_retained_gpu_pools(values)
+
     def test_capacity_helper_supports_hbm_tuple_sizes_and_rank_local_coordinators(self):
         pool = SimpleNamespace(size=4096, get_kv_size_bytes=lambda: (300, 400))
         allocator = SimpleNamespace(

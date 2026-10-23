@@ -151,6 +151,10 @@ def execute(stage, args, manifest, path):
                             require_idle=True,
                         )
                     )
+                    if group["variant"] != "hbm":
+                        RUN.enforce_fixed_compute(
+                            physical_reference, group["round_idle_capacity"][-1]
+                        )
                 if reference is None:
                     reference = records
                 group["comparison_to_cpu_hisparse"] = COMPARE.compare(
