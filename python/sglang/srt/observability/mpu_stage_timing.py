@@ -14,6 +14,56 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+def describe_retained_gpu_pools(named_tensor_trees):
+    """Describe explicitly selected retained pools using CPU tensor metadata only.
+
+    The caller names the model-specific pools that must remain fixed. Storage
+    bytes are deduplicated across aliases; stable allocation groups retain alias
+    relationships without recording addresses. This never reads tensor values,
+    copies KV payload, launches a kernel or synchronizes a device.
+    """
+    if not isinstance(named_tensor_trees, dict):
+        raise TypeError("Retained GPU pools must be a named dictionary")
+    shapes, storages = {}, {}
+
+    def visit(path, value):
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for key in sorted(value):
+                if not isinstance(key, str) or not key:
+                    raise TypeError("Retained pool names must be nonempty strings")
+                visit(f"{path}.{key}" if path else key, value[key])
+            return
+        if isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                visit(f"{path}[{index}]", item)
+            return
+        if getattr(getattr(value, "device", None), "type", None) != "cuda":
+            raise TypeError(f"Retained pool {path} must contain CUDA tensors")
+        if path in shapes:
+            raise ValueError(f"Ambiguous retained tensor path: {path}")
+        storage = value.untyped_storage()
+        storage_bytes = int(storage.nbytes())
+        key = (str(value.device), storage.data_ptr(), storage_bytes)
+        if key not in storages:
+            storages[key] = (len(storages), storage_bytes)
+        shapes[path] = {
+            "shape": [int(size) for size in value.shape],
+            "dtype": str(value.dtype),
+            "stride": [int(size) for size in value.stride()],
+            "storage_offset": int(value.storage_offset()),
+            "storage_bytes": storage_bytes,
+            "allocation_group": storages[key][0],
+        }
+
+    visit("", named_tensor_trees)
+    return {
+        "retained_gpu_pool_bytes": sum(size for _, size in storages.values()),
+        "retained_gpu_pool_shapes": shapes,
+    }
+
+
 def collect_stage_capacity(allocator, coordinator, tp_rank, tp_size):
     """Normalize per-rank pool facts without gathering across TP workers."""
     if coordinator is not None:

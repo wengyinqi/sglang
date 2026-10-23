@@ -59,6 +59,10 @@ V4/GLM 的 `frozen_host_budget=true` 表示 CPU host ratio 同时固定 GPU inde
 然后通过 `--capacity-ratios 1 2 4 8` 只改变 MPU 分配。脚本拒绝超过这个固定地址
 预算的扫点，也拒绝实际 `addressable_backing_slots < backing_slots` 的配置，防止
 不可寻址的额外显存形成虚假的吞吐平台。Qwen recipe 可保持此选项为 false。
+开启此选项还必须记录 GPU 留存池的实际字节数、形状、dtype、stride 与 storage
+别名关系；V4 包含 SWA/C128/indexer/压缩状态，GLM 包含 indexer/KPool tail/线性
+状态。脚本比较每个 rank 在 CPU/MPU 各比例及每轮请求结束时的这些信息，任何变化
+都拒绝作为固定 GPU 预算的容量曲线。
 
 原生 benchmark 保留端到端 TTFT、TPOT、输出吞吐量与完整请求计数。分析器另算：
 
@@ -143,6 +147,14 @@ token 数。模型的 index_topk 等原生设置仍是权威，recipe 必须与�
 CPU 无预留机制时 `reserved_slots=0`；HBM 对照无 backing store 时 backing 字段可为空，
 但其 compute 信息及空闲占用/预留仍必须有效。可以额外提供容量单位、pool 范围、
 padding 和其他驻留池的说明。timer 自动为容量记录标注 `after_sequence`。
+
+`describe_retained_gpu_pools({"pool_name": tensor_or_tree, ...})` 返回可直接合入
+provider 的 `retained_gpu_pool_bytes` 与 `retained_gpu_pool_shapes`。传入值只接受
+CUDA tensor、list/tuple、字符串 key 的 dict 或 None；模型 adapter 显式选择全部
+需要冻结的留存池。helper 只读取 tensor metadata，跨全部输入去重 storage 字节数，
+不读取 KV 值、不传输 payload，也不执行 GPU kernel。结果记录稳定的 allocation
+group 以核对别名关系，不记录地址。`frozen_host_budget=true` 的 CPU/MPU 必须提供
+非空签名，缺失时执行失败，不能仅靠配置名称宣称实际留存池已冻结。
 
 ```bash
 python -m pytest test/manual/mpu_stages -q
