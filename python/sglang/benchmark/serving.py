@@ -114,6 +114,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    request_id: Optional[str] = None
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -292,9 +293,9 @@ async def async_request_openai_completions(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith("completions"), (
-        "OpenAI Completions API URL must end with 'completions'."
-    )
+    assert api_url.endswith(
+        "completions"
+    ), "OpenAI Completions API URL must end with 'completions'."
 
     prompt = request_func_input.prompt
 
@@ -424,9 +425,9 @@ async def async_request_openai_chat_completions(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
-    assert api_url.endswith("chat/completions"), (
-        "OpenAI Chat Completions API URL must end with 'chat/completions'."
-    )
+    assert api_url.endswith(
+        "chat/completions"
+    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -730,7 +731,11 @@ async def async_request_sglang_generate(
         output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
-        output_len = request_func_input.output_len
+        # Use actual server counts, including empty-text and metadata-only frames.
+        output_len = 0
+        observed_completion = False
+        observed_prompt = False
+        finish_reason = None
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -759,7 +764,45 @@ async def async_request_sglang_generate(
                         else:
                             data = orjson.loads(sse_data)
 
+                            if "error" in data:
+                                raise RuntimeError(
+                                    f"SGLang request failed: {data['error']}"
+                                )
                             _meta_info = data.get("meta_info") or {}
+                            if isinstance(_meta_info.get("id"), str):
+                                if output.request_id not in (None, _meta_info["id"]):
+                                    raise ValueError(
+                                        "SGLang response request ID changed"
+                                    )
+                                output.request_id = _meta_info["id"]
+                            if "prompt_tokens" in _meta_info:
+                                prompt_tokens = _meta_info["prompt_tokens"]
+                                if type(prompt_tokens) is not int or prompt_tokens < 0:
+                                    raise ValueError(
+                                        "Invalid prompt_tokens in SGLang response"
+                                    )
+                                output.prompt_len = prompt_tokens
+                                observed_prompt = True
+                            if "completion_tokens" in _meta_info:
+                                completion_tokens = _meta_info["completion_tokens"]
+                                if (
+                                    type(completion_tokens) is not int
+                                    or completion_tokens < output_len
+                                ):
+                                    raise ValueError(
+                                        "Invalid completion_tokens in SGLang response"
+                                    )
+                                output_len = completion_tokens
+                                observed_completion = True
+                            if _meta_info.get("finish_reason") is not None:
+                                finish_reason = _meta_info["finish_reason"]
+                                if (
+                                    isinstance(finish_reason, dict)
+                                    and finish_reason.get("type") == "abort"
+                                ):
+                                    raise RuntimeError(
+                                        f"SGLang request aborted: {finish_reason}"
+                                    )
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
@@ -777,10 +820,10 @@ async def async_request_sglang_generate(
                                     "cached_tokens_details"
                                 )
 
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
+                            if "text" in data:
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+                            if output_len > last_output_len:
+                                timestamp = time.perf_counter()
 
                                 # First token
                                 if ttft == 0.0:
@@ -790,8 +833,6 @@ async def async_request_sglang_generate(
                                 # Decoding phase
                                 else:
                                     num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
                                     chunk_gap = timestamp - most_recent_timestamp
                                     adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
@@ -799,6 +840,14 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
 
+                    if (
+                        not observed_completion
+                        or not observed_prompt
+                        or finish_reason is None
+                    ):
+                        raise RuntimeError(
+                            "SGLang response ended without final token accounting"
+                        )
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
@@ -1332,9 +1381,9 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
 
 
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
-    assert backend in MULTI_TURN_BACKENDS, (
-        f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
-    )
+    assert (
+        backend in MULTI_TURN_BACKENDS
+    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
 
     async def f(
         request_func_input: RequestFuncInput,
@@ -1586,9 +1635,9 @@ async def benchmark(
                 lora_name = lora_names[lora_idx]
                 lora_idx = (lora_idx + 1) % len(lora_names)
             else:
-                assert lora_request_distribution == "skewed", (
-                    f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
-                )
+                assert (
+                    lora_request_distribution == "skewed"
+                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
 
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
@@ -1949,6 +1998,7 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "request_ids": [output.request_id for output in outputs],
     }
 
     if args.cache_report:
@@ -2072,9 +2122,9 @@ def run_benchmark(args_: argparse.Namespace):
         extra_request_body["bootstrap_room"] = 0
 
     if args.tokenize_prompt:
-        assert args.backend == "sglang", (
-            "`--tokenize-prompt` only compatible with `--backend sglang` currently"
-        )
+        assert (
+            args.backend == "sglang"
+        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
 
     # Set url
     if args.port is None:
@@ -2151,18 +2201,18 @@ def run_benchmark(args_: argparse.Namespace):
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
-        assert not args.tokenize_prompt, (
-            "`--tokenize-prompt` not compatible with image dataset"
-        )
+        assert (
+            not args.tokenize_prompt
+        ), "`--tokenize-prompt` not compatible with image dataset"
 
     if args.lora_request_distribution in ["distinct", "skewed"]:
-        assert args.lora_name is not None and len(args.lora_name) > 1, (
-            "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
-        )
+        assert (
+            args.lora_name is not None and len(args.lora_name) > 1
+        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
 
-    assert args.lora_zipf_alpha > 1, (
-        f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
-    )
+    assert (
+        args.lora_zipf_alpha > 1
+    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
 
     print(f"{args}\n")
 
