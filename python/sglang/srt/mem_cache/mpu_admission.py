@@ -1,4 +1,4 @@
-"""CPU control-plane reservations for full MPU KV capacity, without KV payload."""
+"""CPU control-plane reservations for full backing KV capacity, without payload."""
 
 
 class MPUAdmissionBudget:
@@ -33,3 +33,8 @@ class MPUAdmissionBudget:
 
     def release(self, rid: str) -> None:
         self.reserved -= self._leases.pop(rid, 0)
+
+
+# Both DDR and MPU experiment variants share this admission policy. Keep the
+# original public name for existing MPU callers and unit tests.
+BackingAdmissionBudget = MPUAdmissionBudget
