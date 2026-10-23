@@ -84,6 +84,37 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
 
 
+def validate_glm_hisparse_scope(cfg) -> None:
+    """Scope the hybrid DSA/KDA path to colocated, non-speculative serving."""
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("GLM hybrid HiSparse currently requires NoPD serving")
+    if cfg.speculative_algorithm not in (None, "NONE"):
+        raise ValueError("GLM hybrid HiSparse does not support speculative decoding")
+    for name in (
+        "pp_size",
+        "dp_size",
+        "attn_dp_size",
+        "attn_cp_size",
+        "dcp_size",
+        "moe_dp_size",
+        "nnodes",
+    ):
+        if getattr(cfg, name) != 1:
+            raise ValueError(
+                f"GLM hybrid HiSparse requires --{name.replace('_', '-')} 1"
+            )
+    if cfg.enable_prefill_cp or cfg.enable_pdmux or cfg.enable_two_batch_overlap:
+        raise ValueError(
+            "GLM hybrid HiSparse requires a single colocated attention stream"
+        )
+    if cfg.kv_cache_dtype != "bfloat16":
+        raise ValueError("GLM hybrid HiSparse currently requires bfloat16 KV cache")
+    if cfg.enable_hierarchical_cache or cfg.enable_lmcache:
+        raise ValueError(
+            "GLM hybrid HiSparse owns its backing store; disable HiCache/LMCache"
+        )
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
@@ -98,6 +129,8 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
 
     hf_config = model_config_of(server_args).hf_config
+    if getattr(hf_config, "model_type", None) == "glm5_next":
+        validate_glm_hisparse_scope(cfg)
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_m3_hisparse = is_minimax_sparse(hf_config)
     is_hip = get_platform().is_hip
@@ -106,9 +139,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5), DeepSeek V4, and MiniMax M3 now. "
     )
 
-    assert cfg.disable_radix_cache, (
-        "Hierarchical sparse attention currently requires --disable-radix-cache."
-    )
+    assert (
+        cfg.disable_radix_cache
+    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
     validate_hisparse_feature_combos(server_args)
 
     enable_spec = (

@@ -4414,6 +4414,10 @@ class HybridLinearKVPool(KVCache):
             return layer_ids * (len(data_ptrs) // len(layer_ids))
         return layer_ids if self.use_mla else layer_ids * 2
 
+    def translate_loc_to_hisparse_device(self, indices: torch.Tensor):
+        # Mamba state slots are request-indexed and do not use this mapping.
+        return self.full_kv_pool.translate_loc_to_hisparse_device(indices)
+
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
             self.mamba_pool.get_contiguous_buf_infos()
