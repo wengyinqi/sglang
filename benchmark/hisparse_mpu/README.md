@@ -1,6 +1,8 @@
 # HiSparse MPU 数据通路与 1+1 / 1+4 实验
 
-本分支为 Qwen + Quest 增加 MPU backing store：计算 H200 运行模型与 KV 读写
+本目录记录 Qwen + Quest 的 MPU backing store 实现及手动实验命令；当前六阶段的
+默认配置以 `benchmark/mpu_stages/stage.json` 和仓库根目录 `MPU_EXPERIMENTS.md` 为准。
+计算 H200 运行模型与 KV 读写
 kernel，其余 H200 只分配 KV 显存，由计算卡发出 peer load/store。存储卡不启动
 KV 计算 kernel；CPU 只管理请求、分配器和指针元数据。MPU 模式不分配 CPU pinned
 KV backing store，不通过 CPU 中转 KV，也不在 P2P 不可用时回退到 CPU。
