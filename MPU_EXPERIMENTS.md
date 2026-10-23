@@ -66,6 +66,13 @@ decode 估计。TP4 的同一批次使用各 rank 时间的最大值估计关键
 耗时，也不能减去各请求 TTFT 之和。估计仍含排队、CPU、传输和 staging 开销。
 容量平台区需按输入长度、并发和 SLO 分析；没有 MPU 成本数据时不声称经济最优点。
 
+V4/GLM 的 `host_to_device_ratio` 还控制计算侧索引/逻辑地址预算。默认先用比例 2
+打通数据通路；扫描 1/2/4/8 时，使用 `--cpu-capacity-ratio 8 --capacity-ratios 1 2 4 8`
+重新运行完整 CPU/MPU 组，预先固定较大的共同索引预算，只改变 MPU 容量。
+运行器拒绝不可寻址的新增空间，并比较每个 rank 的主 KV、索引、压缩/循环状态
+分配签名；签名字节包含主 KV，不能与 `compute_kv_bytes` 再相加。Qwen 的固定预算
+仅覆盖主 K/V，逻辑地址元数据的大小仍可随后备容量变化，不能当作总 GPU 显存固定。
+
 ## 上游与实验代码隔离
 
 `upstream` 指向 `https://github.com/sgl-project/sglang.git`；`origin` 指向个人 fork。
