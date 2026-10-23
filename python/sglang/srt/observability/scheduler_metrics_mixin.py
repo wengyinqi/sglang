@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import time
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
@@ -28,6 +29,10 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     SchedulerStats,
     compute_routing_key_stats,
+)
+from sglang.srt.observability.mpu_stage_timing import (
+    MPUStageForwardTimer,
+    collect_stage_capacity,
 )
 from sglang.srt.utils.device_timer import DeviceTimer, GapTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
@@ -99,6 +104,22 @@ class SchedulerMetricsMixin:
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
+        stage_timing_dir = os.environ.get("SGLANG_MPU_STAGE_TIMING_DIR")
+        if stage_timing_dir and envs.SGLANG_HISPARSE_TIMING_DIR.get():
+            raise ValueError("Enable only one of the legacy and MPU stage CUDA timers")
+        self.mpu_stage_timer = MPUStageForwardTimer.create(
+            stage_timing_dir,
+            self.server_args,
+            tp_rank,
+            pp_rank,
+            dp_rank,
+            capacity_provider=lambda: collect_stage_capacity(
+                self.token_to_kv_pool_allocator,
+                self.hisparse_coordinator,
+                tp_rank,
+                self.tp_size,
+            ),
+        )
         self.hisparse_forward_timer = HiSparseForwardTimer.create(
             envs.SGLANG_HISPARSE_TIMING_DIR.get(),
             self.server_args,
@@ -931,7 +952,8 @@ class SchedulerMetricsMixin:
     def record_forward_metrics(self: Scheduler, batch: ScheduleBatch):
         metrics_enabled = self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER
         timer = self.hisparse_forward_timer
-        if not (metrics_enabled or timer is not None):
+        stage_timer = self.mpu_stage_timer
+        if not (metrics_enabled or timer is not None or stage_timer is not None):
             yield
             return
 
@@ -947,6 +969,8 @@ class SchedulerMetricsMixin:
                 )
             if timer is not None:
                 stack.enter_context(timer.wrap(batch))
+            if stage_timer is not None:
+                stack.enter_context(stage_timer.wrap(batch))
             yield
 
     @contextmanager
