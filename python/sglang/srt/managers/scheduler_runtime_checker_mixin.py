@@ -544,14 +544,14 @@ class SchedulerRuntimeCheckerMixin:
             self.hisparse_forward_timer.flush_idle()
 
         if self.hisparse_coordinator is not None:
-            capacity = self.hisparse_coordinator.get_mpu_capacity_info()
+            capacity = self.hisparse_coordinator.get_stage_capacity_info()
             if capacity is not None and (
-                capacity["used_mpu_slots"] or capacity["reserved_mpu_slots"]
+                capacity["used_slots"] or capacity["reserved_slots"]
             ):
                 self._report_leak(
-                    "MPU backing",
-                    f"Idle MPU has {capacity['used_mpu_slots']} allocated slots and "
-                    f"{capacity['reserved_mpu_slots']} reserved slots",
+                    "HiSparse backing",
+                    f"Idle {capacity['backing_store']} has {capacity['used_slots']} allocated slots and "
+                    f"{capacity['reserved_slots']} reserved slots",
                 )
 
         # memory leak check

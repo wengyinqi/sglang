@@ -64,11 +64,14 @@ class _Backing:
         self.size = 256
         self.shard_rows = 256
         self.token_stride_size = 8
+        self.size_per_token = 16
+        self.storage_device_ids = [1]
         self.peer_ptrs = object()
         self.k_buffer = [object()]
         self.v_buffer = [object()]
         self.free = Mock()
         self.close = Mock()
+        self.available_size = lambda: self.size
 
 
 def coordinator_type():
@@ -86,6 +89,7 @@ def coordinator_type():
         "release_mpu_request",
         "request_finished",
         "close",
+        "get_stage_capacity_info",
     }
     cls.body = [
         n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names
@@ -197,6 +201,22 @@ class TestMPUCoordinator(unittest.TestCase):
         )
         ns["load_cache_to_device_buffer_mha"].assert_called_once()
         ns["load_cache_from_mpu_to_device_buffer_mha"].assert_not_called()
+
+    def test_cpu_and_mpu_reserve_the_same_full_request_budget(self):
+        for backing in ("cpu", "mpu"):
+            coord, _, _ = self.fixture(backing)
+            req = SimpleNamespace(
+                rid="r",
+                origin_input_ids=[0] * 129,
+                sampling_params=SimpleNamespace(max_new_tokens=16),
+            )
+            self.assertTrue(coord.reserve_mpu_request(req))
+            report = coord.get_stage_capacity_info()
+            self.assertEqual(report["reserved_slots"], 145)
+            self.assertEqual(report["backing_store"], backing)
+            self.assertEqual(report["backing_slots"], 256)
+            coord.release_mpu_request(req)
+            self.assertEqual(coord.get_stage_capacity_info()["reserved_slots"], 0)
 
     def test_finish_releases_backing_slots_and_request_lease(self):
         coord, _, _ = self.fixture()

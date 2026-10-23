@@ -156,10 +156,18 @@ class HiSparseCoordinator:
         # Preserve the coordinator's historical host-pool names as the
         # backing-store interface. In MPU mode no host KV pool is created.
         self.mpu_budget = None
-        if backing_store == "mpu":
-            from sglang.srt.mem_cache.mpu_admission import MPUAdmissionBudget
+        self.backing_budget = None
+        self.backing_capacity_ratio = (
+            mpu_capacity_ratio if backing_store == "mpu" else host_to_device_ratio
+        )
+        if mode == MODE_QUEST:
+            from sglang.srt.mem_cache.mpu_admission import BackingAdmissionBudget
 
-            self.mpu_budget = MPUAdmissionBudget(self.mem_pool_host.size)
+            # CPU DDR and MPU comparisons must enforce the same full-lifetime
+            # KV capacity budget even after logical prefill slots are released.
+            self.backing_budget = BackingAdmissionBudget(self.mem_pool_host.size)
+            if backing_store == "mpu":
+                self.mpu_budget = self.backing_budget
 
         max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -240,20 +248,20 @@ class HiSparseCoordinator:
         self.decode_producer_stream = stream
 
     def mpu_request_error(self, req: Req) -> Optional[str]:
-        if self.mpu_budget is None:
+        if self.backing_budget is None:
             return None
         if getattr(req, "session", None) is not None:
-            return "MPU HiSparse currently requires independent, non-session requests"
+            return "Quest HiSparse currently requires independent, non-session requests"
         needed = len(req.origin_input_ids) + req.sampling_params.max_new_tokens
-        if needed > self.mpu_budget.capacity:
+        if needed > self.backing_budget.capacity:
             return (
-                f"MPU KV capacity {self.mpu_budget.capacity} cannot hold this "
+                f"{self.backing_store} KV capacity {self.backing_budget.capacity} cannot hold this "
                 f"request's input + max_new_tokens ({needed})"
             )
         return None
 
     def reserve_mpu_request(self, req: Req) -> bool:
-        if self.mpu_budget is None:
+        if self.backing_budget is None:
             return True
         if (
             getattr(req, "to_finish", None) is not None
@@ -265,13 +273,35 @@ class HiSparseCoordinator:
             return True
         # Reserve the complete request before its first prefill chunk. Logical
         # slots are early-freed after staging, so they cannot bound full KV.
-        return self.mpu_budget.reserve(
+        return self.backing_budget.reserve(
             req.rid, len(req.origin_input_ids) + req.sampling_params.max_new_tokens
         )
 
     def release_mpu_request(self, req: Req) -> None:
-        if getattr(self, "mpu_budget", None) is not None:
-            self.mpu_budget.release(req.rid)
+        if getattr(self, "backing_budget", None) is not None:
+            self.backing_budget.release(req.rid)
+
+    def get_stage_capacity_info(self) -> dict:
+        pool = self.mem_pool_host
+        slots = self.mem_pool_device.size
+        return {
+            "backing_store": self.backing_store,
+            "physical_compute_slots": slots,
+            "backing_slots": pool.size,
+            "compute_kv_bytes": slots * pool.size_per_token,
+            "backing_kv_bytes": pool.size * pool.size_per_token,
+            "storage_device_ids": (
+                pool.storage_device_ids if self.backing_store == "mpu" else []
+            ),
+            "requested_capacity_ratio": self.backing_capacity_ratio,
+            "effective_capacity_ratio": pool.size / slots,
+            "padding_slots": pool.size - int(slots * self.backing_capacity_ratio),
+            "reserved_slots": (
+                self.backing_budget.reserved if self.backing_budget else 0
+            ),
+            "used_slots": pool.size - pool.available_size(),
+            "scope": "all Qwen MHA/GQA K and V layers; excludes Quest selector metadata",
+        }
 
     def get_mpu_capacity_info(self) -> Optional[dict]:
         if self.backing_store != "mpu":
