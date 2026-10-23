@@ -558,23 +558,14 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
-#ifdef USE_ROCM
-      // ROCm wavefront64: WARP_SIZE (64) > NUM_WARPS (16 at block_size=1024),
-      // so the wide-count form below would let lanes beyond this iteration's
-      // NUM_WARPS-wide window write the accumulator into s_chunk_offset
-      // positions belonging to future iterations, corrupting their reads.
-      // Bound the scan window to NUM_WARPS lanes.
+// This iteration produces only NUM_WARPS counts. Scanning a whole
+      // warp corrupts future counts when BLOCK_SIZE < WARP_SIZE * WARP_SIZE
+      // (including the default CUDA block size of 960).
       const int scan_offset = iter * NUM_WARPS + 1;
       const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
       total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
       total_evict_count =
           warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
-#else
-      total_hit_count =
-          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
-      total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
-#endif
       if (tid == 0) {
         s_total_hits = total_hit_count;
       }
@@ -633,13 +624,9 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
 
     if (warp_id == 0) {
-#ifdef USE_ROCM
-      const int scan_offset = iter * NUM_WARPS + 1;
+const int scan_offset = iter * NUM_WARPS + 1;
       const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
       total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
-#else
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
-#endif
       if (tid == 0) {
         s_total_misses = total_misses;
       }

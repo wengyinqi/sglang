@@ -604,9 +604,11 @@ class HiSparseCoordinator:
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
                         0
                     ].buffer_info,
-                    device_capacity_tokens=self.mem_pool_device.size
-                    if self.mem_pool_device.host_capacity_tokens is None
-                    else self.mem_pool_device.host_capacity_tokens,
+                    device_capacity_tokens=(
+                        self.mem_pool_device.size
+                        if self.mem_pool_device.host_capacity_tokens is None
+                        else self.mem_pool_device.host_capacity_tokens
+                    ),
                     start_layer=self.mem_pool_device.start_layer,
                     end_layer=self.mem_pool_device.end_layer,
                     host_to_device_ratio=host_to_device_ratio,
@@ -619,9 +621,11 @@ class HiSparseCoordinator:
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
                         0
                     ].buffer_info,
-                    device_capacity_tokens=self.mem_pool_device.size
-                    if self.mem_pool_device.host_capacity_tokens is None
-                    else self.mem_pool_device.host_capacity_tokens,
+                    device_capacity_tokens=(
+                        self.mem_pool_device.size
+                        if self.mem_pool_device.host_capacity_tokens is None
+                        else self.mem_pool_device.host_capacity_tokens
+                    ),
                     start_layer=self.mem_pool_device.start_layer,
                     end_layer=self.mem_pool_device.end_layer,
                     target_layer_num=self.mem_pool_device.layer_num,
@@ -817,6 +821,31 @@ class HiSparseCoordinator:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
         self.mem_pool_host.destroy()
+
+    def get_stage_capacity_info(self) -> dict:
+        """Per-rank cache accounting for the controlled NoPD experiment."""
+        physical = self.token_to_kv_pool_allocator.hisparse_attn_allocator.size
+        backing = self.mem_pool_host.size
+        return {
+            "backing_store": "cpu",
+            "physical_compute_slots": physical,
+            "backing_slots": backing,
+            "compute_kv_bytes": sum(x.nbytes for x in self.mem_pool_device.kv_buffer),
+            "backing_kv_bytes": sum(x.nbytes for x in self.mem_pool_host.kv_buffer),
+            "storage_device_ids": [],
+            "requested_capacity_ratio": backing / physical,
+            "effective_capacity_ratio": backing / physical,
+            "reserved_slots": 0,
+            "used_slots": backing - self.mem_pool_host.available_size(),
+            "scope": (
+                "C4 compressed slots only" if self.is_dsv4_hisparse else "MLA KV slots"
+            ),
+            "retained_on_compute": (
+                ["SWA", "C128", "indexer", "compression_state"]
+                if self.is_dsv4_hisparse
+                else ["indexer"]
+            ),
+        }
 
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
@@ -1286,9 +1315,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert not self.is_dsv4_hisparse, (
-            "naive_load_topk is not implemented for dsv4 hisparse"
-        )
+        assert (
+            not self.is_dsv4_hisparse
+        ), "naive_load_topk is not implemented for dsv4 hisparse"
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -1303,9 +1332,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(selected_tokens >= 0), (
-                f"Req {req_idx}: selected tokens contain negative positions"
-            )
+            assert torch.all(
+                selected_tokens >= 0
+            ), f"Req {req_idx}: selected tokens contain negative positions"
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"

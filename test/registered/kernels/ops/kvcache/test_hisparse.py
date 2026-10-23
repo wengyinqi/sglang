@@ -783,10 +783,9 @@ def test_load_cache_to_device_buffer_dsv4_fused_copy_multi_miss() -> None:
         assert torch.all(_read_dsv4_token(device_cpu, loc) == 0xFF)
 
 
-@pytest.mark.skipif(
-    not is_hip(), reason="Covers a ROCm wavefront64 LRU writeback regression."
-)
-def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
+@pytest.mark.skipif(is_xpu(), reason="Exercises JIT launch configurations.")
+@pytest.mark.parametrize("block_size", [256, 960, 1024])
+def test_load_cache_to_device_buffer_large_lru_writeback(block_size) -> None:
     top_k = 2048
     hot_buffer_size = 4096
     seq_len = 7299
@@ -834,7 +833,7 @@ def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
         num_top_k=top_k,
         hot_buffer_size=hot_buffer_size,
         page_size=1,
-        block_size=1024,
+        block_size=block_size,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
     get_device_module().synchronize()
