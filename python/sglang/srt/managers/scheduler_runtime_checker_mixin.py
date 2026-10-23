@@ -542,6 +542,8 @@ class SchedulerRuntimeCheckerMixin:
 
         if self.hisparse_forward_timer is not None:
             self.hisparse_forward_timer.flush_idle()
+        if self.mpu_stage_timer is not None:
+            self.mpu_stage_timer.flush_idle()
 
         if self.hisparse_coordinator is not None:
             capacity = self.hisparse_coordinator.get_stage_capacity_info()
