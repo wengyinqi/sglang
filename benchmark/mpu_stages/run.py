@@ -1,5 +1,6 @@
 """Portable staged CPU-DDR/MPU HiSparse benchmarking. Default operation only plans."""
 
+import copy
 import importlib.util
 import math
 import os
@@ -93,6 +94,10 @@ def verify_capacities(capacities, stage, args, variant, ratio):
         for key in ("physical_compute_slots", "compute_kv_bytes"):
             if type(capacity.get(key)) is not int or capacity[key] <= 0:
                 raise ValueError(f"Missing positive actual {key}")
+        if variant != "hbm":
+            verify_retained_pools(
+                capacity, required=stage.get("frozen_host_budget", False)
+            )
         if (
             variant != "hbm"
             and stage.get("physical_budget_exact", True)
@@ -140,6 +145,39 @@ def verify_capacities(capacities, stage, args, variant, ratio):
     return capacities
 
 
+def verify_retained_pools(capacity, *, required=False):
+    total = capacity.get("retained_gpu_pool_bytes")
+    shapes = capacity.get("retained_gpu_pool_shapes")
+    if total is None and shapes is None and not required:
+        return
+    if type(total) is not int or total < 0 or not isinstance(shapes, dict):
+        raise ValueError("Missing retained GPU pool bytes/shapes capacity signature")
+    if required and (total <= 0 or not shapes):
+        raise ValueError("Frozen GPU budgets require nonempty retained pool evidence")
+    storages = {}
+    for path, item in shapes.items():
+        if not isinstance(path, str) or not path or not isinstance(item, dict):
+            raise ValueError("Invalid retained GPU tensor signature")
+        shape, stride = item.get("shape"), item.get("stride")
+        if (
+            not isinstance(shape, list)
+            or not isinstance(stride, list)
+            or len(shape) != len(stride)
+            or any(type(n) is not int or n < 0 for n in shape + stride)
+            or not isinstance(item.get("dtype"), str)
+            or not item["dtype"]
+        ):
+            raise ValueError("Invalid retained GPU tensor shape/dtype/stride")
+        for key in ("storage_offset", "storage_bytes", "allocation_group"):
+            if type(item.get(key)) is not int or item[key] < 0:
+                raise ValueError(f"Invalid retained GPU tensor {key}")
+        group, size = item["allocation_group"], item["storage_bytes"]
+        if storages.setdefault(group, size) != size:
+            raise ValueError("Retained GPU storage aliases disagree on allocation size")
+    if sum(storages.values()) != total:
+        raise ValueError("Retained GPU total bytes disagree with deduplicated storage")
+
+
 def decode_graph_enabled(server_info):
     """The new phase backend is authoritative; legacy bool is old-checkout fallback."""
     config = server_info.get("cuda_graph_config")
@@ -181,7 +219,12 @@ def wait_capacities(
 
 def enforce_fixed_compute(reference, capacities):
     shape = [
-        (capacity["physical_compute_slots"], capacity["compute_kv_bytes"])
+        (
+            capacity["physical_compute_slots"],
+            capacity["compute_kv_bytes"],
+            capacity.get("retained_gpu_pool_bytes"),
+            copy.deepcopy(capacity.get("retained_gpu_pool_shapes")),
+        )
         for capacity in capacities
     ]
     if reference is not None and reference != shape:
@@ -315,6 +358,10 @@ def execute(stage, args, manifest, path):
                             request_ids=result["request_ids"],
                             require_idle=True,
                         )
+                        if group["variant"] != "hbm":
+                            enforce_fixed_compute(
+                                physical_references[key], case["idle_capacity"]
+                            )
                         COMMON.write_manifest(
                             args.output_dir / f'{case["id"]}-timing.json',
                             case["analysis"],
