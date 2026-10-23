@@ -248,6 +248,49 @@ class TestStagePlanning(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "preserve selector"):
             self.parse(stage)
 
+    def test_frozen_index_budget_does_not_follow_mpu_capacity_sweep(self):
+        stage = recipe(tp=4) | {"frozen_host_budget": True}
+        with self.assertRaisesRegex(ValueError, "frozen index/address"):
+            self.parse(stage, ["--capacity-ratios", "1", "4"])
+        stage, args = self.parse(
+            stage,
+            ["--cpu-capacity-ratio", "8", "--capacity-ratios", "1", "2", "4", "8"],
+        )
+        for variant, ratio in RUN.STAGE.variants(stage, args):
+            self.assertEqual(
+                RUN.STAGE.config_for(stage, args, variant, ratio)[
+                    "host_to_device_ratio"
+                ],
+                8,
+            )
+        measured = [capacity(rank, 4, ratio=1) for rank in range(4)]
+        measured[2]["addressable_backing_slots"] = 4095
+        with self.assertRaisesRegex(ValueError, "false capacity plateau"):
+            RUN.verify_capacities(measured, stage, args, "mpu", 1)
+
+    def test_resolved_graph_backend_takes_precedence_over_legacy_flag(self):
+        self.assertFalse(
+            RUN.decode_graph_enabled(
+                {
+                    "disable_cuda_graph": False,
+                    "cuda_graph_config": {"decode": {"backend": "disabled"}},
+                }
+            )
+        )
+        self.assertTrue(
+            RUN.decode_graph_enabled(
+                {
+                    "disable_cuda_graph": True,
+                    "cuda_graph_config": {"decode": {"backend": "full"}},
+                }
+            )
+        )
+        self.assertTrue(RUN.decode_graph_enabled({"disable_cuda_graph": False}))
+        with self.assertRaises(ValueError):
+            RUN.decode_graph_enabled(
+                {"disable_cuda_graph": False, "cuda_graph_config": {}}
+            )
+
     def test_new_runner_finishes_analysis_before_owned_server_shutdown(self):
         stage, args = self.parse(recipe(variant="cpu"))
         args.input_lens, args.concurrencies, args.num_prompts, args.output_len = (

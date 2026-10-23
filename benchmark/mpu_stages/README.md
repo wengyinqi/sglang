@@ -54,6 +54,12 @@ CPU `host_to_device_ratio` 必须是正整数；MPU 比例可以是正浮点数�
 存储 ordinal，各计算 rank 对应一张卡，例如 `4 5 6 7`。保持拓扑固定时扫描容量，
 变更存储卡数量还会同时改变聚合链路带宽。
 
+V4/GLM 的 `frozen_host_budget=true` 表示 CPU host ratio 同时固定 GPU index/逻辑地址
+预算。扫描 `[1,2,4,8]` 前必须给所有 CPU/MPU 变体设置 `--cpu-capacity-ratio 8`，
+然后通过 `--capacity-ratios 1 2 4 8` 只改变 MPU 分配。脚本拒绝超过这个固定地址
+预算的扫点，也拒绝实际 `addressable_backing_slots < backing_slots` 的配置，防止
+不可寻址的额外显存形成虚假的吞吐平台。Qwen recipe 可保持此选项为 false。
+
 原生 benchmark 保留端到端 TTFT、TPOT、输出吞吐量与完整请求计数。分析器另算：
 
 `P = Σ 每个对齐 prefill batch 的 max(TP rank CUDA event 时长)`
@@ -90,6 +96,7 @@ batch 不对齐、混杂请求、重算 prefill、未完成输出和非正残余
   "variant": "mpu",
   "selector": "quest",
   "physical_budget_exact": true,
+  "frozen_host_budget": false,
   "sparse_context_multiplier": 1,
   "page_size": 64,
   "server_args": ["--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16", "--page-size", "64"],
@@ -115,6 +122,8 @@ recipe 中同名参数必须一致。可选 defaults 包括 `input_lens`、`outp
 `repeats`、`mem_fraction_static`、`cpu_capacity_ratio`。DSV4 C4 可设置
 `sparse_context_multiplier=4`，将 hot buffer 的压缩行数换算为正确性 prompt 的原始
 token 数。模型的 index_topk 等原生设置仍是权威，recipe 必须与实际 checkpoint 一致。
+新 main 的 graph 验收读取 resolved `cuda_graph_config.decode.backend`；仅旧分支
+没有该结构时读取 `disable_cuda_graph`，避免 legacy 标志与自动关闭的实际 backend 不一致。
 
 运行时使用 `SGLANG_MPU_STAGE_TIMING_DIR` 与
 `sglang.srt.observability.mpu_stage_timing.MPUStageForwardTimer`：

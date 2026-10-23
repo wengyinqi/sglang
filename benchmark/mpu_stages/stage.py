@@ -204,6 +204,13 @@ def validate(stage, args):
             "Stage must explicitly define a full-HBM recipe preserving the same sparse selector"
         )
     if stage["variant"] == "mpu":
+        if (
+            stage.get("frozen_host_budget", False)
+            and max(args.capacity_ratios) > args.cpu_capacity_ratio
+        ):
+            raise ValueError(
+                "MPU ratio exceeds the frozen index/address budget; increase --cpu-capacity-ratio for all CPU/MPU runs first"
+            )
         cpu = config_for(stage, args, "cpu", args.cpu_capacity_ratio)
         mpu = config_for(stage, args, "mpu", args.capacity_ratios[0])
         for key in (
@@ -248,6 +255,8 @@ def config_for(stage, args, variant, ratio):
             config[name] = getattr(args, name)
     if variant == "mpu":
         config["backing_store"] = "mpu"
+        if stage.get("frozen_host_budget", False):
+            config["host_to_device_ratio"] = args.cpu_capacity_ratio
         if args.mpu_device_ids is not None:
             config["mpu_device_ids"] = args.mpu_device_ids
         if args.mpu_memory_reserve_bytes is not None:
