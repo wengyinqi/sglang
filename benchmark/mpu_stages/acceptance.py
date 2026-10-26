@@ -51,6 +51,8 @@ def portable_targets(stage):
         "test/manual/mpu_stages/test_environment_packaging.py",
         "test/manual/mpu_stages/test_model_snapshot.py",
         "test/manual/mpu_stages/test_hardware_probe.py",
+        "test/manual/mpu_stages/test_lifecycle_cpu.py",
+        "test/manual/mpu_stages/test_lifecycle_tools.py",
     ]
     if stage["family"] == "qwen":
         targets += [
@@ -123,11 +125,7 @@ def remap_ordinals(ordinals, visibility):
 
 
 def kernel_jobs(stage, args, visibility):
-    """Reuse tests in subprocesses, mapping their local IDs to every target pair.
-
-    Pair tests run separately. They do not certify concurrent TP collectives or
-    the GLM tail-aware resolve-to-replay path; model acceptance is a later gate.
-    """
+    """Run pair diagnostics, real GLM resolve, then simultaneous MPU data paths."""
     jobs = []
     if stage["family"] == "qwen":
         jobs.append(
@@ -188,6 +186,10 @@ def kernel_jobs(stage, args, visibility):
             "env": {"CUDA_VISIBLE_DEVICES": remap_ordinals([0], visibility)},
         }
     )
+    if stage["family"] == "glm-5.3-flash":
+        jobs[-1]["targets"].append(
+            "test/registered/kernels/ops/attention/test_dsa_kpool_topk_transform.py"
+        )
     if stage["variant"] == "mpu":
         storage = STAGE.config_for(stage, args, "mpu", args.capacity_ratios[0])[
             "mpu_device_ids"
@@ -200,7 +202,10 @@ def kernel_jobs(stage, args, visibility):
             else:
                 order = [rank, *[index for index in range(4) if index != rank]]
                 mapping = order + [storage[index] for index in order]
-                targets = ["test/manual/mpu_stages/test_glm53_gpu.py"]
+                targets = [
+                    "test/manual/mpu_stages/test_glm53_gpu.py",
+                    "test/manual/mpu_stages/test_glm53_resolve_gpu.py",
+                ]
                 extra = {"SGLANG_TEST_GLM53_MPU": "1"}
             jobs.append(
                 {
@@ -214,6 +219,22 @@ def kernel_jobs(stage, args, visibility):
                     "storage_ordinal": storage[rank],
                 }
             )
+        jobs.append(
+            {
+                "name": "mpu-concurrent",
+                "targets": ["test/manual/mpu_stages/test_mpu_concurrent_gpu.py"],
+                "env": {
+                    "CUDA_VISIBLE_DEVICES": remap_ordinals(
+                        [0, 1, 2, 3, *storage], visibility
+                    ),
+                    "SGLANG_TEST_MPU_CONCURRENT": "1",
+                    "SGLANG_MPU_TEST_FAMILY": stage["family"],
+                    "SGLANG_MPU_CONCURRENT_REPORT": str(
+                        args.output_dir.resolve() / "concurrent-ranks.json"
+                    ),
+                },
+            }
+        )
     return jobs
 
 
@@ -276,6 +297,8 @@ def forwarded_args(argv, output_dir, *, correctness=False, model=None):
         index += 1
     if correctness and "--include-hbm" not in clean:
         clean.append("--include-hbm")
+    if correctness and "--lifecycle" not in clean:
+        clean.append("--lifecycle")
     if model is not None:
         clean += ["--model", model]
     return [
@@ -524,6 +547,22 @@ def external_result(step, job, returncode):
                 "reason": "Model runner did not finish all required groups",
                 "runner_status": status,
             }
+        if step.get("id") == "correctness":
+            required = {"abort_prefill", "abort_decode", "retract_decode"}
+            for group in groups:
+                accepted = {
+                    item.get("case")
+                    for item in group.get("lifecycle_results", [])
+                    if item.get("status") == "passed"
+                }
+                if (
+                    group.get("lifecycle_required") is not True
+                    or not required <= accepted
+                ):
+                    return {
+                        "status": "failed",
+                        "reason": "Missing required abort/retract recovery evidence",
+                    }
         return {"status": "passed", "runner_status": status, "groups": len(groups)}
     except (OSError, ValueError, TypeError, KeyError) as error:
         return {"status": "failed", "reason": f"Invalid delegated report: {error}"}
@@ -671,8 +710,9 @@ def main(argv=None):
             "+0 is HiSparse CPU DDR backing; the correctness gate also requires the same-selector HBM reference.",
             "Compile gate builds production MPU objects only; native load and GPU execution are separate evidence.",
             "Required pytest skips block the next layer. Passing a requested subset does not pass later layers.",
-            "TP4 peer kernel tests sweep every configured pair separately, not simultaneous rank communication.",
-            "Abort/retract stress, GLM tail-aware resolve-to-peer integration and economic/SLO acceptance are not certified by this suite.",
+            "TP4 kernel acceptance includes four concurrent compute processes; it does not certify TP collectives or measured GPU traffic overlap.",
+            "GLM MPU tests use real KPool selection and resolve-to-peer replay; model correctness also requires observed abort/retract recovery.",
+            "Economic/SLO acceptance remains separate from successful data-path and model tests.",
             "Target model acceptance requires both full local fingerprints and a matching trusted fixed-revision reference.",
         ],
     }
