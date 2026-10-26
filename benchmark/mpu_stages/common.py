@@ -4,6 +4,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import signal
 import socket
 import subprocess
@@ -104,11 +105,45 @@ def runtime_info():
         "cpu_count": os.cpu_count(),
         "packages": {},
     }
-    for package in ("torch", "triton", "flashinfer-python", "sglang", "sgl-kernel"):
+    # The distribution is sglang-kernel, while its import namespace is sgl_kernel.
+    # Keep the old distribution spelling too so older environments remain visible.
+    for package in (
+        "torch",
+        "triton",
+        "flashinfer-python",
+        "sglang",
+        "sglang-kernel",
+        "sgl-kernel",
+        "tilelang",
+        "apache-tvm-ffi",
+    ):
         try:
             info["packages"][package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             info["packages"][package] = None
+    marker = REPO / ".mpu-source.json"
+    if marker.is_file():
+        try:
+            source = json.loads(marker.read_text(encoding="utf-8"))
+            if (
+                not isinstance(source, dict)
+                or source.get("provenance") != "git_archive"
+                or not re.fullmatch(r"[0-9a-f]{40}", source.get("source_commit", ""))
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", source.get("source_archive_sha256", "")
+                )
+            ):
+                raise ValueError("Invalid archived-source identity")
+            info["archived_source"] = source
+            if info["git_commit"].startswith("unavailable:"):
+                info["git_commit"] = source["source_commit"]
+                info["git_commit_source"] = "archive_build_marker"
+                # An archive has no index to prove an unmodified working tree.
+                # Its commit marker records build provenance, not a current diff.
+                info["git_status"] = "unavailable: archived source has no Git index"
+        except (OSError, ValueError, TypeError) as error:
+            info["archived_source_error"] = str(error)
+    info.setdefault("git_commit_source", "git")
     if hasattr(os, "sysconf"):
         info["host_memory_bytes"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf(
             "SC_PHYS_PAGES"
