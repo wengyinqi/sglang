@@ -17,6 +17,22 @@ SPEC.loader.exec_module(MODEL)
 
 
 class ModelSnapshotTests(unittest.TestCase):
+    def test_bundled_reference_matches_this_stage_and_has_only_checksum_inventory(self):
+        directory = ROOT / "benchmark/mpu_stages"
+        stage = MODEL.read_json(directory / "stage.json")
+        path = directory / "environments/model-references" / f"{stage['family']}.json"
+        reference = MODEL.reference_identity(path, MODEL.stage_identity(stage))
+        self.assertIs(reference["weight_payloads_downloaded"], False)
+        self.assertIn(stage["default_revision"], reference["source_url"])
+        weights = [
+            entry for entry in reference["files"].values() if entry["role"] == "weight"
+        ]
+        self.assertTrue(weights)
+        for name, entry in reference["files"].items():
+            MODEL.safe_name(name)
+            self.assertGreater(entry["size"], 0)
+            self.assertRegex(entry["sha256"], r"^[0-9a-f]{64}$")
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
