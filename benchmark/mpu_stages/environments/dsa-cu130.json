@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "dsa-cu130",
+  "families": ["deepseek-v4-flash", "glm-5.3-flash"],
+  "dockerfile": "docker/Dockerfile",
+  "target": "runtime",
+  "cuda_version": "13.0.3",
+  "platform": "linux/amd64",
+  "build_type": "all",
+  "expected_packages": {
+    "torch": "2.14.1",
+    "flashinfer-python": "0.7.2",
+    "sglang-kernel": "0.4.10",
+    "tilelang": "0.1.12"
+  }
+}
