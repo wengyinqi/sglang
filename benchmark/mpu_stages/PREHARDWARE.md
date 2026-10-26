@@ -52,7 +52,9 @@ python benchmark/mpu_stages/hardware_probe.py --mode compile --output /results/n
 
 ## 3. 准备本地模型身份
 
-可先下载固定 revision 的元数据及 LFS 校验和参考，不下载权重：
+仓库已包含本轮从固定 revision 取得的三份
+[校验和参考](environments/model-references/README.md)，可随代码带到服务器。
+如需重新取得参考，以下命令只下载元数据及 LFS 校验和，不下载权重：
 
 ```bash
 python benchmark/mpu_stages/model_snapshot.py fetch-reference --output /results/model-reference.json
@@ -63,9 +65,12 @@ python benchmark/mpu_stages/model_snapshot.py fetch-reference --output /results/
 
 ```bash
 python benchmark/mpu_stages/model_snapshot.py create \
-  --model /models/model --reference /results/model-reference.json \
+  --model /models/model \
+  --reference benchmark/mpu_stages/environments/model-references/glm-5.3-flash.json \
   --full-checksum --output /results/model-manifest.json
 ```
+
+以上以 GLM 为例；Qwen 使用 `qwen.json`，V4 使用 `deepseek-v4-flash.json`。
 
 本地目录名或声明 revision 不证明权重来源。没有可信参考时，完整 SHA 清单证明的
 是可重复的本地内容身份，报告的 `upstream_identity_verified` 仍为 false，并阻塞

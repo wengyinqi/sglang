@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "kind": "hf_revision_reference",
+  "family": "qwen",
+  "model_id": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+  "revision": "144afc2f379b542fdd4e85a1fcd5e1f79112d95d",
+  "resolved_revision": "144afc2f379b542fdd4e85a1fcd5e1f79112d95d",
+  "files": {
+    "config.json": {
+      "role": "config",
+      "size": 963,
+      "sha256": "a1ee086a68d0cbfc87316da00ba4b8507bd1292978108e2496201a30a450f438"
+    },
+    "config_1m.json": {
+      "role": "config",
+      "size": 77716,
+      "sha256": "fa9f253ed6748b3a5664e70a533e3e90e4b09bb4749296f4911108d933737351"
+    },
+    "generation_config.json": {
+      "role": "config",
+      "size": 239,
+      "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+    },
+    "merges.txt": {
+      "role": "tokenizer",
+      "size": 1671839,
+      "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+    },
+    "model-00001-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3998893112,
+      "sha256": "d6f04f15f023d0a0eff2d073b4276dd0151100bd94b1799fa27166bf99d68a1c"
+    },
+    "model-00002-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999974192,
+      "sha256": "1cc90a6c66e32b8ef75ecd3f4e184a17adc7bebc81833fff7249caa05208cc51"
+    },
+    "model-00003-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3997360832,
+      "sha256": "11708821e290005919b8bf2d8274929fb1e55bcca27872a9a21ccaec9088c0df"
+    },
+    "model-00004-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975056,
+      "sha256": "b2df42850cff934ddfd65e6bea496a3124cb94b70464529d0653a6bdded2ed9e"
+    },
+    "model-00005-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975400,
+      "sha256": "31ce04731fbf3b572f8342a48c3d974aeec2c3d03be425a881ce4e9b67bfa3aa"
+    },
+    "model-00006-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975400,
+      "sha256": "2e1a20ddcdc0e74edbcbd4fcd1c8a9b50ead8db64105f12a936d284602f34481"
+    },
+    "model-00007-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975472,
+      "sha256": "8a6c42fbe9a8cdef9095aa371429b5ecb290f2649a98396ee756470fe7b2f434"
+    },
+    "model-00008-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3997362064,
+      "sha256": "195c7e165e0ebd6ceb4ac9a63e0d2f938e9a12345ff6c49c3514e8706854e546"
+    },
+    "model-00009-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975408,
+      "sha256": "8ec0147957bfeaae8b30997c2a6729ae66c1422bf4fbbd32926e217a3f889c25"
+    },
+    "model-00010-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975400,
+      "sha256": "eb6294ba4427d5cbb5fedde8e93463e633b425027361980411c7d2fd87326ea3"
+    },
+    "model-00011-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975408,
+      "sha256": "298194ffc33a87636c8c0bb7ff397e4a3bd2331c47ba13fb5ee4f75b5bc330b0"
+    },
+    "model-00012-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3987924896,
+      "sha256": "fc4a51b2452eb2a0250eaf195d4850db457ec03db569ec22c6f630b7857358be"
+    },
+    "model-00013-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975088,
+      "sha256": "fa1056cfc9875bab67c38789dad6f1e8cd589a8ca01fbda2ae6b061146880543"
+    },
+    "model-00014-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975400,
+      "sha256": "4c7be0464c767cacfacca4fe1e36dc03e2b7df080054e5d4683a2f259ec0be71"
+    },
+    "model-00015-of-00016.safetensors": {
+      "role": "weight",
+      "size": 3999975400,
+      "sha256": "cf7c761699afa8265c8a193bd582a49aaa5f2acb77669cf2f2225fb80b50874c"
+    },
+    "model-00016-of-00016.safetensors": {
+      "role": "weight",
+      "size": 1085307128,
+      "sha256": "2f2dba3a7e094bd12ddce13f5f44edc4a39615d810faf9f20c42d4d136dc5956"
+    },
+    "model.safetensors.index.json": {
+      "role": "weight_index",
+      "size": 1699758,
+      "sha256": "8dde190b862c7c80ec7403c6495de00c60bbaf246ed479cee4506284989c584c"
+    },
+    "tokenizer.json": {
+      "role": "tokenizer",
+      "size": 7032399,
+      "sha256": "19564a48c4f71a2a1b937cce34c737a1e662b171c5f5d7edf641a15cd896f07d"
+    },
+    "tokenizer_config.json": {
+      "role": "tokenizer",
+      "size": 10835,
+      "sha256": "9c9cfea24361f234a5ef67d3f49f69733163f77c0d1fcced5b5aa72913b8ea22"
+    },
+    "vocab.json": {
+      "role": "tokenizer",
+      "size": 2776833,
+      "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    }
+  },
+  "retrieved_at": "2026-10-26T07:11:39.099480+00:00",
+  "source_url": "https://huggingface.co/api/models/Qwen/Qwen3-30B-A3B-Thinking-2507/revision/144afc2f379b542fdd4e85a1fcd5e1f79112d95d?blobs=true",
+  "weight_payloads_downloaded": false,
+  "trust_basis": "HTTPS Hugging Face fixed-revision API plus metadata content; operator must preserve/review this reference"
+}
