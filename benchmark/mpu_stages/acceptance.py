@@ -58,8 +58,17 @@ def portable_targets(stage):
             "test/manual/hisparse/test_quest_backend_contracts.py",
             "test/manual/hisparse/test_quest_lifecycle_ordering.py",
             "test/manual/hisparse/test_benchmark_stream_accounting.py",
-            "test/manual/hisparse/test_mpu_timing.py",
+            "test/manual/hisparse/test_mpu_timing.py::TestDecodeOnlyAccounting",
             "test/manual/test_hisparse_qwen_benchmark.py",
+        ]
+        targets += [
+            f"test/manual/hisparse/test_mpu_timing.py::TestForwardTrace::{name}"
+            for name in (
+                "test_hot_path_never_syncs_or_writes_events",
+                "test_failed_forward_is_recorded_and_exception_propagates",
+                "test_completed_events_remain_ordered_across_idle_waves",
+                "test_disabled_trace_does_not_require_cuda_or_create_files",
+            )
         ]
         targets += [
             f"test/manual/mpu/test_mpu_{name}.py"
@@ -125,7 +134,8 @@ def kernel_jobs(stage, args, visibility):
             {
                 "name": "quest-cuda",
                 "targets": [
-                    "test/manual/hisparse/test_quest_selector.py::TestQuestSelectorCUDA"
+                    "test/manual/hisparse/test_quest_selector.py::TestQuestSelectorCUDA",
+                    "test/manual/hisparse/test_mpu_timing.py::TestForwardTrace::test_real_cuda_stream_eager_and_graph_replay",
                 ],
                 "env": {"CUDA_VISIBLE_DEVICES": remap_ordinals([0], visibility)},
             }
