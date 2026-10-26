@@ -5,6 +5,7 @@ preserves Git modes/symlinks and never copies a live working directory.
 """
 
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -76,7 +77,13 @@ def image_reference(value):
 
 
 def generate_dockerfile(
-    original, recipe, commit, archive_sha, base_image=None, uv_image=None
+    original,
+    recipe,
+    commit,
+    archive_sha,
+    base_image=None,
+    uv_image=None,
+    build_jobs=None,
 ):
     original = original.replace("\r\n", "\n")
     if (
@@ -119,6 +126,15 @@ def generate_dockerfile(
         )
         if count != 1:
             raise ValueError("This source Dockerfile has no configurable uv stage")
+    if build_jobs is not None:
+        dockerfile, count = re.subn(
+            r"(?m)^(FROM [^\n]+ AS base)$",
+            lambda match: match.group(0)
+            + f"\nENV MAX_JOBS={build_jobs} CMAKE_BUILD_PARALLEL_LEVEL={build_jobs} CARGO_BUILD_JOBS={build_jobs}",
+            dockerfile,
+        )
+        if count != 1:
+            raise ValueError("Expected exactly one base stage for build job limits")
     dockerfile += f"""
 
 # MPU experiment provenance. Package install and runtime both use the archive.
@@ -159,8 +175,14 @@ def external_images(dockerfile, cuda_version):
 def make_context(source_archive, output, additions):
     # Streaming copy avoids extracting Git symlinks (which require extra Windows
     # privileges) and faithfully retains executable bits on Linux.
-    with tarfile.open(source_archive, "r") as source, tarfile.open(
-        output, "w"
+    # Buildx can mistake a raw tar beginning with a PAX header for a Dockerfile
+    # on stdin. A deterministic gzip envelope makes the archive unambiguous.
+    with tarfile.open(source_archive, "r") as source, Path(output).open(
+        "wb"
+    ) as destination, gzip.GzipFile(
+        filename="", mode="wb", fileobj=destination, mtime=0
+    ) as compressed, tarfile.open(
+        fileobj=compressed, mode="w"
     ) as target:
         for member in source:
             if member.name == "_mpu_build" or member.name.startswith("_mpu_build/"):
@@ -184,8 +206,14 @@ def prepare_environment(
     image_tag=None,
     base_image=None,
     uv_image=None,
+    build_network=None,
+    build_jobs=None,
 ):
     repo, output_dir = Path(repo).resolve(), Path(output_dir).resolve()
+    if build_network not in (None, "default", "none", "host"):
+        raise ValueError("Unsupported Docker build network")
+    if build_jobs is not None and (type(build_jobs) is not int or build_jobs <= 0):
+        raise ValueError("Build jobs must be a positive integer")
     commit = git(repo, "rev-parse", "--verify", f"{source_ref}^{{commit}}")
     if not re.fullmatch(r"[0-9a-f]{40,64}", commit):
         raise ValueError("Source ref did not resolve to a commit")
@@ -227,7 +255,7 @@ def prepare_environment(
     )
     archive_sha = sha256(archive)
     dockerfile = generate_dockerfile(
-        original, recipe, commit, archive_sha, base_image, uv_image
+        original, recipe, commit, archive_sha, base_image, uv_image, build_jobs
     )
     capture_path = HERE / "environments" / "capture_environment.py"
     tag = image_reference(image_tag or f"sglang-mpu:{stage['id']}-{commit[:12]}")
@@ -241,6 +269,8 @@ def prepare_environment(
         "SGL_KERNEL_VERSION": pins["sglang-kernel"],
         "FLASHINFER_VERSION": pins["flashinfer-python"],
     }
+    if build_jobs is not None:
+        build_args["BUILD_AND_DOWNLOAD_PARALLEL"] = str(build_jobs)
     command = [
         "docker",
         "build",
@@ -253,6 +283,8 @@ def prepare_environment(
         "--tag",
         tag,
     ]
+    if build_network is not None:
+        command += ["--network", build_network]
     for name, value in build_args.items():
         command += ["--build-arg", f"{name}={value}"]
     command += ["-"]
@@ -271,7 +303,7 @@ def prepare_environment(
         ).encode(),
         "_mpu_build/capture_environment.py": capture_path.read_bytes(),
     }
-    context = output_dir / "build-context.tar"
+    context = output_dir / "build-context.tar.gz"
     make_context(archive, context, additions)
     (output_dir / "Dockerfile").write_text(dockerfile, encoding="utf-8")
     write_json(output_dir / "build-input.json", build_input)
@@ -308,6 +340,8 @@ def prepare_environment(
             "dockerfile_sha256": hashlib.sha256(dockerfile.encode()).hexdigest(),
             "image_tag": tag,
             "build_args": build_args,
+            "network": build_network or "default",
+            "jobs_per_build_process": build_jobs,
             "external_images": external_images(dockerfile, recipe["cuda_version"]),
         },
         "image": {"id": None, "repo_digests": [], "pip_freeze": None},
@@ -433,6 +467,10 @@ def main(argv=None):
     parser.add_argument(
         "--uv-image", help="Optional pinned uv image for the newer Dockerfile"
     )
+    parser.add_argument("--build-network", choices=("default", "none", "host"))
+    parser.add_argument(
+        "--build-jobs", type=int, help="Positive per-build-process concurrency limit"
+    )
     parser.add_argument(
         "--execute",
         action="store_true",
@@ -447,6 +485,8 @@ def main(argv=None):
         args.image_tag,
         args.base_image,
         args.uv_image,
+        args.build_network,
+        args.build_jobs,
     )
     result = execute_build(plan, args.output_dir) if args.execute else plan
     print(
