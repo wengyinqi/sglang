@@ -10,9 +10,12 @@ spec = importlib.util.spec_from_file_location(
 RUN = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(RUN)
 COMPARE = RUN.load("comparison")
+LIFECYCLE = RUN.load("lifecycle")
 
 
 def make_plan(stage, args):
+    if getattr(args, "lifecycle", False) and args.output_len < 8:
+        raise ValueError("Lifecycle acceptance requires at least 8 output tokens")
     config = RUN.STAGE.config_for(
         stage, args, stage["variant"], args.capacity_ratios[0]
     )
@@ -53,6 +56,12 @@ def make_plan(stage, args):
                     "eager": eager,
                     "status": "planned",
                     "rounds": rounds,
+                    "lifecycle_required": getattr(args, "lifecycle", False),
+                    "lifecycle_cases": (
+                        ["abort_prefill", "abort_decode", "retract_decode"]
+                        if getattr(args, "lifecycle", False)
+                        else []
+                    ),
                     "planned_peak_original_token_slots": peak,
                     "trace_dir": str(args.output_dir / f"{gid}-trace"),
                     "server_command": RUN.STAGE.server_command(
@@ -163,6 +172,10 @@ def execute(stage, args, manifest, path):
                 group["slot_reuse_comparison"] = COMPARE.compare(
                     [records[0]], [records[2]], args.logprob_atol
                 )
+                if group["lifecycle_required"]:
+                    length = max(args.input_lens)
+                    inputs = (base * math.ceil(length / len(base)))[:length]
+                    LIFECYCLE.run_cases(RUN, COMPARE, stage, args, group, inputs)
                 group["status"] = "success"
         except (OSError, ValueError, RuntimeError) as error:
             group.update(status="failed", error=str(error))

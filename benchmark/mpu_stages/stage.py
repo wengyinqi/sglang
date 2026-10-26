@@ -59,6 +59,11 @@ def parse_args(argv=None, *, correctness=False):
     p.add_argument("--model", default=stage["default_model"])
     p.add_argument("--revision", default=stage.get("default_revision"))
     p.add_argument(
+        "--lifecycle",
+        action="store_true",
+        help="Correctness: require prefill/decode abort and retract recovery",
+    )
+    p.add_argument(
         "--input-lens",
         nargs="+",
         type=int,
