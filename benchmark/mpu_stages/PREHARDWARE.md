@@ -22,6 +22,9 @@ python benchmark/mpu_stages/build_environment.py \
 依赖会明确标记；保存实际构建的镜像 ID、RepoDigests、完整 pip freeze 和工具链记录。
 切换 Qwen 与新 main 系列时必须切换环境。每个镜像都要对应待验收分支的源码提交。
 
+WSL2 的资源较少时可加 `--build-jobs 1`。只有专用 Docker daemon 缺少可用网桥时
+才加 `--build-network host`；这两个选项及 NVIDIA 官方镜像替代路径详见环境文档。
+
 ## 2. 开发机先执行便携测试
 
 ```bash
@@ -133,6 +136,9 @@ CPU 层增加 8 个固定 seed、每 seed 400 步的生产分配器/协调器检
 
 ## 本轮证据边界
 
-2026-10-26 的开发主机是 Windows CPU 环境，无可用 Docker/CUDA 构建环境。可执行的
-验证是便携测试、计划生成、源码归档和探针的阻塞行为；Linux object 编译、原生模块
-加载、P2P、完整模型和性能均未在该主机执行。先保存这些明确状态，再在目标环境补验。
+2026-10-26 已在 Windows 主机的 WSL2 中建立 Ubuntu 24.04 编译容器。六阶段源码的
+MPU 传输、Quest Resolve、DeepSeek C4 Resolve/传输、GLM KPool/尾部槽位 Resolve
+和共享索引复制的默认配置特化，已进入真实 `sm_90a` 对象编译与直接链接验收。
+编译容器、对象编译、直接 FFI 加载、完整服务镜像、生产 JIT 工厂、GPU 执行和模型验收
+是不同证据层级：以各次报告的实际状态为准。直接加载共享库并检查导出函数不会执行内核，
+不能替代生产 JIT 工厂或模型启动。P2P、TP 多卡、完整模型正确性与性能仍需目标机器。

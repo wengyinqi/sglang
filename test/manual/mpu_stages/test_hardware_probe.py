@@ -67,10 +67,21 @@ class ProbeUnitTests(unittest.TestCase):
             "flashinfer-python": "0.6.8.post1",
             "sglang-kernel": "0.4.1.post1",
         }
-        actual = {**expected, "torch": "2.9.1+cu130"}
+        actual = {
+            **expected,
+            "torch": "2.9.1+cu130",
+            "sglang-kernel": "0.4.1.post1+cu130",
+        }
         result = probe.compare_environment_pins(source, expected, actual)
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["evidence"]["actual_packages"]["torch"], "2.9.1+cu130")
+        for version in ("0.4.1.post1+cu128", "0.4.10+cu130"):
+            self.assertEqual(
+                probe.compare_environment_pins(
+                    source, expected, {**actual, "sglang-kernel": version}
+                )["status"],
+                "failed",
+            )
         self.assertEqual(
             result["evidence"]["package_checks"][0]["evidence"]["source_pins"],
             ["2.9.1"],
