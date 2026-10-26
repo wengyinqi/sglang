@@ -4,6 +4,10 @@
 KV 都驻留计算卡 HBM 的配置。当前分支的 `stage.json` 确定模型、TP 数量和 CPU/MPU
 配置。六个阶段使用同一套脚本，模型专用设置保留在各分支的 recipe 中。
 
+机器到位前先按 [PREHARDWARE.md](PREHARDWARE.md) 固定分支构建配方和模型清单。
+新增 `acceptance.py` 复用下述运行器，将编译、导入、设备、内核、正确性和性能分层
+验收；必需测试被跳过时停止后续层，不把计划或缺硬件误判为通过。
+
 ```bash
 # 默认读取旁边的 stage.json，生成计划，不加载模型或启动 CUDA。
 python benchmark/mpu_stages/correctness.py
