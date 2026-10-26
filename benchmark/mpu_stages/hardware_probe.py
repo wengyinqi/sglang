@@ -174,7 +174,11 @@ def compare_environment_pins(pyproject, expected, actual):
     for name, wanted in expected.items():
         installed = actual.get(name)
         source_pins = sorted(source.get(name, set()))
-        allowed = {wanted, wanted + "+cu130"} if name == "torch" else {wanted}
+        allowed = (
+            {wanted, wanted + "+cu130"}
+            if name in {"torch", "sglang-kernel"}
+            else {wanted}
+        )
         if source_pins != [wanted]:
             status, reason = (
                 "failed",
@@ -205,7 +209,7 @@ def compare_environment_pins(pyproject, expected, actual):
         expected_packages=expected,
         actual_packages=actual,
         package_checks=checks,
-        version_policy="Exact core pins; torch additionally accepts the +cu130 local suffix",
+        version_policy="Exact core pins; torch and sglang-kernel additionally accept the +cu130 wheel suffix",
         scope="package_metadata_and_source_pins_only_no_import_or_cuda_execution",
     )
 

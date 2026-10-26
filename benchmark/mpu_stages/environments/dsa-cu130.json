@@ -8,6 +8,7 @@
   "platform": "linux/amd64",
   "build_type": "all",
   "expected_packages": {
+    "apache-tvm-ffi": "0.1.11",
     "torch": "2.14.1",
     "flashinfer-python": "0.7.2",
     "sglang-kernel": "0.4.10",
