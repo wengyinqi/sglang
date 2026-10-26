@@ -108,6 +108,9 @@ def make_logical_allocator():
 
 def coordinator(pool, mapping, allocated, audit):
     path = "python/sglang/srt/managers/hisparse_coordinator.py"
+    methods = ["request_finished", "retract_req"]
+    if "def release_backing(" in (ROOT / path).read_text(encoding="utf-8"):
+        methods.append("release_backing")
     namespace = {
         "device_module": NS(
             current_stream=lambda: NS(
@@ -121,10 +124,11 @@ def coordinator(pool, mapping, allocated, audit):
         (),
         {
             name: definition(path, name, namespace, "HiSparseCoordinator")
-            for name in ("request_finished", "retract_req")
+            for name in methods
         },
     )
     c = cls()
+    c.backing_budget = None  # This state machine exercises allocated slot ownership.
     c.decode_producer_stream = object()
     c.wait_for_pending_backup = lambda: audit.append("wait_backup")
     c._has_pending_backup = True
