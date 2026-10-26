@@ -98,17 +98,37 @@ Qwen 1+1 使用计算卡加一张存储卡；1+4 加 `--mpu-device-ids 1 2 3 4`�
 
 - `device` 在每个计算 rank 和每个指定 MPU 上做定向 P2P 小数据读写、allocator 与
   显存预留检查。存储卡只分配空间，读写由计算卡发起；这不等于 profiler 证明。
-- `kernels` 复用已有 CUDA 算子测试，Qwen 包含所选全部 shard。V4/GLM 将已有单对
-  测试分别映射到全部四对设备，逐对执行；不是同时四 rank 的并发通信测试。
+- `kernels` 复用已有 CUDA 算子测试，Qwen 包含所选全部 shard。V4/GLM 先逐对诊断，
+  再启动四个独立计算进程，同步提交四对 MPU 的写入、跨 stream 事件依赖和读取；
+  覆盖 eager/graph、rank/轮次不同的数据、C4 value/scale/page padding 及排空后的槽位复用。
+  `concurrent-ranks.json` 保存每 rank 的结果。这验证并发数据通路，不代表 TP collective
+  验证，也不把主机提交时间当成 GPU 流量确实重叠或带宽收益的证据。
+- GLM 每一对额外运行真实 KPool selector → coordinator resolve → MPU replay，输入为
+  人工构造的 score；2048 个 history 列和 3 个 tail 列直接来自生产 selector，miss 表由
+  生产 resolve 生成。覆盖初次 miss、全 hit、驱逐、非恒等页映射、短序列、页尾、
+  padding、共享索引复制和动态 graph replay；尚不是完整 GLM 模型验证。
 - `correctness` 复用已有运行器，强制加入相同 selector 的 HBM 存储参考，再比较
   CPU DDR/MPU、eager/graph、长短长请求和正常完成后的槽位复用。指定
   `--disable-cuda-graph` 后只验证 eager，报告不能被解释为 graph 已通过。
+- 总入口强制给 correctness 加 `--lifecycle`：正常对照后再测试 chunked prefill 中 abort、
+  decode 中 abort、公开 pause(retract)/continue 接口触发的回退恢复。每次故障后发送
+  新 request ID，要求输出与故障前相同输入的 greedy token/logprob 匹配、各 rank 容量
+  恢复且物理池大小不漂移。retract 还要求 `num_retractions > 0`、trace 中确有重算，
+  并比较恢复请求的完整输出。HTTP 200、排队时取消或正常完成均不能替代故障证据。
+  prefill 取消按 10/50/200 ms 尝试，三次均未命中实际 prefill 窗口时验收失败；按日志
+  增大长输入或调整 chunk 大小后重跑。此窗口检测依赖实际 forward trace，不推断阶段。
 - 必需的 JUnit 测试出现 skip、空集合或缺失报告会阻塞后续步骤；测试失败会停止。
   总报告 `acceptance.json` 引用每层原始日志、JUnit、探针与模型 manifest，且保留
   `passed / failed / blocked / not_requested / not_run_after_failure`。
 
-该入口不认证尚未补齐的 abort/retract 压力、四对设备同时执行、GLM 的 2051 列
-真实 resolve→MPU 联合路径，也不把性能数据自动判为经济最优点。模型性能入口保留
+CPU 层增加 8 个固定 seed、每 seed 400 步的生产分配器/协调器检查，混合 append、
+容量耗尽、finish/abort/retract 和复用，每步检查地址独占与容量守恒，失败输出完整
+操作日志。它覆盖 CPU 控制逻辑，CUDA stream 与模型状态是替代边界。并修复分页池
+映射范围溢出时先分配后报错而泄漏页面的问题，改为分配前拒绝。
+热缓存扩容失败时也保留原 prefill 映射，确保失败清理还能找到原有页面；该回归分别
+覆盖旧 Quest 与新 main 系列分配器。Quest 另检查 1000 步真实 admission lease 的容量守恒。
+
+该入口不自动认证长时间服务压力稳定性，也不把性能数据自动判为经济最优点。模型性能入口保留
 实测 TTFT/TPOT/吞吐量与独立的 prefill 扣减估算；更多口径见 [README.md](README.md)。
 
 ## 本轮证据边界

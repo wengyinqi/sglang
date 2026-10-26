@@ -55,6 +55,28 @@ def args(root, devices=None):
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_model_success_without_fault_evidence_cannot_pass_correctness(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "manifest.json"
+            group = {"status": "success"}
+            report = {"status": "success", "groups": [group]}
+            job = {"report": str(path)}
+            step = {"id": "correctness", "kind": "model_run"}
+            path.write_text(json.dumps(report), encoding="utf-8")
+            self.assertEqual(ACCEPT.external_result(step, job, 0)["status"], "failed")
+            group.update(
+                lifecycle_required=True,
+                lifecycle_results=[
+                    {"case": case, "status": "passed"}
+                    for case in ("abort_prefill", "abort_decode", "retract_decode")
+                ],
+            )
+            path.write_text(json.dumps(report), encoding="utf-8")
+            self.assertEqual(ACCEPT.external_result(step, job, 0)["status"], "passed")
+            group["lifecycle_results"][0]["status"] = "window_missed"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            self.assertEqual(ACCEPT.external_result(step, job, 0)["status"], "failed")
+
     def test_junit_skip_empty_failures_and_missing_reports_never_pass(self):
         with tempfile.TemporaryDirectory() as name:
             path = Path(name) / "report.xml"
@@ -88,8 +110,8 @@ class AcceptanceTests(unittest.TestCase):
         visibility = [f"GPU-{i}" for i in range(8)]
         for family in ("deepseek-v4-flash", "glm-5.3-flash"):
             jobs = ACCEPT.kernel_jobs(recipe(family), args(Path("results")), visibility)
-            self.assertEqual(len(jobs), 5)
-            pairs = jobs[1:]
+            self.assertEqual(len(jobs), 6)
+            pairs = jobs[1:5]
             for rank, job in enumerate(pairs):
                 actual = job["env"]["CUDA_VISIBLE_DEVICES"].split(",")
                 self.assertEqual(actual[0], visibility[rank])
@@ -99,6 +121,17 @@ class AcceptanceTests(unittest.TestCase):
                 )
                 self.assertEqual(job["storage_ordinal"], 4 + rank)
                 self.assertEqual(len(set(actual)), len(actual))
+            concurrent = jobs[-1]
+            self.assertEqual(
+                concurrent["env"]["CUDA_VISIBLE_DEVICES"], ",".join(visibility)
+            )
+            self.assertEqual(concurrent["env"]["SGLANG_TEST_MPU_CONCURRENT"], "1")
+            if family == "glm-5.3-flash":
+                self.assertTrue(
+                    all(
+                        any("resolve_gpu" in t for t in job["targets"]) for job in pairs
+                    )
+                )
 
     def test_qwen_multishard_mapping_and_cpu_stages_do_not_require_mpu(self):
         jobs = ACCEPT.kernel_jobs(
@@ -148,6 +181,7 @@ class AcceptanceTests(unittest.TestCase):
             cmd = steps[-2]["commands"][0]["command"]
             self.assertEqual(cmd.count("--execute"), 1)
             self.assertIn("--include-hbm", cmd)
+            self.assertIn("--lifecycle", cmd)
             self.assertNotIn("original.json", cmd)
             self.assertIn("local model", cmd)
             self.assertEqual(cmd[cmd.index("--stage") + 1], str(root / "stage.json"))
