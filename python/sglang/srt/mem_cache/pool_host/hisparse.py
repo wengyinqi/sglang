@@ -25,13 +25,29 @@ class HiSparseHostPoolMixin:
     ) -> torch.Tensor:
         """Allocate request host slots by page and return token-granular slots."""
         device = req_to_host_pool.device
-        if num_tokens <= 0:
-            return torch.empty((0,), dtype=torch.int64, device=device)
-
+        # Reject a bad mapping range before consuming backing pages. Tensor slice
+        # assignment would otherwise fail only after alloc_page, leaking pages.
+        if (
+            req_to_host_pool.ndim != 2
+            or req_to_host_pool_allocated_len.ndim != 1
+            or req_to_host_pool_allocated_len.shape[0] != req_to_host_pool.shape[0]
+            or not 0 <= req_pool_idx < req_to_host_pool.shape[0]
+            or start_pos < 0
+            or num_tokens < 0
+        ):
+            raise ValueError("Invalid HiSparse request backing range")
         allocated_len = int(req_to_host_pool_allocated_len[req_pool_idx])
         end_pos = start_pos + num_tokens
         page_end = self._round_up_to_page_size(end_pos)
-        assert start_pos <= allocated_len
+        if (
+            allocated_len < 0
+            or allocated_len % self.page_size
+            or start_pos > allocated_len
+            or max(allocated_len, page_end) > req_to_host_pool.shape[1]
+        ):
+            raise ValueError("HiSparse request backing range exceeds its mapping")
+        if num_tokens == 0:
+            return torch.empty((0,), dtype=torch.int64, device=device)
 
         if page_end > allocated_len:
             num_new_pages = (page_end - allocated_len) // self.page_size
