@@ -191,9 +191,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
-        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
+        # Keep the original mapping until expansion succeeds, so an allocation
+        # failure can still release the request's existing prefill pages.
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         # Zero means unmapped; after alloc_logical_only the mapping is all zeros.
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         if len(hisparse_indices) >= need_size:
@@ -219,10 +219,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert extra_indices is not None, (
-                "Hisparse allocation failed in alloc_device_buffer"
-            )
+            assert (
+                extra_indices is not None
+            ), "Hisparse allocation failed in alloc_device_buffer"
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
+        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
@@ -280,9 +281,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             len(logical_indices),
             num_new_pages=num_new_pages,
         )
-        assert hisparse_indices is not None, (
-            "Hisparse allocation failed in alloc_extend"
-        )
+        assert (
+            hisparse_indices is not None
+        ), "Hisparse allocation failed in alloc_extend"
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
         return logical_indices
 
@@ -528,7 +529,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.hisparse_page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        # Preserve ownership if the extra physical-page allocation fails.
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
 
         device_buffer_size = need_size - self.hisparse_page_size
@@ -569,10 +570,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extra_indices = self.hisparse_attn_allocator.alloc(
                 need_size - len(hisparse_indices)
             )
-            assert extra_indices is not None, (
-                "Hisparse allocation failed in alloc_device_buffer"
-            )
+            assert (
+                extra_indices is not None
+            ), "Hisparse allocation failed in alloc_device_buffer"
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
+        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
@@ -641,9 +643,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             hisparse_last_loc,
             len(compressed_logical_indices),
         )
-        assert hisparse_indices is not None, (
-            "Hisparse allocation failed in alloc_extend"
-        )
+        assert (
+            hisparse_indices is not None
+        ), "Hisparse allocation failed in alloc_extend"
 
         self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
             hisparse_indices.to(torch.int64)
