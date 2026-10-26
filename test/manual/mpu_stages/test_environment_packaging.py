@@ -1,6 +1,7 @@
 """Offline construction/verification of the two source-pinned image recipes."""
 
 import importlib.util
+import io
 import json
 import subprocess
 import tarfile
@@ -113,6 +114,32 @@ class EnvironmentPackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pyproject mismatch"):
             self.plan()
 
+    def test_stdin_archive_detection_and_pax_members(self):
+        archive = self.root / "pax.tar"
+        long_name = "long-directory/" * 12 + "kernel.cuh"
+        with tarfile.open(archive, "w", format=tarfile.PAX_FORMAT) as source:
+            item = tarfile.TarInfo(long_name)
+            item.pax_headers = {"comment": "git archive provenance"}
+            item.mode = 0o755
+            item.size = 6
+            source.addfile(item, io.BytesIO(b"source"))
+            link = tarfile.TarInfo("kernel-link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = long_name
+            source.addfile(link)
+        outputs = [self.root / "first.tar.gz", self.root / "second.tar.gz"]
+        for output in outputs:
+            ENV.make_context(
+                archive, output, {"_mpu_build/Dockerfile": b"FROM scratch\n"}
+            )
+            # Docker's stdin archive sniffer recognizes gzip before parsing PAX.
+            self.assertEqual(output.read_bytes()[:2], b"\x1f\x8b")
+            with tarfile.open(output) as context:
+                self.assertEqual(context.extractfile(long_name).read(), b"source")
+                self.assertEqual(context.getmember(long_name).mode, 0o755)
+                self.assertEqual(context.getmember("kernel-link").linkname, long_name)
+        self.assertEqual(outputs[0].read_bytes(), outputs[1].read_bytes())
+
     def test_different_stage_or_mutable_worktree_changes_are_rejected(self):
         alternate = self.root / "stage.json"
         alternate.write_text(
@@ -153,6 +180,27 @@ class EnvironmentPackagingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "context changed"):
                 ENV.execute_build(plan, self.root / "output")
             run.assert_not_called()
+
+    def test_explicit_host_network_and_per_process_job_limits(self):
+        plan = self.plan(build_network="host", build_jobs=1)
+        command = plan["build"]["command"]
+        self.assertEqual(command[command.index("--network") + 1], "host")
+        self.assertIn("BUILD_AND_DOWNLOAD_PARALLEL=1", command)
+        dockerfile = (self.root / "output/Dockerfile").read_text()
+        self.assertIn(
+            "ENV MAX_JOBS=1 CMAKE_BUILD_PARALLEL_LEVEL=1 CARGO_BUILD_JOBS=1", dockerfile
+        )
+        self.assertEqual(plan["build"]["jobs_per_build_process"], 1)
+
+    def test_invalid_build_controls_are_rejected_before_creating_output(self):
+        for kwargs in (
+            {"build_jobs": 0},
+            {"build_jobs": True},
+            {"build_network": "unreviewed"},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.plan(**kwargs)
+        self.assertFalse((self.root / "output").exists())
 
     def test_execute_records_failure_without_claiming_a_built_image(self):
         plan = self.plan()
