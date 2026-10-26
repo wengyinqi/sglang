@@ -361,9 +361,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
-        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
+        # Preserve prefill ownership until expansion succeeds, so failure cleanup
+        # can still find and release the original physical pages.
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         # Filter valid (non-zero) hisparse indices.
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
@@ -395,6 +395,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 extra_indices is not None
             ), "Hisparse allocation failed in alloc_device_buffer"
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
+        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
