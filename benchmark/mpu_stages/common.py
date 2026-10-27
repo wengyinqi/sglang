@@ -236,6 +236,12 @@ def start_server(args, command, log, *, trace_dir=None, env_updates=None):
     env = subprocess_env()
     env.pop("SGLANG_MPU_STAGE_TIMING_DIR", None)
     env.pop("SGLANG_HISPARSE_TIMING_DIR", None)
+    stage = (
+        json.loads(Path(args.stage).read_text(encoding="utf-8"))
+        if getattr(args, "stage", None)
+        else {}
+    )
+    env.update(stage.get("server_environment", {}))
     if trace_dir:
         env["SGLANG_MPU_STAGE_TIMING_DIR"] = str(trace_dir)
     env.update(env_updates or {})

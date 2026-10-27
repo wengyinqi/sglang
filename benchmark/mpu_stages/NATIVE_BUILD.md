@@ -1,5 +1,8 @@
 # Native build and experimental runtime image
 
+四卡 recipe 采用 Attention-DP4+EP4，Qwen 仍单计算卡；见
+[ATTENTION_DP_EP.md](ATTENTION_DP_EP.md)。需要对修正后的源码提交重新构建。
+
 六个实验分支共享此入口。`+0` 始终是 HiSparse CPU DDR 全量 KV 后备存储。
 `main` 和四个官方 HiSparse 分支不需要这些工具。
 
