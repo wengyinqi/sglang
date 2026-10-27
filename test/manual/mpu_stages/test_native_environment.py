@@ -98,6 +98,23 @@ class NativeEnvironmentTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 NATIVE.linux_prefix(value)
 
+    def test_registry_wheelhouse_pin_is_explicit_and_rejects_wrong_platform_or_hash(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            wheel = Path(directory) / "pkg-1.0-cp312-cp312-manylinux_2_27_x86_64.whl"
+            wheel.write_bytes(b"synthetic fixture")
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            lock = "pkg==1.0 \\\n    --hash=sha256:" + digest + "\n"
+            self.assertIn(
+                wheel.resolve().as_uri(), NATIVE.effective_lock(lock, directory)
+            )
+            wheel.write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "hash differs"):
+                NATIVE.effective_lock(lock, directory)
+            wheel.rename(wheel.with_name("pkg-1.0-cp312-cp312-win_amd64.whl"))
+            self.assertNotIn("file:", NATIVE.effective_lock(lock, directory))
+
     def test_wheel_must_include_every_declared_extension_and_no_bytecode(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
