@@ -6,6 +6,7 @@ the methods under test is used.  Run with Python's unittest or pytest.
 """
 
 import ast
+import importlib.util
 import signal
 import subprocess
 import unittest
@@ -295,7 +296,13 @@ class TestQuestFusedPrefill(unittest.TestCase):
 
 class TestQuestAcceptanceWorkerCleanup(unittest.TestCase):
     def test_worker_process_group_cleanup_on_success_and_timeout(self):
-        from test.manual.hisparse import test_quest_offload_equivalence as acceptance
+        # Ubuntu installs a stdlib `test` package that shadows our namespace.
+        spec = importlib.util.spec_from_file_location(
+            "quest_offload_acceptance",
+            ROOT / "test/manual/hisparse/test_quest_offload_equivalence.py",
+        )
+        acceptance = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(acceptance)
 
         command = ["python", "acceptance-worker"]
         for timed_out in (False, True):
