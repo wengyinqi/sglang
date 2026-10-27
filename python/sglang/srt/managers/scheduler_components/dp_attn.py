@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
@@ -686,6 +687,12 @@ def prepare_mlp_sync_batch_raw(
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
     if local_batch is not None and metadata_ready:
+        if os.environ.get("SGLANG_MPU_STAGE_TIMING_DIR"):
+            local_batch.mpu_dp_forward_modes = [
+                ForwardMode(mode).name.lower()
+                for mode in mlp_sync_info.tp0_info_cpu[:, 5].tolist()
+            ]
+            local_batch.mpu_dp_num_tokens = list(mlp_sync_info.global_num_tokens)
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
                 mlp_sync_info.tp0_info_cpu[:, 5].tolist()

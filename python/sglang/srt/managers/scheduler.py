@@ -1311,6 +1311,7 @@ class Scheduler(
             parallel.tp_rank,
             parallel.pp_rank,
             parallel.dp_rank,
+            model=self.tp_worker.model_runner.model,
             capacity_provider=lambda: collect_stage_capacity(
                 self.token_to_kv_pool_allocator,
                 self.hisparse_coordinator,

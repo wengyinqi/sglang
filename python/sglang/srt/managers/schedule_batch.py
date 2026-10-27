@@ -2585,6 +2585,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Config / flags crossing to ForwardBatch (by-value) ===
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
+    # Optional experiment trace metadata from the existing DP gather. CPU only;
+    # preserve the original decode mode before any prefill-graph conversion.
+    mpu_dp_forward_modes: Optional[List[str]] = None
+    mpu_dp_num_tokens: Optional[List[int]] = None
 
     # Full-DP metadata from the existing scheduler gather.
     dp_spec_prefill_coordination_metadata: Optional[tuple] = None
