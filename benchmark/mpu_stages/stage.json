@@ -3,8 +3,11 @@
   "id": "04-deepseek-v4-flash-4gpu-4mpu",
   "family": "deepseek-v4-flash",
   "tp_size": 4,
-  "default_model": "deepseek-ai/DeepSeek-V4-Flash",
-  "default_revision": "60d8d70770c6776ff598c94bb586a859a38244f1",
+  "attn_dp_size": 4,
+  "ep_size": 4,
+  "server_environment": {"SGLANG_DSV4_FP4_EXPERTS": "0"},
+  "default_model": "sgl-project/DeepSeek-V4-Flash-FP8",
+  "default_revision": "ae01d80c06cdfe30581edfd0e1c5449dc7ed7f17",
   "variant": "mpu",
   "selector": "deepseek-v4-c4-indexer",
   "physical_budget_exact": false,
@@ -14,9 +17,9 @@
   "sparse_context_multiplier": 4,
   "page_size": 256,
   "server_args": [
-    "--trust-remote-code", "--moe-runner-backend", "marlin",
+    "--trust-remote-code", "--moe-runner-backend", "deep_gemm",
     "--attention-backend", "dsv4", "--dsv4-attn-backend", "flashmla",
-    "--attn-dp-size", "1", "--base-gpu-id", "0"
+    "--base-gpu-id", "0"
   ],
   "variants": {
     "cpu": {
@@ -42,7 +45,7 @@
     "input_lens": [8192, 32768],
     "output_len": 256,
     "correctness_output_len": 257,
-    "concurrencies": [1, 2, 4],
+    "concurrencies": [4, 8, 16],
     "num_prompts": 32,
     "repeats": 3,
     "max_total_tokens": 131072,

@@ -8,16 +8,22 @@ A CPU configuration check is not model/GPU validation.
 
 ## H200 start point
 
-Use Linux, the pinned branch's CUDA build dependencies and the official
-`deepseek-ai/DeepSeek-V4-Flash` FP4 checkpoint. TP4/Marlin follows
-`test/manual/dsv4/test_h200_fp4_flash.py`. FP8 repacks are a different baseline.
-Start without speculative decoding, DP, PP, CP or PD. Do not copy EAGLE flags
-from the general model cookbook: upstream rejects DSV4 HiSparse speculation.
+Use Linux and `sgl-project/DeepSeek-V4-Flash-FP8`, revision
+`ae01d80c06cdfe30581edfd0e1c5449dc7ed7f17`, with `SGLANG_DSV4_FP4_EXPERTS=0`.
+The H200 FP8 recipe is grounded in `test/manual/dsv4/test_h200_fp8_flash.py`.
+Both CPU and MPU stages use Attention-DP4 + EP4, effective attention/dense/MoE
+TP=1, DeepGEMM and DeepEP. No speculative decoding, PP, CP or PD.
+FP4/Marlin is not a DeepEP-compatible replacement in this source revision.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V4-Flash --trust-remote-code \
-  --tp-size 4 --moe-runner-backend marlin \
+SGLANG_DSV4_FP4_EXPERTS=0 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
+  --model-path sgl-project/DeepSeek-V4-Flash-FP8 --trust-remote-code \
+  --revision ae01d80c06cdfe30581edfd0e1c5449dc7ed7f17 \
+  --tp-size 4 --dp-size 1 --attn-dp-size 4 --ep-size 4 \
+  --moe-dense-tp-size 1 --enable-dense-mlp-attn-tp --enable-dp-lm-head \
+  --moe-runner-backend deep_gemm --moe-a2a-backend deepep --deepep-mode auto \
+  --disable-overlap-schedule --load-balance-method round_robin \
+  --cuda-graph-config '{"prefill":{"backend":"disabled"}}' \
   --attention-backend dsv4 --dsv4-attn-backend flashmla \
   --enable-hisparse --disable-radix-cache \
   --hisparse-config '{"top_k":512,"device_buffer_size":1024,"host_to_device_ratio":2,"swap_in_block_size":960}'
@@ -39,12 +45,11 @@ retractions; then enable graph replay. Check value and scale bytes separately.
 Test prefill lengths not divisible by 4 or 256 and at least 257 decode tokens.
 Long contexts must force actual C4 misses before any performance interpretation.
 
-Report TTFT and TPOT as observed. For a NoPD decode-only estimate, subtract the
-sum of matched prefill batch durations from measured run wall time, taking
-max(TP-rank local CUDA duration) for each serial NoPD prefill batch. This is
-an approximation: rank-local CUDA clocks do not provide an exact cross-device
-interval union. Do not sum per-request TTFTs or TP-rank durations. Preserve both original and
-estimated throughput, generated-token denominator and graph/timing overhead.
+Report TTFT and TPOT as observed. Decode-only estimation subtracts only pure
+prefill EP steps using the maximum CUDA duration across four ranks per step.
+Mixed prefill/decode steps remain in the denominator. Requests belong to one
+Attention owner each; idle ranks still participate in EP. See
+[ATTENTION_DP_EP.md](ATTENTION_DP_EP.md) for alignment and limitations.
 
 `host_to_device_ratio` participates in C4 GPU sizing. Freeze it and the actual
 compute C4/SWA/C128/index pools when comparing backing capacity. Expose MPU
@@ -62,7 +67,7 @@ Keep every model/GPU sizing option unchanged and replace only the JSON config:
 {"top_k":512,"device_buffer_size":1024,"host_to_device_ratio":2,"swap_in_block_size":960,"backing_store":"mpu","mpu_device_ids":[4,5,6,7],"mpu_capacity_ratio":2.0,"mpu_memory_reserve_bytes":1073741824}
 ```
 
-TP rank i runs on CUDA-visible GPU i and allocates C4 on GPU 4+i. The four
+Attention rank i runs on CUDA-visible GPU i and allocates C4 on GPU 4+i. The four
 storage GPUs run no model, indexer, collective or KV copy/initialization kernels.
 Compute-side coherent `.cg` loads/stores copy value and scale regions; peer
 writes include a system fence. Existing HiSparse streams/events retain producer
@@ -82,16 +87,12 @@ The code uses conservative input + maximum output lifetime page leases for
 both CPU and MPU runs; waiting requests cannot consume more backing than the
 pool. This policy must stay identical between variants.
 
-The stage recipe pins official checkpoint revision
-`60d8d70770c6776ff598c94bb586a859a38244f1`. The Hugging Face model API and
-that revision's config were checked on 2026-10-23: `index_topk=512`,
-`expert_dtype=fp4`, 43 base layers. Its general quantization config says FP8;
-the explicit expert dtype is why the H200 recipe uses Marlin for FP4 experts.
-Weights were not downloaded. A local snapshot override must preserve the
-checkpoint and tokenizer identity in the recorded evidence.
+The pinned FP8 reference was fetched on 2026-10-27; metadata was hashed and
+46 weight-shard checksums were recorded without downloading weight payloads.
+Old FP4/Marlin results cannot be used as this recipe's CPU/MPU baseline.
 
 The default `--max-total-tokens=131072`, input lengths 8192/32768, and concurrency
-1/2/4 are unmeasured starting settings. Correctness generates 257 tokens and
+4/8/16 are unmeasured starting settings. Correctness generates 257 tokens and
 uses original-token page boundaries of 256 (64 compressed C4 rows). Prefill
 still needs compute KV capacity before staging; an allocation/startup failure
 is a failed setup, not evidence of low throughput. Calibrate fit on H200.
@@ -109,7 +110,7 @@ PYTORCH_CUDA_ALLOC_CONF=backend:native,expandable_segments:False \
 
 Current validation is CPU-only. GPU tests cover split value/scale page-boundary
 roundtrips, repeated graph replay and 2048-selected/4096-hot-buffer miss plans
-with 256/960/1024-thread planners. They are unrun here. Complete eight-GPU TP4
+with 256/960/1024-thread planners. They are unrun here. Complete eight-GPU Attention-DP4+EP4
 model tests, abort/retract and capacity sweeps with the shared stage runner;
 profile the storage GPUs to verify the no-kernel contract before accepting a
 performance result. No hardware throughput, TTFT, TPOT or accuracy result is

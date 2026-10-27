@@ -1,5 +1,8 @@
 # 本地验证记录：DeepSeek V4 Flash
 
+以下为旧 TP4/FP4 配方的历史记录，不代表当前 DP+EP/FP8 验收。
+当前规则见 [ATTENTION_DP_EP.md](ATTENTION_DP_EP.md)。
+
 日期：2026-10-23。环境：Windows、CPU PyTorch，无 CUDA/GPU。
 阶段 03/04 使用相同实现，分别默认 CPU DDR 与 MPU C4 backing。
 
