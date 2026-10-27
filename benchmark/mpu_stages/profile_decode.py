@@ -148,7 +148,7 @@ def plan(stage, args, steps):
         "workload": {
             "input_len": args.input_lens[0],
             "output_len": output_len,
-            "concurrency": 1,
+            "concurrency": stage.get("attn_dp_size", 1),
             "prompt": "synthetic repeated token 42; diagnostic only",
         },
         "configured_decode_steps": steps,
@@ -257,7 +257,11 @@ def execute(report, stage, args, acceptance):
                 args.port,
                 "generate",
                 {
-                    "input_ids": [42] * report["workload"]["input_len"],
+                    "input_ids": (
+                        [[42] * report["workload"]["input_len"] for _ in range(4)]
+                        if stage.get("attn_dp_size", 1) > 1
+                        else [42] * report["workload"]["input_len"]
+                    ),
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": report["workload"]["output_len"],
@@ -266,14 +270,40 @@ def execute(report, stage, args, acceptance):
                 },
                 timeout=args.benchmark_timeout,
             )
-            if (
-                response.get("meta_info", {}).get("completion_tokens")
+            responses = response if isinstance(response, list) else [response]
+            if len(responses) != report["workload"]["concurrency"] or any(
+                item.get("meta_info", {}).get("completion_tokens")
                 != report["workload"]["output_len"]
+                for item in responses
             ):
                 raise ValueError(
                     "Profiled request did not complete the intended decode length"
                 )
-            report["completion_tokens"] = response["meta_info"]["completion_tokens"]
+            report["completion_tokens"] = sum(
+                item["meta_info"]["completion_tokens"] for item in responses
+            )
+            report["profiled_request_ids"] = [
+                item["meta_info"].get("id") for item in responses
+            ]
+            RUN.wait_capacities(
+                root / "forward-trace",
+                stage,
+                args,
+                stage["variant"],
+                args.capacity_ratios[0],
+                request_ids=report["profiled_request_ids"],
+                require_idle=True,
+            )
+            if stage.get("attn_dp_size", 1) > 1:
+                traces = RUN.ANALYZE.load_traces(root / "forward-trace")
+                owners = RUN.ANALYZE._request_owners(
+                    RUN.ANALYZE._dp_traces(traces), set(report["profiled_request_ids"])
+                )
+                if set(owners.values()) != set(range(stage["attn_dp_size"])):
+                    raise ValueError(
+                        "Profile workload did not cover all Attention-DP owners"
+                    )
+                report["attention_owners"] = owners
             # Terminate the owned server, leaving nsys alive to finalize its report.
             server_pid = int((root / "server.pid").read_text())
             os.kill(server_pid, signal.SIGTERM)

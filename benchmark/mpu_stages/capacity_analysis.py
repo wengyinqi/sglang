@@ -130,6 +130,13 @@ def enrich(summary, groups, policy):
                 "Duplicate repeat IDs cannot be treated as independent samples"
             )
         ids = sorted(indexed)
+        methods = {
+            indexed[i]["analysis"]["decode_only_estimate"].get("method") for i in ids
+        }
+        if len(methods) > 1:
+            raise ValueError(
+                "Cannot mix TP and DP prefill subtraction methods in repeated samples"
+            )
         rates = [
             indexed[i]["analysis"]["decode_only_estimate"][
                 "decode_throughput_tokens_per_second"
@@ -148,6 +155,11 @@ def enrich(summary, groups, policy):
             n=len(cases),
             decode_median_ci95=bootstrap(rates),
             actual_output_median_ci95=bootstrap(actual),
+            decode_estimate_method=next(iter(methods)),
+            mixed_ep_steps_by_repeat=[
+                indexed[i]["analysis"].get("cuda_trace", {}).get("mixed_steps", 0)
+                for i in ids
+            ],
         )
         capacities = row.get("per_rank_capacity") or []
         effective = [p.get("effective_capacity_ratio") for p in capacities]
@@ -184,7 +196,9 @@ def enrich(summary, groups, policy):
                 status=(
                     "failed"
                     if "failed" in states
-                    else "missing_metric" if "missing_metric" in states else "passed"
+                    else "missing_metric"
+                    if "missing_metric" in states
+                    else "passed"
                 ),
                 metrics=results,
             )

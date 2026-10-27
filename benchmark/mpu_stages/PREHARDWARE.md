@@ -1,5 +1,8 @@
 # 机器到位前的准备与到货验收
 
+多卡阶段已改为 Attention-DP4 + EP4。当前权威并行与计时规则见
+[ATTENTION_DP_EP.md](ATTENTION_DP_EP.md)；历史 TP 构建记录不能替代新方案验收。
+
 六个实验分支复用本目录脚本，`stage.json` 决定模型和默认 CPU/MPU 后备存储。
 `+0` 仍是 HiSparse CPU DDR；所有阶段是 NoPD。此入口不改变模型或缓存算法。
 
@@ -104,7 +107,7 @@ Qwen 1+1 使用计算卡加一张存储卡；1+4 加 `--mpu-device-ids 1 2 3 4`�
 - `kernels` 复用已有 CUDA 算子测试，Qwen 包含所选全部 shard。V4/GLM 先逐对诊断，
   再启动四个独立计算进程，同步提交四对 MPU 的写入、跨 stream 事件依赖和读取；
   覆盖 eager/graph、rank/轮次不同的数据、C4 value/scale/page padding 及排空后的槽位复用。
-  `concurrent-ranks.json` 保存每 rank 的结果。这验证并发数据通路，不代表 TP collective
+  `concurrent-ranks.json` 保存每 rank 的结果。这验证并发数据通路，不代表 Attention-DP/DeepEP collective
   验证，也不把主机提交时间当成 GPU 流量确实重叠或带宽收益的证据。
 - GLM 每一对额外运行真实 KPool selector → coordinator resolve → MPU replay，输入为
   人工构造的 score；2048 个 history 列和 3 个 tail 列直接来自生产 selector，miss 表由
@@ -141,4 +144,4 @@ MPU 传输、Quest Resolve、DeepSeek C4 Resolve/传输、GLM KPool/尾部槽位
 和共享索引复制的默认配置特化，已进入真实 `sm_90a` 对象编译与直接链接验收。
 编译容器、对象编译、直接 FFI 加载、完整服务镜像、生产 JIT 工厂、GPU 执行和模型验收
 是不同证据层级：以各次报告的实际状态为准。直接加载共享库并检查导出函数不会执行内核，
-不能替代生产 JIT 工厂或模型启动。P2P、TP 多卡、完整模型正确性与性能仍需目标机器。
+不能替代生产 JIT 工厂或模型启动。P2P、Attention-DP/EP 多卡、完整模型正确性与性能仍需目标机器。
