@@ -1,4 +1,4 @@
-"""Opt-in batch CUDA timing for TP1/TP4 HiSparse stage experiments.
+"""Opt-in CUDA timing for single-compute and Attention-DP4/EP4 experiments.
 
 CUDA events are recorded on the stream executing forward, including graph
 replay. No device synchronization or file writes occur in the forward wrapper.
@@ -117,6 +117,20 @@ class MPUStageForwardTimer:
         self._last_written_sequence = -1
         self._capacity_provider = capacity_provider
         self._last_capacity = None
+        self._parallel_metadata = {
+            key: metadata[key]
+            for key in (
+                "compute_world_size",
+                "attn_dp_size",
+                "attn_dp_rank",
+                "attn_tp_size",
+                "ep_size",
+                "moe_tp_size",
+                "parallel_strategy",
+                "tensor_parallel_audit",
+            )
+            if key in metadata
+        }
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         self.path = directory / (
@@ -131,11 +145,31 @@ class MPUStageForwardTimer:
 
     @classmethod
     def create(
-        cls, directory, server_args, tp_rank, pp_rank, dp_rank, capacity_provider=None
+        cls,
+        directory,
+        server_args,
+        tp_rank,
+        pp_rank,
+        dp_rank,
+        capacity_provider=None,
+        model=None,
     ):
         if not directory:
             return None
+        from sglang.srt.observability.mpu_parallel import (
+            audit_model_tensor_parallelism,
+            parallel_metadata,
+        )
+
+        parallel = parallel_metadata(server_args, tp_rank)
+        if parallel["attn_dp_size"] > 1:
+            if model is None:
+                raise ValueError(
+                    "DP+EP experiment timing requires a model partition audit"
+                )
+            parallel["tensor_parallel_audit"] = audit_model_tensor_parallelism(model)
         metadata = {
+            **parallel,
             "tp_rank": tp_rank,
             "pp_rank": pp_rank,
             "dp_rank": dp_rank,
@@ -170,6 +204,12 @@ class MPUStageForwardTimer:
             "launch_monotonic_ns": time.monotonic_ns(),
             "success": False,
         }
+        if self._parallel_metadata.get("attn_dp_size", 1) > 1:
+            modes = getattr(batch, "mpu_dp_forward_modes", None)
+            counts = getattr(batch, "mpu_dp_num_tokens", None)
+            if modes is None or counts is None:
+                raise ValueError("Missing metadata from the actual DP scheduler gather")
+            metadata.update(dp_forward_modes=list(modes), dp_num_tokens=list(counts))
         self._sequence += 1
         start, end = self._event_factory(), self._event_factory()
         start.record(stream)
@@ -198,6 +238,8 @@ class MPUStageForwardTimer:
         """Drain the final event and publish an explicit completeness marker."""
         self._collect(wait=True)
         capacity = self._capacity_provider() if self._capacity_provider else None
+        if capacity is not None:
+            capacity = {**capacity, **self._parallel_metadata}
         if not self._completed and capacity == self._last_capacity:
             return
         with self.path.open("a", encoding="utf-8") as output:
