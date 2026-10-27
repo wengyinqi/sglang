@@ -33,6 +33,12 @@ def make_plan(stage, args):
     page = stage.get("page_size", 64)
     short = [page + 1, min(hot + 1, max(args.input_lens))]
     rounds = [args.input_lens, short, args.input_lens]
+    if stage.get("attn_dp_size", 1) > 1:
+        # Round-robin assigns one independent request to each attention owner.
+        rounds = [
+            (lengths * math.ceil(4 / len(lengths)))[: max(4, len(lengths))]
+            for lengths in rounds
+        ]
     peak = max(
         sum(math.ceil((n + args.output_len) / page) * page for n in lengths)
         for lengths in rounds
@@ -94,7 +100,7 @@ def execute(stage, args, manifest, path):
     for group in manifest["groups"]:
         process = None
         try:
-            with (args.output_dir / f'{group["id"]}-server.log').open(
+            with (args.output_dir / f"{group['id']}-server.log").open(
                 "w", encoding="utf-8"
             ) as log:
                 process = RUN.COMMON.start_server(
@@ -103,7 +109,7 @@ def execute(stage, args, manifest, path):
                 RUN.COMMON.wait_ready(process, args.port, args.startup_timeout)
                 info = RUN.COMMON.request_json(args.port, "get_server_info")
                 RUN.COMMON.write_manifest(
-                    args.output_dir / f'{group["id"]}-server-info.json', info
+                    args.output_dir / f"{group['id']}-server-info.json", info
                 )
                 if RUN.decode_graph_enabled(info) == group["eager"]:
                     raise ValueError(
@@ -136,7 +142,7 @@ def execute(stage, args, manifest, path):
                         timeout=args.benchmark_timeout,
                     )
                     RUN.COMMON.write_manifest(
-                        args.output_dir / f'{group["id"]}-round{index}.json',
+                        args.output_dir / f"{group['id']}-round{index}.json",
                         {"input_ids": inputs, "responses": outputs},
                     )
                     records.append(
@@ -160,6 +166,16 @@ def execute(stage, args, manifest, path):
                             require_idle=True,
                         )
                     )
+                    if stage.get("attn_dp_size", 1) > 1:
+                        traces = RUN.ANALYZE._dp_traces(
+                            RUN.ANALYZE.load_traces(group["trace_dir"])
+                        )
+                        owners = RUN.ANALYZE._request_owners(traces, set(ids))
+                        if set(owners.values()) != set(range(4)):
+                            raise ValueError(
+                                "Correctness round must exercise all four Attention-DP owners"
+                            )
+                        group.setdefault("round_attention_owners", []).append(owners)
                     if group["variant"] != "hbm":
                         RUN.enforce_fixed_compute(
                             physical_reference, group["round_idle_capacity"][-1]

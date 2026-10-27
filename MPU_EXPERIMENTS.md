@@ -1,5 +1,9 @@
 # 六阶段 MPU 实验分支
 
+四个多卡阶段使用 **Attention-DP4 + EP4**，有效 Attention TP 和 MoE TP 都为 1。
+Qwen 两阶段仍为单计算卡。并行、模型权重配方与计时修正详见
+[ATTENTION_DP_EP.md](benchmark/mpu_stages/ATTENTION_DP_EP.md)。
+
 阶段中的第一个数字是计算 GPU 数，第二个数字是 MPU 数（当前用额外 H200 只作
 存储模拟）。**`+0` 是 HiSparse 的 CPU DDR 后备存储，不是全 KV 驻留 GPU**。
 六个阶段均按 NoPD 运行。CPU DDR 路径沿用 pinned memory；MPU 路径不通过 CPU
@@ -62,8 +66,9 @@ Qwen 实验分支来自较早的 Quest 开发线，V4/GLM 分支来自新的 mai
 H200 peer load/store 模拟验证也不等于真实 MPU 驱动、带宽、延迟或价格验证。
 
 保留实测 TTFT、TPOT、端到端吞吐量；另报告 `wall time - prefill CUDA time` 的
-decode 估计。TP4 的同一批次使用各 rank 时间的最大值估计关键路径，不能相加四卡
-耗时，也不能减去各请求 TTFT 之和。估计仍含排队、CPU、传输和 staging 开销。
+decode 估计。DP4 使用同步 EP 步骤中各 rank 时长的最大值，只扣除纯 prefill 步骤；
+混合 prefill/decode 步骤完整保留。不能相加四卡耗时或减去各请求 TTFT 之和。
+估计仍含排队、CPU、传输和 staging 开销。
 容量平台区需按输入长度、并发和 SLO 分析；没有 MPU 成本数据时不声称经济最优点。
 
 V4/GLM 的 `host_to_device_ratio` 还控制计算侧索引/逻辑地址预算。默认先用比例 2

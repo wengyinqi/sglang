@@ -21,7 +21,8 @@ correctness 原始产物；CPU 测试通过不能解锁采集。归档源码保�
 
 脚本复用 SGLang 两代代码均有的 `SGLANG_PROFILE_V2=1` 与 `/start_profile` 接口，
 只启用 `CUDA_PROFILER` 的 `decode` 阶段。它先启动模型、warmup、flush cache，再启用
-阶段触发器并发送一个诊断请求。采样使用重复 token 42，单请求、非性能样本。
+阶段触发器并发送诊断请求。采样使用重复 token 42；Qwen 为单请求，多卡阶段为
+四个请求，覆盖四个 Attention owner。这些都是非性能样本。
 生成长度至少比请求的采样步数多 4，给上游触发器留下结束边界；实际可能多包含一个
 边界 step，必须检查原始时间线。NoPD 服务仍执行 prefill，但 trace 由 decode 触发。
 
@@ -67,6 +68,9 @@ trace；有界诊断中不会插入用于正确性对比的 `.cpu()` 操作。
 ## 容量、SLO 和成本
 
 `run.py` 的原始 TTFT、TPOT、端到端吞吐和扣除 prefill 的 decode 估算继续分别保存。
+DP4 只扣除全局纯 prefill 的 EP 步骤，混合 prefill/decode 步骤完整保留；每次重复
+记录混合步骤数量，见 [ATTENTION_DP_EP.md](ATTENTION_DP_EP.md)。不能混合旧 TP
+和新 DP 扣减方法计算重复区间。
 新分析保留 P99 TTFT/TPOT，给出重复实验中位数的 95% bootstrap 区间和相邻比例增益
 区间。默认至少 5 次重复才产生平台候选结论；原有默认 3 次仍可运行，但标为证据不足。
 实际分配容量未增加、样本缺失、结果波动跨越阈值，都不会给出平台结论；明确下降记为
