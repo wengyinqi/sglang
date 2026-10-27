@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -150,6 +151,13 @@ class NativeEnvironmentTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "successful native"):
                 IMAGE.validate_native(receipt)
+
+    def test_rebound_local_base_tag_cannot_change_pinned_image(self):
+        with patch.object(
+            IMAGE.subprocess, "check_output", return_value='[{"Id":"sha256:wrong"}]'
+        ):
+            with self.assertRaisesRegex(ValueError, "no longer"):
+                IMAGE.verify_base_reference("fixture:tag", "sha256:expected")
 
 
 if __name__ == "__main__":
