@@ -234,7 +234,7 @@ def enforce_fixed_compute(reference, capacities):
     return shape
 
 
-def summarize(groups, threshold):
+def summarize(groups, threshold, policy=None):
     rows, previous = [], {}
     for group in groups:
         for concurrency in sorted({case["concurrency"] for case in group["cases"]}):
@@ -286,11 +286,14 @@ def summarize(groups, threshold):
                     )
             previous[group["variant"], group["input_len"], concurrency] = row
             rows.append(row)
-    return {
+    summary = {
         "rows": rows,
         "plateau_threshold": threshold,
         "interpretation": "+0 means HiSparse CPU DDR backing. Per-workload adjacent gains are not an economic optimum without costs, uncertainty and SLO constraints.",
     }
+    if policy is not None:
+        return load("capacity_analysis").enrich(summary, groups, policy)
+    return summary
 
 
 def execute(stage, args, manifest, path):
@@ -385,7 +388,9 @@ def execute(stage, args, manifest, path):
                 if case["status"] == "planned":
                     case["status"] = "not_run_after_failure"
             COMMON.write_manifest(path, manifest)
-    manifest["summary"] = summarize(manifest["groups"], args.plateau_threshold)
+    manifest["summary"] = summarize(
+        manifest["groups"], args.plateau_threshold, manifest.get("analysis_policy")
+    )
     COMMON.write_manifest(args.output_dir / "capacity-curve.json", manifest["summary"])
     return all(group["status"] == "success" for group in manifest["groups"])
 
@@ -399,6 +404,9 @@ def new_manifest(stage, args, groups, kind):
         allocator_config_new=os.environ.get("PYTORCH_ALLOC_CONF"),
     )
     return {
+        "analysis_policy": load("capacity_analysis").load_policy(
+            getattr(args, "analysis_policy", None)
+        ),
         "status": "planned",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "kind": kind,

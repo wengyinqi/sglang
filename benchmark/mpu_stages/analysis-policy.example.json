@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "minimum_repeats": 5,
+  "slo": {},
+  "costs": [],
+  "currency": null,
+  "cost_basis": "simulator_hardware",
+  "source": "Fill with the quote, rental price or explicit hypothetical model used"
+}

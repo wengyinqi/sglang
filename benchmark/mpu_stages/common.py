@@ -229,7 +229,7 @@ def request_json(port, route, payload=None, *, timeout=30):
         return json.load(response)
 
 
-def start_server(args, command, log, *, trace_dir=None):
+def start_server(args, command, log, *, trace_dir=None, env_updates=None):
     with socket.socket() as probe:
         if probe.connect_ex(("127.0.0.1", args.port)) == 0:
             raise RuntimeError(f"port {args.port} is already in use")
@@ -238,6 +238,7 @@ def start_server(args, command, log, *, trace_dir=None):
     env.pop("SGLANG_HISPARSE_TIMING_DIR", None)
     if trace_dir:
         env["SGLANG_MPU_STAGE_TIMING_DIR"] = str(trace_dir)
+    env.update(env_updates or {})
     return subprocess.Popen(
         command,
         cwd=REPO,
