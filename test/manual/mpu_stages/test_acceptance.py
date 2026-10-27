@@ -32,9 +32,13 @@ def recipe(family="glm-5.3-flash", variant="mpu"):
         "selector": "test",
         "hbm_preserves_selector": True,
         "variants": {
-            "cpu": {"hisparse_config": {}},
+            "cpu": {"hisparse_config": {"top_k": 2048, "device_buffer_size": 4096}},
             "mpu": {
-                "hisparse_config": {"mpu_device_ids": [1] if tp == 1 else [4, 5, 6, 7]}
+                "hisparse_config": {
+                    "mpu_device_ids": [1] if tp == 1 else [4, 5, 6, 7],
+                    "top_k": 2048,
+                    "device_buffer_size": 4096,
+                }
             },
             "hbm": {"hisparse_config": {}},
         },
