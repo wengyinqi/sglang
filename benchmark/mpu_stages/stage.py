@@ -316,7 +316,7 @@ def server_command(stage, args, variant, input_len, ratio, *, eager=None):
                 "--ep-size": 4,
                 "--moe-dense-tp-size": 1,
                 "--moe-a2a-backend": "deepep",
-                "--deepep-mode": "low_latency",
+                "--deepep-mode": "auto",
                 "--load-balance-method": "round_robin",
                 # A decode converted to an extend graph is still a decode token.
                 # Keep prefill eager for unambiguous phase accounting in this PoC.

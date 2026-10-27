@@ -9,12 +9,14 @@ SGLang 的 `tp_size=4` 是这里用于划分 Attention-DP 与 EP 的四进程组
 每个请求只属于一个 Attention rank，每个 rank 对应一张 MPU（CUDA ordinal 4+i）。
 EP dispatch/combine 与调度同步仍然存在，不声称四张卡独立运行或无通信。
 
-运行器固定 DeepEP low_latency、DeepGEMM、DP LM head、dense MLP 使用 attention
+运行器固定 DeepEP auto（prefill/mixed 用 normal，decode 用 low_latency）、DeepGEMM、
+DP LM head、dense MLP 使用 attention
 group；关闭 CP、prefill graph、overlap 和 speculative decoding。decode graph
 仍作为单独正确性案例。计时启动时检查 resolved 参数，并遍历已实例化的
 Column/RowParallelLinear 与 VocabParallelEmbedding（包含派生类），拒绝任何
 tp_size>1 或缺失的分片信息。MoE 的有效 TP 另由 resolved EP group 检查。
 这项模型实例检查需要加载模型，CPU 测试不替代它。
+不能全程固定 low_latency：它的单 rank token 上限不足以容纳默认 4096-token prefill。
 
 ## 模型与配对
 
