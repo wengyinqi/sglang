@@ -13,9 +13,9 @@
 - 完整 server imports 单独记录；缺少 `libcuda.so.1` 可标为 blocked，代码/ABI 错误仍失败。
   编译或加载成功均不代表 GPU 数据通路、模型正确性或性能通过。
 
-本轮新增入口尚需在恢复后的 Linux 环境真实重跑。此前固定提交上的 26 个 JIT 加载
-结果不能替代新入口、新提交的执行结果。2026-10-27 本机 WSL 启动返回“系统资源不足，
-无法完成请求的服务”，因此本轮没有已构建的新 runtime 镜像。
+以每次执行生成的 `native-build.json` 与 `image-build.json` 为准，计划文件不证明成功。
+此前固定提交上的 26 个 JIT 加载结果不能替代新入口、新提交的执行结果。2026-10-27
+曾遇到 WSL 启动“系统资源不足，无法完成请求的服务”；恢复时没有更新内核或配置。
 
 ## 固定输入
 
@@ -52,7 +52,9 @@ python3 benchmark/mpu_stages/native_environment.py execute \
 已有下载缓存时可加 `--offline --wheelhouse /path/to/verified-wheels`。离线模式需要完整
 uv 与 Cargo 缓存；缺包会失败，不自动改成在线安装。Qwen `sglang-kernel` 使用固定
 GitHub release URL；离线 wheelhouse 中应包含 URL 对应的原始文件名，工具核验 SHA256
-后才改为本地 file URL。有效安装输入另存为前缀下的 `*-effective.txt`。
+后才改为本地 file URL。普通 registry pin 也会按包名、版本、Linux/Python 3.12 兼容
+标签和锁内 SHA256 绑定本地 wheel，避免 `--find-links` 被同版本 registry 候选抢先。
+有效安装输入另存为前缀下的 `*-effective.txt`。
 
 成功后 `native-build.json` 的 `built=true`、`status=built_jit_verified` 才能打包镜像：
 
