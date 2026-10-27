@@ -102,7 +102,6 @@ def validate_glm_hisparse_scope(cfg) -> None:
     for name in (
         "pp_size",
         "dp_size",
-        "attn_dp_size",
         "attn_cp_size",
         "dcp_size",
         "moe_dp_size",
@@ -112,6 +111,12 @@ def validate_glm_hisparse_scope(cfg) -> None:
             raise ValueError(
                 f"GLM hybrid HiSparse requires --{name.replace('_', '-')} 1"
             )
+    if cfg.attn_dp_size > 1:
+        if cfg.attn_dp_size != 4:
+            raise ValueError("GLM MPU experiments require Attention-DP4 + EP4")
+        from sglang.srt.observability.mpu_parallel import parallel_metadata
+
+        parallel_metadata(cfg, 0)
     if cfg.enable_prefill_cp or cfg.enable_pdmux or cfg.enable_two_batch_overlap:
         raise ValueError(
             "GLM hybrid HiSparse requires a single colocated attention stream"
@@ -148,9 +153,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5), DeepSeek V4, and MiniMax M3 now. "
     )
 
-    assert (
-        cfg.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+    assert cfg.disable_radix_cache, (
+        "Hierarchical sparse attention currently requires --disable-radix-cache."
+    )
     validate_hisparse_feature_combos(server_args)
 
     enable_spec = (
