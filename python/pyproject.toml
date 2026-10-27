@@ -78,7 +78,7 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
-  "kernels",
+  "kernels==0.14.1",  # Match the LayerRepository API used by Transformers 5.6.
 ]
 
 [[tool.uv.index]]

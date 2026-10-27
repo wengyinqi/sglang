@@ -40,6 +40,7 @@ PACKAGES = (
     "apache-tvm-ffi",
     "tilelang",
     "transformers",
+    "kernels",
     "msgspec",
     "ninja",
     "sglang",

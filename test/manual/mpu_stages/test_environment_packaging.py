@@ -55,7 +55,7 @@ class EnvironmentPackagingTests(unittest.TestCase):
         }
         files = {
             "benchmark/mpu_stages/stage.json": json.dumps(self.stage),
-            "python/pyproject.toml": '[project]\nname="sglang"\ndependencies = ["torch==2.9.1", "flashinfer_python==0.6.8.post1", "sglang-kernel==0.4.1.post1"]\n',
+            "python/pyproject.toml": '[project]\nname="sglang"\ndependencies = ["torch==2.9.1", "flashinfer_python==0.6.8.post1", "sglang-kernel==0.4.1.post1", "kernels==0.14.1"]\n',
             "python/sglang/__init__.py": "# committed source\n",
             "docker/Dockerfile": DOCKERFILE,
         }
