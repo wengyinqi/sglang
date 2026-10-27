@@ -4,6 +4,8 @@ The parent imports only the Python standard library. ``compile --compile-only``
 compiles the production MPU CUDA header and its real FFI exports into an object
 for Hopper; it neither links nor loads that object. Default ``compile`` also
 calls the production JIT factory in another process and checks its exports.
+``jit`` loads the complete stage-specific production factory matrix without
+launching GPU work; ``--jit-matrix boundaries`` adds supported specializations.
 ``device`` executes small compute-side load/store checks, not model correctness
 or a simultaneous tensor-parallel workload. All ordinals are CUDA-visible IDs.
 """
@@ -15,6 +17,7 @@ import ast
 import hashlib
 import importlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -26,6 +29,7 @@ import subprocess
 import sys
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +44,7 @@ PACKAGES = (
     "apache-tvm-ffi",
     "tilelang",
     "transformers",
+    "kernels",
     "msgspec",
     "ninja",
     "sglang",
@@ -281,7 +286,7 @@ def source_metadata(stage_path, family):
             return None
 
     module_path = ROOT / "python" / (family["kernel_module"].replace(".", "/") + ".py")
-    return {
+    metadata = {
         "repository": str(ROOT),
         "git_head": git("rev-parse", "HEAD"),
         "git_branch": git("branch", "--show-current"),
@@ -291,6 +296,11 @@ def source_metadata(stage_path, family):
         "kernel_module": file_identity(module_path),
         "dependency_spec": file_identity(ROOT / "python/pyproject.toml"),
     }
+    marker = ROOT / ".mpu-source.json"
+    if marker.is_file():
+        metadata["archive_provenance"] = json.loads(marker.read_text(encoding="utf-8"))
+        metadata["archive_marker"] = file_identity(marker)
+    return metadata
 
 
 def load_recipe(path):
@@ -594,6 +604,44 @@ def native_load(payload):
     )
 
 
+def jit_factory(payload):
+    """Call the real production factory; never substitute modules or launch GPU work."""
+    family, case = FAMILIES[payload["family"]], payload["case"]
+    arch = importlib.import_module(family["arch_module"])
+    kernel = importlib.import_module(case["module"])
+    origin = Path(kernel.__file__).resolve()
+    if not origin.is_relative_to(ROOT / "python"):
+        raise RuntimeError("JIT factory resolved outside the pinned source")
+    exports = case["exports"]
+    headers = [ROOT / family["kernel_root"] / "csrc" / p for p in case["headers"]]
+    if case["id"] == "mpu-load-store":
+        spec = production_spec(family)
+        exports = [pair[0] for pair in spec["wrappers"]]
+        headers = [Path(p) for p in spec["sources"]]
+    with arch.override_jit_cuda_arch(9, 0, "a"):
+        module = getattr(kernel, case["factory"])(*case["args"], **case["kwargs"])
+    if not exports or any(
+        not callable(getattr(module, name, None)) for name in exports
+    ):
+        raise RuntimeError("Production JIT module has missing exports")
+    cache = Path(os.environ["SGLANG_JIT_CACHE_DIR"])
+    libraries = [file_identity(p) for p in sorted(cache.rglob("*.so"))]
+    if not libraries or any(p["bytes"] <= 0 for p in libraries):
+        raise RuntimeError("A loaded JIT factory must retain its actual shared library")
+    return check(
+        "production_jit_factory",
+        "passed",
+        case=case,
+        exports=exports,
+        sources=[file_identity(origin), *[file_identity(p) for p in headers]],
+        shared_libraries=libraries,
+        cache_directory=str(cache),
+        target="sm_90a",
+        native_module_loaded=True,
+        gpu_executed=False,
+    )
+
+
 def cuda_torch():
     import torch
 
@@ -839,6 +887,7 @@ WORKERS = {
     "import": import_module_probe,
     "compile_object": compile_object,
     "native_load": native_load,
+    "jit_factory": jit_factory,
     "inventory": device_inventory,
     "compute": compute_smoke,
     "peer": peer_smoke,
@@ -948,7 +997,17 @@ def run_worker(args, artifacts, name, kind, **payload):
     ]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
-    env["SGLANG_JIT_CACHE_DIR"] = str(work / "jit_cache")
+    # Linux JIT loaders atomically rename directories containing loaded .so files.
+    # DrvFS/Windows-backed output directories do not provide those semantics.
+    cache_root = (
+        getattr(args, "jit_cache_root", None)
+        or Path.home() / ".cache/sglang/mpu-probes"
+    )
+    cache = (
+        Path(cache_root).resolve() / (args.output.stem + "-" + uuid.uuid4().hex) / name
+    )
+    cache.mkdir(parents=True, exist_ok=False)
+    env["SGLANG_JIT_CACHE_DIR"] = str(cache)
     env["SGLANG_JIT_FORCE_RECOMPILE"] = "1"
     env["SGLANG_CRASH_ON_JIT_COMPILE"] = "0"
     stdout, stderr = work / "stdout.log", work / "stderr.log"
@@ -992,6 +1051,7 @@ def run_probe(args):
                 "object_only" if args.compile_only else "object_and_native_module_load"
             ),
             "device": "sequential_compute_and_directed_peer_smoke_no_collectives_or_model",
+            "jit": "production_jit_load_no_gpu",
         }[args.mode],
     }
     try:
@@ -1058,6 +1118,29 @@ def run_probe(args):
                             f"import-{index:02d}",
                             "import",
                             module=module,
+                        )
+                    )
+            elif args.mode == "jit":
+                spec = importlib.util.spec_from_file_location(
+                    "mpu_jit_matrix", Path(__file__).with_name("jit_matrix.py")
+                )
+                jit_matrix = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(jit_matrix)
+
+                cases = jit_matrix.cases_for(
+                    stage, family, getattr(args, "jit_matrix", "default")
+                )
+                report["jit_cases"] = cases
+                report["gpu_execution_requested"] = False
+                for case in cases:
+                    report["checks"].append(
+                        run_worker(
+                            args,
+                            artifacts,
+                            case["id"],
+                            "jit_factory",
+                            family=stage["family"],
+                            case=case,
                         )
                     )
             elif args.mode == "compile":
@@ -1159,9 +1242,17 @@ def main(argv=None):
         return worker_main(*argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode", required=True, choices=("imports", "compile", "device")
+        "--mode", required=True, choices=("imports", "compile", "jit", "device")
     )
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--jit-matrix", choices=("default", "boundaries"), default="default"
+    )
+    parser.add_argument(
+        "--jit-cache-root",
+        type=Path,
+        help="Native Linux directory for JIT artifacts, independent of report output",
+    )
     parser.add_argument(
         "--stage", type=Path, default=Path(__file__).with_name("stage.json")
     )
