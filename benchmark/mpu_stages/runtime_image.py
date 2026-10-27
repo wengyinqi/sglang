@@ -37,6 +37,15 @@ def validate_native(result):
     return Path(NATIVE.linux_prefix(result["plan"]["prefix"]))
 
 
+def verify_base_reference(reference, expected):
+    details = json.loads(
+        subprocess.check_output(["docker", "image", "inspect", reference], text=True)
+    )
+    if len(details) != 1 or details[0].get("Id") != expected:
+        raise ValueError("Local base reference no longer identifies the pinned image")
+    return details[0]
+
+
 def prepare(native_result, output, base_image_id, tag):
     import re
 
@@ -61,6 +70,12 @@ def prepare(native_result, output, base_image_id, tag):
         or details.get("Os") != "linux"
     ):
         raise ValueError("Wrong image ID or platform")
+    # BuildKit interprets FROM sha256:<id> as a registry repository. Use a
+    # dedicated local tag, check its ID before/after building, and verify the
+    # filesystem layer prefix against the immutable base.
+    base_reference = "sglang-mpu-verified-base:" + base_image_id.split(":", 1)[1]
+    subprocess.run(["docker", "tag", base_image_id, base_reference], check=True)
+    verify_base_reference(base_reference, base_image_id)
     output.mkdir(parents=True, exist_ok=True)
     BUILD.write_json(output / "base-inspect.json", details)
     archive = output / "environment.tar"
@@ -90,7 +105,7 @@ def prepare(native_result, output, base_image_id, tag):
     tag = BUILD.image_reference(tag)
     if "@" in tag:
         raise ValueError("Output tag cannot be a digest reference")
-    dockerfile = f"""FROM {base_image_id}
+    dockerfile = f"""FROM {base_reference}
 LABEL org.opencontainers.image.revision="{result['plan']['source_commit']}"
 LABEL ai.sglang.mpu.build_route="verified-native-runtime"
 ADD environment.tar /
@@ -109,6 +124,8 @@ CMD ["--help"]
         "built": False,
         "build_route": "verified-native-runtime",
         "base_image_id": base_image_id,
+        "base_reference": base_reference,
+        "base_rootfs_layers": details["RootFS"]["Layers"],
         "source_commit": result["plan"]["source_commit"],
         "prefix": str(prefix),
         "environment_archive": NATIVE.identity(archive),
@@ -140,9 +157,11 @@ def execute(output):
         "gpu_model_validated": False,
     }
     try:
+        verify_base_reference(plan["base_reference"], plan["base_image_id"])
         command = [
             "docker",
             "build",
+            "--pull=false",
             "--network",
             "none",
             "--tag",
@@ -157,6 +176,12 @@ def execute(output):
             )
         )[0]
         image_id = details["Id"]
+        verify_base_reference(plan["base_reference"], plan["base_image_id"])
+        layers = plan["base_rootfs_layers"]
+        if details["RootFS"]["Layers"][: len(layers)] != layers:
+            raise ValueError(
+                "Built image filesystem does not derive from the pinned base"
+            )
         BUILD.write_json(output / "image-inspect.json", details)
         # Exercise the actual container, all native extensions and package
         # metadata. No --gpus and no model are involved in this smoke check.
