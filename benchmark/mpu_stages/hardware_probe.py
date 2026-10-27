@@ -436,7 +436,7 @@ def wrapper_source(spec):
     ]
     lines.extend(f'#include "{Path(path).as_posix()}"' for path in spec["sources"])
     if spec["namespace"]:
-        lines.append(f'namespace {spec["namespace"]} {{')
+        lines.append(f"namespace {spec['namespace']} {{")
     lines.extend(
         f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({name}, ({target}));"
         for name, target in spec["wrappers"]
@@ -1017,9 +1017,10 @@ def run_worker(args, artifacts, name, kind, **payload):
     start = time.monotonic()
     try:
         # File-backed output avoids keeping large compiler/import logs in RAM.
-        with stdout.open("w", encoding="utf-8") as out, stderr.open(
-            "w", encoding="utf-8"
-        ) as err:
+        with (
+            stdout.open("w", encoding="utf-8") as out,
+            stderr.open("w", encoding="utf-8") as err,
+        ):
             returncode = wait_for_worker(
                 command, cwd=ROOT, env=env, stdout=out, stderr=err, timeout=args.timeout
             )
@@ -1063,6 +1064,9 @@ def run_probe(args):
         report["stage"] = {
             key: stage[key] for key in ("id", "family", "tp_size", "variant")
         }
+        report["stage"].update(
+            attn_dp_size=stage.get("attn_dp_size", 1), ep_size=stage.get("ep_size", 1)
+        )
         report["source"] = source_metadata(args.stage, family)
         mapping = device_mapping(
             stage,
