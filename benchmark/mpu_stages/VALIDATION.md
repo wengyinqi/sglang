@@ -1,5 +1,8 @@
 # 本地验证记录：GLM-5.3-Flash
 
+以下为旧 TP4 配方的历史结果。当前并行规则见 [ATTENTION_DP_EP.md](ATTENTION_DP_EP.md)，
+这些结果不代表新 DP+EP 配方通过。
+
 日期：2026-10-23。环境：Windows、CPU PyTorch，无 CUDA/GPU。
 阶段 05/06 使用相同混合模型实现，分别默认 CPU DDR 与 MPU DSA KV backing。
 

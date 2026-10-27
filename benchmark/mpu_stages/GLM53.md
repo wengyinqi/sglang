@@ -1,4 +1,4 @@
-# GLM-5.3-Flash: NoPD TP4 HiSparse stages
+# GLM-5.3-Flash: NoPD Attention-DP4 + EP4 HiSparse stages
 
 These branches implement CPU DDR (4+0) and MPU (4+4) backing for the complete
 DSA main KV history. `4+0` does **not** mean full GPU KV. Model execution,
@@ -26,7 +26,11 @@ No model or CUDA run has been performed in the Windows development environment.
 CUDA_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
   --model-path zai-org/GLM-5.3-Flash \
   --revision 46a050bec13002ad29ee795c16e61cf4fa3c4a9c \
-  --tp-size 4 --pp-size 1 --dp-size 1 --attn-dp-size 1 \
+  --tp-size 4 --pp-size 1 --dp-size 1 --attn-dp-size 4 --ep-size 4 \
+  --moe-dense-tp-size 1 --enable-dense-mlp-attn-tp --enable-dp-lm-head \
+  --moe-runner-backend deep_gemm --moe-a2a-backend deepep --deepep-mode low_latency \
+  --disable-overlap-schedule --load-balance-method round_robin \
+  --cuda-graph-config '{"prefill":{"backend":"disabled"}}' \
   --dsa-prefill-backend flashmla_sparse --dsa-decode-backend flashmla_sparse \
   --kv-cache-dtype bfloat16 --page-size 64 \
   --disable-radix-cache --enable-hisparse \
@@ -35,11 +39,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
   --reasoning-parser auto --tool-call-parser auto
 ```
 
-No speculative/MTP, PD, attention DP/CP, or additional HiCache/LMCache tier is
+No speculative/MTP, PD, CP, or additional HiCache/LMCache tier is
 enabled. On H200 the existing KPool resolver changes `flashmla_sparse` to FA3
 when tail columns are present; record this effective backend as well as the CLI.
 Keep this same attention path for the CPU and MPU comparison. The upstream
-H200 regression recipe uses TP8, so TP4 startup/accuracy/capacity remains a
+H200 regression recipe uses TP8, so Attention-DP4 + EP4 startup/accuracy/capacity remains a
 hardware acceptance item rather than a measured result here.
 
 The host pool preserves `[11, backing_slots, 1, 512]` layer-first BF16 layout,
@@ -142,7 +146,7 @@ SGLANG_TEST_GLM53_MPU=1 python -m unittest discover -s test/manual/mpu_stages -p
 
 It exercises one compute/storage pair from the eight-device topology, BF16
 all-layer writeback, per-layer load, fixed-size miss replay with invalid padded
-rows, and CUDA graph replay. It does not load the model or establish TP4 model
+rows, and CUDA graph replay. It does not load the model or establish Attention-DP4 + EP4 model
 equivalence. It is skipped in the local CPU test run.
 
 Hardware acceptance must check startup, logits/selected locations versus the

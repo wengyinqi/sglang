@@ -23,7 +23,9 @@ def resolve_compute_ordinal(device, *, tp_rank=None):
     if ordinal is None:
         ordinal = torch.cuda.current_device()
     if tp_rank is not None and ordinal != tp_rank:
-        raise ValueError("GLM MPU requires compute CUDA ordinal to equal TP rank")
+        raise ValueError(
+            "GLM MPU requires compute CUDA ordinal to equal its process rank"
+        )
     return ordinal
 
 
@@ -56,7 +58,7 @@ def glm_backing_options(extra, *, tp_size, compute_device):
         or any(type(i) is not int for i in ids)
         or ids != [4, 5, 6, 7]
     ):
-        raise ValueError("GLM MPU requires TP4 compute ordinals 0..3 paired with 4..7")
+        raise ValueError("GLM MPU requires four compute ordinals 0..3 paired with 4..7")
     ratio = extra.get("mpu_capacity_ratio", 2.0)
     if type(ratio) not in (int, float) or not math.isfinite(ratio) or ratio <= 0:
         raise ValueError("mpu_capacity_ratio must be finite and positive")

@@ -42,7 +42,7 @@ class TestMPUConfig(unittest.TestCase):
         with patch.object(torch.cuda, "current_device", return_value=2):
             self.assertEqual(resolve("cuda", tp_rank=2), 2)
             self.assertEqual(resolve("cuda:1", tp_rank=1), 1)
-            with self.assertRaisesRegex(ValueError, "TP rank"):
+            with self.assertRaisesRegex(ValueError, "process rank"):
                 resolve("cuda", tp_rank=0)
             with self.assertRaisesRegex(ValueError, "CUDA"):
                 resolve("cpu")

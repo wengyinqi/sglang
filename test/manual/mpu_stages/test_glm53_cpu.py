@@ -384,6 +384,29 @@ class TestScopeAndCapacity(unittest.TestCase):
         ):
             validate(self.config())
 
+    def test_attention_dp4_ep4_scope_uses_resolved_contract(self):
+        validate = definition(
+            "python/sglang/srt/arg_groups/hisparse_hook.py",
+            "validate_glm_hisparse_scope",
+        )
+        contract = definition(
+            "python/sglang/srt/observability/mpu_parallel.py", "parallel_metadata"
+        )
+        cfg = self.config()
+        cfg.attn_dp_size = cfg.ep_size = 4
+        cfg.moe_dense_tp_size = 1
+        cfg.enable_dp_lm_head = cfg.disable_overlap_schedule = True
+        cfg.enable_cp_tp_group_sharing = False
+        cfg.moe_a2a_backend = "deepep"
+        with patch.dict(sys.modules, {
+            "sglang.srt.mem_cache.mpu_glm": NS(glm_backing_options=Mock()),
+            "sglang.srt.observability.mpu_parallel": NS(parallel_metadata=contract),
+        }):
+            validate(cfg)
+            cfg.ep_size = 1
+            with self.assertRaises(ValueError):
+                validate(cfg)
+
     def test_unvalidated_modes_fail_closed(self):
         validate = definition(
             "python/sglang/srt/arg_groups/hisparse_hook.py",
