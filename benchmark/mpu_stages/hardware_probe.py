@@ -1008,6 +1008,9 @@ def run_worker(args, artifacts, name, kind, **payload):
     )
     cache.mkdir(parents=True, exist_ok=False)
     env["SGLANG_JIT_CACHE_DIR"] = str(cache)
+    # Qwen's older loader calls TVM-FFI directly and ignores SGLang's cache.
+    # Keep both loader generations (and their actual .so files) in this run.
+    env["TVM_FFI_CACHE_DIR"] = str(cache / "tvm-ffi")
     env["SGLANG_JIT_FORCE_RECOMPILE"] = "1"
     env["SGLANG_CRASH_ON_JIT_COMPILE"] = "0"
     stdout, stderr = work / "stdout.log", work / "stderr.log"

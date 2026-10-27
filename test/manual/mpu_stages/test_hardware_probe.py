@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +36,23 @@ def recipe(tp=4, variant="mpu"):
 
 
 class ProbeUnitTests(unittest.TestCase):
+    def test_worker_isolates_both_production_loader_caches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            args = Namespace(
+                python=sys.executable,
+                timeout=1,
+                output=root / "probe.json",
+                jit_cache_root=root / "cache",
+            )
+            with mock.patch.object(probe, "wait_for_worker", return_value=1) as worker:
+                probe.run_worker(args, root / "reports", "fixture", "jit_factory")
+            env = worker.call_args.kwargs["env"]
+            cache = Path(env["SGLANG_JIT_CACHE_DIR"])
+            self.assertTrue(cache.is_relative_to(root / "cache"))
+            self.assertEqual(Path(env["TVM_FFI_CACHE_DIR"]), cache / "tvm-ffi")
+            self.assertFalse(cache.is_relative_to(root / "reports"))
+
     def test_status_aggregation_never_passes_empty_or_blocked(self):
         self.assertEqual(probe.aggregate([]), "blocked")
         self.assertEqual(
