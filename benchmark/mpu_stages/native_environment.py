@@ -121,7 +121,11 @@ def prepare(repo, source_ref, output, prefix):
 
 
 def effective_lock(text, wheelhouse):
-    """Only rewrite a direct URL to a verified local copy; retain its hash."""
+    """Bind compatible local wheels to locked hashes, including registry pins.
+
+    --find-links alone can lose to an equally versioned registry candidate in
+    uv. Explicit file URLs make an offline wheelhouse deterministic.
+    """
     if wheelhouse is None:
         return text
     from urllib.parse import unquote, urlsplit
@@ -135,7 +139,58 @@ def effective_lock(text, wheelhouse):
             raise ValueError(f"Missing or changed direct-URL wheel: {wheel}")
         return f"{name} @ {wheel.resolve().as_uri()} --hash=sha256:{expected}"
 
-    return re.sub(pattern, replace, text)
+    text = re.sub(pattern, replace, text)
+    logical = re.sub(r"\\\r?\n\s*", " ", text)
+    wheels = sorted(Path(wheelhouse).glob("*.whl"))
+    result = []
+    for line in logical.splitlines():
+        match = re.match(r"^([A-Za-z0-9_.-]+)==([^\s;]+)\s+(.+)$", line)
+        if not match:
+            result.append(line)
+            continue
+        name, version, hashes = match.groups()
+        normalized = re.sub(r"[-_.]+", "-", name).lower()
+        candidates = []
+        for wheel in wheels:
+            parts = wheel.name[:-4].split("-")
+            if len(parts) < 5:
+                continue
+            wheel_name = re.sub(r"[-_.]+", "-", parts[0]).lower()
+            python_tag, abi, platform_tag = parts[-3:]
+            compatible_python = any(
+                tag in ("py3", "cp312")
+                or (
+                    abi == "abi3"
+                    and re.fullmatch(r"cp3\d+", tag)
+                    and int(tag[2:]) <= 312
+                )
+                for tag in python_tag.split(".")
+            )
+            compatible_platform = any(
+                tag == "any"
+                or (tag.startswith(("manylinux", "linux")) and tag.endswith("x86_64"))
+                for tag in platform_tag.split(".")
+            )
+            if (
+                wheel_name == normalized
+                and parts[1] == version
+                and compatible_python
+                and compatible_platform
+                and abi in ("none", "abi3", "cp312")
+            ):
+                digest = BUILD.sha256(wheel)
+                if f"--hash=sha256:{digest}" not in hashes.split():
+                    raise ValueError(f"Local wheel hash differs from lock: {wheel}")
+                candidates.append((wheel, digest))
+        if len(candidates) > 1:
+            raise ValueError(
+                f"Ambiguous local wheels for {name}; provide one compatible distribution"
+            )
+        if candidates:
+            wheel, digest = candidates[0]
+            line = f"{name} @ {wheel.resolve().as_uri()} --hash=sha256:{digest}"
+        result.append(line)
+    return "\n".join(result) + "\n"
 
 
 def native_filesystem(path):
