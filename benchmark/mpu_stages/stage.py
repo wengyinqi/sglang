@@ -131,6 +131,11 @@ def parse_args(argv=None, *, correctness=False):
     p.add_argument("--trace-timeout", type=float, default=30)
     p.add_argument("--logprob-atol", type=float, default=0.02)
     p.add_argument("--plateau-threshold", type=float, default=0.05)
+    p.add_argument(
+        "--analysis-policy",
+        type=Path,
+        help="JSON with repeat, measured-latency SLO and explicit per-configuration hourly costs",
+    )
     p.add_argument("--output-dir", type=Path)
     p.add_argument("--execute", action="store_true")
     args = p.parse_args(argv)
@@ -149,6 +154,8 @@ def parse_args(argv=None, *, correctness=False):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         args.output_dir = Path("results/mpu_stages") / f"{stage['id']}-{stamp}"
     args.output_dir = args.output_dir.resolve()
+    if args.analysis_policy is not None:
+        args.analysis_policy = args.analysis_policy.resolve()
     validate(stage, args)
     return stage, args
 
