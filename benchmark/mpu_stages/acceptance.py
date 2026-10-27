@@ -51,6 +51,8 @@ def portable_targets(stage):
         "test/manual/mpu_stages/test_acceptance.py",
         "test/manual/mpu_stages/test_environment_packaging.py",
         "test/manual/mpu_stages/test_native_environment.py",
+        "test/manual/mpu_stages/test_capacity_analysis.py",
+        "test/manual/mpu_stages/test_profile_tools.py",
         "test/manual/mpu_stages/test_model_snapshot.py",
         "test/manual/mpu_stages/test_hardware_probe.py",
         "test/manual/mpu_stages/test_jit_matrix.py",

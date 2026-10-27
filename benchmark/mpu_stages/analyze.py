@@ -176,6 +176,8 @@ def _analyze_single(result, traces):
             "output_throughput_tokens_per_second": result["output_throughput"],
             "mean_ttft_ms": result["mean_ttft_ms"],
             "mean_tpot_ms": result["mean_tpot_ms"],
+            "p99_ttft_ms": result.get("p99_ttft_ms"),
+            "p99_tpot_ms": result.get("p99_tpot_ms"),
         },
         "cuda_trace": {
             "prefill_forward_seconds": prefill_seconds,
