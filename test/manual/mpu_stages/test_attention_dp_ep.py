@@ -177,6 +177,29 @@ def test_single_compute_parallelism_is_unchanged():
     assert result["attn_tp_size"] == result["ep_size"] == 1
 
 
+@pytest.mark.parametrize(
+    "family",
+    [
+        "ColumnParallelLinear",
+        "RowParallelLinear",
+        "MergedColumnParallelRepeatedLinear",
+        "ColumnParallelBatchedLinear",
+    ],
+)
+def test_current_linear_partition_api_uses_resolved_group(family):
+    layer = type(family, (), {})()
+    model = NS(named_modules=lambda: [("projection", layer)])
+    for group in (None, NS(world_size=1)):
+        layer.tp_group = group
+        assert PARALLEL.audit_model_tensor_parallelism(model)["status"] == "passed"
+    layer.tp_group = NS(world_size=4)
+    with pytest.raises(ValueError, match="projection"):
+        PARALLEL.audit_model_tensor_parallelism(model)
+    del layer.tp_group
+    with pytest.raises(ValueError, match="projection"):
+        PARALLEL.audit_model_tensor_parallelism(model)
+
+
 def test_resolved_dp_ep_contract_rejects_residual_tp_and_overlap():
     cfg = NS(
         tp_size=4,
