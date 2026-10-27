@@ -173,3 +173,6 @@ python -m pytest test/manual/mpu_stages -q
 
 可复现 native 构建入口、依赖锁、实验 runtime 镜像打包和独立 `jit` 验收阶段，见
 [NATIVE_BUILD.md](NATIVE_BUILD.md)。本轮新入口的 Linux/Docker 执行仍待 WSL 恢复后验证。
+
+独立 decode profiler、设备角色检查、容量曲线重复区间与 SLO/成本策略，见
+[PROFILING_AND_COST.md](PROFILING_AND_COST.md)。profiler 样本不参与性能统计。
