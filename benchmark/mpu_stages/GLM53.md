@@ -28,7 +28,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m sglang.launch_server \
   --revision 46a050bec13002ad29ee795c16e61cf4fa3c4a9c \
   --tp-size 4 --pp-size 1 --dp-size 1 --attn-dp-size 4 --ep-size 4 \
   --moe-dense-tp-size 1 --enable-dense-mlp-attn-tp --enable-dp-lm-head \
-  --moe-runner-backend deep_gemm --moe-a2a-backend deepep --deepep-mode low_latency \
+  --moe-runner-backend deep_gemm --moe-a2a-backend deepep --deepep-mode auto \
   --disable-overlap-schedule --load-balance-method round_robin \
   --cuda-graph-config '{"prefill":{"backend":"disabled"}}' \
   --dsa-prefill-backend flashmla_sparse --dsa-decode-backend flashmla_sparse \
