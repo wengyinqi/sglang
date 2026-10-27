@@ -169,3 +169,7 @@ python -m pytest test/manual/mpu_stages -q
 
 这些 CPU 测试验证 TP 聚合、配置约束、实际容量一致性、空闲快照时序与失败路径；
 最终仍需每个阶段的硬件正确性、kernel/profile 检查和性能验收。
+# 构建与 JIT 验收更新
+
+可复现 native 构建入口、依赖锁、实验 runtime 镜像打包和独立 `jit` 验收阶段，见
+[NATIVE_BUILD.md](NATIVE_BUILD.md)。本轮新入口的 Linux/Docker 执行仍待 WSL 恢复后验证。
