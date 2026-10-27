@@ -1,4 +1,4 @@
-"""Pure validation for the controlled single-node TP4 C4 experiment."""
+"""Validation for the single-node Attention-DP4 + EP4 C4 experiment."""
 
 import math
 
@@ -37,10 +37,13 @@ def validate_c4_mpu_launch(cfg, extra):
     mode, _, _, _ = c4_backing_options(extra)
     if mode != "mpu":
         return
+    from sglang.srt.observability.mpu_parallel import parallel_metadata
+
+    parallel_metadata(cfg, 0)
     for name, value in (
         ("tp_size", 4),
         ("dp_size", 1),
-        ("attn_dp_size", 1),
+        ("attn_dp_size", 4),
         ("attn_cp_size", 1),
         ("dcp_size", 1),
         ("pp_size", 1),
@@ -61,7 +64,6 @@ def validate_c4_mpu_launch(cfg, extra):
         "enable_hierarchical_cache",
         "enable_lmcache",
         "enable_memory_saver",
-        "enable_dp_attention",
         "enable_mixed_chunk",
     ):
         if getattr(cfg, name, False):

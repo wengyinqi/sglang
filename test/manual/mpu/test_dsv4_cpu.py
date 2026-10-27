@@ -113,11 +113,36 @@ def test_invalid_mpu_options(override):
         config.c4_backing_options({"backing_store": "mpu", **override})
 
 
-def test_strict_tp4_nopd_launch():
-    cfg = SimpleNamespace(disable_radix_cache=True)
+def test_strict_attention_dp4_ep4_nopd_launch():
+    load(
+        "sglang.srt.observability.mpu_parallel",
+        "python/sglang/srt/observability/mpu_parallel.py",
+    )
+    cfg = SimpleNamespace(
+        disable_radix_cache=True,
+        tp_size=4,
+        attn_dp_size=4,
+        ep_size=4,
+        dp_size=1,
+        pp_size=1,
+        attn_cp_size=1,
+        dcp_size=1,
+        moe_dp_size=1,
+        moe_dense_tp_size=1,
+        nnodes=1,
+        enable_dp_lm_head=True,
+        disable_overlap_schedule=True,
+        enable_prefill_cp=False,
+        enable_two_batch_overlap=False,
+        enable_cp_tp_group_sharing=False,
+        moe_a2a_backend="deepep",
+    )
     config.validate_c4_mpu_launch(cfg, {"backing_store": "mpu"})
     for key, value in (
         ("tp_size", 8),
+        ("attn_dp_size", 1),
+        ("ep_size", 1),
+        ("moe_dense_tp_size", 4),
         ("attn_cp_size", 2),
         ("disaggregation_mode", "decode"),
         ("enable_hierarchical_cache", True),
@@ -126,7 +151,7 @@ def test_strict_tp4_nopd_launch():
     ):
         with pytest.raises(ValueError):
             config.validate_c4_mpu_launch(
-                SimpleNamespace(**vars(cfg), **{key: value}), {"backing_store": "mpu"}
+                SimpleNamespace(**(vars(cfg) | {key: value})), {"backing_store": "mpu"}
             )
     with pytest.raises(ValueError):
         config.c4_backing_options({"mpu_device_ids": [4, 5, 6, 7]})
@@ -161,7 +186,7 @@ def coordinator(methods, **namespace):
         "HiSparseCoordinator",
         methods,
         torch=torch,
-        **namespace
+        **namespace,
     )
     return cls()
 
