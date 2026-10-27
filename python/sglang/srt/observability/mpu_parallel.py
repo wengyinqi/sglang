@@ -63,11 +63,26 @@ def audit_model_tensor_parallelism(model):
     Audit the actual tensor-parallel linear/embedding modules instead.
     """
     checked = []
-    families = {"ColumnParallelLinear", "RowParallelLinear", "VocabParallelEmbedding"}
+    families = {
+        "ColumnParallelLinear",
+        "RowParallelLinear",
+        "VocabParallelEmbedding",
+        "MergedColumnParallelRepeatedLinear",
+        "ColumnParallelBatchedLinear",
+    }
     for name, module in model.named_modules():
         if families.intersection(cls.__name__ for cls in type(module).__mro__):
             width = getattr(module, "tp_size", None)
-            if width != 1:
+            # New main uses a resolved group on linear layers; the older Quest
+            # layers and vocabulary embeddings expose tp_size directly. None
+            # is an explicit unsharded group, distinct from a missing field.
+            if hasattr(module, "tp_group"):
+                group = module.tp_group
+                group_width = 1 if group is None else getattr(group, "world_size", None)
+                if width is not None and width != group_width:
+                    raise ValueError(f"Conflicting tensor partition metadata in {name}")
+                width = group_width
+            if type(width) is not int or width != 1:
                 raise ValueError(
                     f"Residual tensor parallelism in {name}: tp_size={width}"
                 )
