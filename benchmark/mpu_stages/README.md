@@ -1,7 +1,11 @@
 # MPU 分阶段实验公共入口
 
+四个多卡阶段现使用 **Attention-DP4 + EP4（有效 Attention/MoE TP=1）**，
+并行约束、逐 owner 故障恢复与 DP 计时规则见 [ATTENTION_DP_EP.md](ATTENTION_DP_EP.md)。
+外层 `tp_size=4` 表示承载 DP/EP 的四计算进程组，不能当作 Attention TP4。
+
 `+0` 表示计算 GPU 配合 **HiSparse CPU DDR/pinned KV backing store**；它不是全量
-KV 都驻留计算卡 HBM 的配置。当前分支的 `stage.json` 确定模型、TP 数量和 CPU/MPU
+KV 都驻留计算卡 HBM 的配置。当前分支的 `stage.json` 确定模型、计算卡数量和 CPU/MPU
 配置。六个阶段使用同一套脚本，模型专用设置保留在各分支的 recipe 中。
 
 机器到位前先按 [PREHARDWARE.md](PREHARDWARE.md) 固定分支构建配方和模型清单。
@@ -35,9 +39,10 @@ CPU 阶段默认只使用 CPU HiSparse。MPU 阶段自动先运行 CPU HiSparse�
 eager，但不能据此宣称 graph 已通过。三轮请求覆盖超过 hot buffer 的长 prompt、
 prefill chunk、长短请求混合和 KV slot 复用；每轮保存完整 token 输入与响应。
 逐 token 要求 greedy token IDs 相同，选中 token 的 logprob 默认允许 0.02 绝对误差。
+DP4 每轮至少四个请求并覆盖四个 owner；故障和恢复逐 owner 定向执行。
 Near-tie 导致的分歧也会明确失败，需检查原始证据，不能静默忽略。
 
-每轮完成后，脚本等待所有 TP rank 的计时 trace 出现该轮真实 request IDs，并取得
+每轮完成后，脚本等待每个请求的 Attention owner 提交真实 request ID，并取得所有计算 rank
 这些 forward 之后的空闲容量快照。实际 KV 占用与生命周期预留都必须归零。启动时的
 零占用快照不能掩盖后续泄漏。MPU 的内部 padding、CPU pool 额外行和按最大输出长度
 提前预留造成的排队都记录为实现事实，不能当作测量噪声丢弃。
@@ -54,7 +59,7 @@ offload pool 相同；因此需单独解释该对照的显存差异，不能混�
 
 CPU `host_to_device_ratio` 必须是正整数；MPU 比例可以是正浮点数。CPU baseline 的
 容量比例由 `--cpu-capacity-ratio` 指定，默认 2；目标 MPU 的 `--capacity-ratios`
-单独扫描。TP1 可用 `--mpu-device-ids 1 2 3 4` 测试多张存储卡；TP4 当前使用四个
+单独扫描。Qwen 单卡可用 `--mpu-device-ids 1 2 3 4` 测试多张存储卡；四计算卡当前使用四个
 存储 ordinal，各计算 rank 对应一张卡，例如 `4 5 6 7`。保持拓扑固定时扫描容量，
 变更存储卡数量还会同时改变聚合链路带宽。
 
@@ -70,14 +75,15 @@ V4/GLM 的 `frozen_host_budget=true` 表示 CPU host ratio 同时固定 GPU inde
 
 原生 benchmark 保留端到端 TTFT、TPOT、输出吞吐量与完整请求计数。分析器另算：
 
-`P = Σ 每个对齐 prefill batch 的 max(TP rank CUDA event 时长)`
+`P = Σ 每个全局纯 prefill 步骤的 max(计算 rank CUDA event 时长)`
 
 `decode 吞吐估算 = (总输出 token − 请求数) / (benchmark wall time − P)`
 
-TP1 时退化为单卡批次时间；TP4 **不把四张卡时间相加**，也不使用整轮最慢 rank 的
-总和替代逐批次最大值。所有 rank 必须报告相同 batch 顺序、request IDs、模式与
-prefill chunk 长度，trace 必须完整并在空闲时落盘。CUDA events 跨卡不具有同步的
-绝对开始时间，因而 `P` 是明确标记的关键路径近似，不是精确分布式 prefill 时长。
+Qwen 时退化为单卡批次时间；DP4+EP4 **不把四张卡时间相加**，也不使用整轮最慢 rank 的
+总和替代逐步最大值。请求分属不同 Attention owner；所有 rank（含 idle EP 参与者）必须
+报告连续的全局步骤和一致的模式/token 向量，各 owner 的 chunk 长度按自己的请求核对。
+混合 prefill/decode 步骤完整保留。trace 必须完整并在空闲时落盘。CUDA events 跨卡没有
+同步绝对开始时间，因而 `P` 是估算，不是精确分布式 prefill 时长。
 NoPD 的 `wall time − P` 同样是反事实 decode-only 估算；TTFT/TPOT 不作此扣减。
 
 排队、CPU/网络间隔、forward 以外的 staging、以及计时自身的开销仍保留。禁止减去

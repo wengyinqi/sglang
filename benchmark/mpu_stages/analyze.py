@@ -210,6 +210,22 @@ def _tp_session(session):
     if type(rank) is not int or not 0 <= rank < session["tp_size"]:
         raise ValueError("Invalid TP rank in timing session")
     _validate_session(session | {"tp_size": 1})
+    if session.get("attn_dp_size", 1) > 1:
+        for key, value in {
+            "attn_dp_size": 4,
+            "ep_size": 4,
+            "attn_tp_size": 1,
+            "moe_tp_size": 1,
+            "parallel_strategy": "attention_dp4_ep4",
+            "disable_overlap_schedule": True,
+        }.items():
+            if session.get(key) != value:
+                raise ValueError(f"Invalid DP+EP trace topology: {key}")
+        if session.get("attn_dp_rank") != rank or session["tp_size"] != 4:
+            raise ValueError("Attention-DP rank differs from the compute rank")
+        audit = session.get("tensor_parallel_audit", {})
+        if audit.get("status") != "passed" or not audit.get("checked_modules"):
+            raise ValueError("Missing instantiated tensor-parallel partition audit")
 
 
 def _selected(trace, expected):
@@ -230,6 +246,8 @@ def analyze(result, traces):
     mode, request order and chunk sizes, and must flush its complete trace.
     """
     expected = set(result.get("request_ids", []))
+    if any(trace and trace[0].get("attn_dp_size", 1) > 1 for trace in traces):
+        return _analyze_attention_dp(result, traces)
     matches = [trace for trace in traces if trace and _selected(trace, expected)]
     if not matches:
         raise ValueError("No complete rank traces contain these benchmark requests")
@@ -280,13 +298,218 @@ def analyze(result, traces):
             for rank, item in enumerate(per_rank)
         ],
     )
-    report["decode_only_estimate"][
-        "method"
-    ] = "wall_time_minus_aligned_tp_prefill_batch_maxima"
+    report["decode_only_estimate"]["method"] = (
+        "wall_time_minus_aligned_tp_prefill_batch_maxima"
+    )
     report["decode_only_estimate"]["limitations"].append(
         "TP duration is a sum of per-batch maximum rank CUDA times; unsynchronized starts and collective overlap prevent interpreting it as an exact distributed critical path."
     )
     return report
+
+
+def _dp_traces(traces):
+    """Require all EP participants, including ranks with no local requests."""
+    traces = [trace for trace in traces if trace]
+    if len(traces) != 4:
+        raise ValueError("Need all four Attention-DP/EP rank traces")
+    for trace in traces:
+        _tp_session(trace[0])
+        if trace[0].get("attn_dp_size") != 4:
+            raise ValueError("Cannot mix TP and Attention-DP traces")
+        if sum(r.get("type") == "session" for r in trace) != 1:
+            raise ValueError("Trace contains multiple scheduler lifetimes")
+        records = [r for r in trace if r.get("type") == "forward"]
+        if [r.get("sequence") for r in records] != list(range(len(records))):
+            raise ValueError("Missing, duplicated or reordered DP forward step")
+        if (
+            trace[-1].get("type") != "idle_flush"
+            or trace[-1].get("last_sequence") != len(records) - 1
+        ):
+            raise ValueError("DP trace must finish at a complete global idle boundary")
+    traces.sort(key=lambda t: t[0]["tp_rank"])
+    if [t[0]["tp_rank"] for t in traces] != list(range(4)):
+        raise ValueError("Missing or duplicated Attention-DP rank")
+    if len({t[-1]["last_sequence"] for t in traces}) != 1:
+        raise ValueError("EP participants disagree on completed global steps")
+    return traces
+
+
+def _request_owners(traces, expected):
+    owners = {}
+    for trace in traces:
+        rank = trace[0]["tp_rank"]
+        for record in _selected(trace, expected):
+            for rid in set(record["request_ids"]) & expected:
+                if owners.setdefault(rid, rank) != rank:
+                    raise ValueError(
+                        "A request migrated or is duplicated across Attention-DP ranks"
+                    )
+    if set(owners) != expected:
+        raise ValueError("Some benchmark requests have no Attention-DP owner")
+    return owners
+
+
+def _analyze_attention_dp(result, traces):
+    """Subtract only pure-prefill EP steps; retain mixed prefill/decode steps.
+
+    Each rank owns different requests. The existing scheduler gather provides
+    the global mode/token vector; all four ranks execute every EP step (idle
+    ranks included). CUDA durations are not synchronized timestamps, so step
+    maxima remain an explicit approximation. Never add four rank durations.
+    """
+    traces = _dp_traces(traces)
+    request_ids = result.get("request_ids", [])
+    expected = set(request_ids)
+    if not expected or len(expected) != len(request_ids):
+        raise ValueError("Benchmark request IDs must be nonempty and unique")
+    for name in ("input_lens", "output_lens", "errors"):
+        if len(result.get(name, [])) != len(request_ids):
+            raise ValueError("Incomplete benchmark token accounting")
+    if result.get("completed") != len(request_ids) or result.get(
+        "total_output_tokens"
+    ) != sum(result["output_lens"]):
+        raise ValueError("All requests and output tokens must be accounted for")
+    duration = _number(result.get("duration"), "duration", positive=True)
+    if not math.isclose(
+        result["output_throughput"], sum(result["output_lens"]) / duration, rel_tol=1e-6
+    ):
+        raise ValueError("Benchmark output throughput disagrees with tokens / duration")
+    owners = _request_owners(traces, expected)
+    steps = [[r for r in trace if r.get("type") == "forward"] for trace in traces]
+    selected_steps = [
+        r["sequence"] for trace in traces for r in _selected(trace, expected)
+    ]
+    begin, end = min(selected_steps), max(selected_steps)
+    totals = {"prefill": 0.0, "decode": 0.0, "mixed": 0.0}
+    counts = dict.fromkeys(totals, 0)
+    for step in range(begin, end + 1):
+        group = [rank_steps[step] for rank_steps in steps]
+        modes, tokens = group[0].get("dp_forward_modes"), group[0].get("dp_num_tokens")
+        if (
+            not isinstance(modes, list)
+            or len(modes) != 4
+            or not isinstance(tokens, list)
+            or len(tokens) != 4
+        ):
+            raise ValueError("Missing global mode/token vector from DP gather")
+        if any(
+            r.get("dp_forward_modes") != modes or r.get("dp_num_tokens") != tokens
+            for r in group
+        ):
+            raise ValueError("DP ranks disagree on the synchronized EP step")
+        for rank, record in enumerate(group):
+            ids = record.get("request_ids", [])
+            if (
+                record.get("success") is not True
+                or len(ids) != len(set(ids))
+                or not set(ids) <= expected
+            ):
+                raise ValueError("Failed, duplicate or unrelated request in an EP step")
+            if (
+                modes[rank] not in ("extend", "decode", "idle")
+                or record.get("forward_mode") != modes[rank]
+            ):
+                raise ValueError("Unsupported or converted local forward mode")
+            local_tokens = (
+                sum(record.get("extend_lens") or [])
+                if modes[rank] == "extend"
+                else len(ids)
+            )
+            if type(tokens[rank]) is not int or tokens[rank] != local_tokens:
+                raise ValueError(
+                    "Local request tokens differ from the actual DP gather"
+                )
+            if (modes[rank] == "idle") != (not ids):
+                raise ValueError("Idle EP participants must have no local requests")
+        active = set(modes) - {"idle"}
+        if not active:
+            raise ValueError("An all-idle step cannot be a model forward")
+        kind = (
+            "mixed"
+            if len(active) > 1
+            else ("prefill" if "extend" in active else "decode")
+        )
+        totals[kind] += max(
+            _number(r.get("cuda_seconds"), "cuda_seconds", positive=True) for r in group
+        )
+        counts[kind] += 1
+    per_rank = []
+    for rank, trace in enumerate(traces):
+        indexes = [i for i, rid in enumerate(request_ids) if owners[rid] == rank]
+        if not indexes:
+            per_rank.append({"rank": rank, "request_count": 0})
+            continue
+        local_result = copy.deepcopy(result)
+        for key in ("request_ids", "input_lens", "output_lens", "errors"):
+            local_result[key] = [result[key][i] for i in indexes]
+        local_result.update(
+            completed=len(indexes), total_output_tokens=sum(local_result["output_lens"])
+        )
+        local_result["output_throughput"] = (
+            local_result["total_output_tokens"] / duration
+        )
+        local_records = [copy.deepcopy(r) for r in steps[rank] if r.get("request_ids")]
+        for index, record in enumerate(local_records):
+            record["sequence"] = index
+        local_trace = [
+            trace[0] | {"tp_size": 1},
+            *local_records,
+            {"type": "idle_flush", "last_sequence": len(local_records) - 1},
+        ]
+        validated = _analyze_single(local_result, [local_trace])
+        per_rank.append(
+            {"rank": rank, "request_count": len(indexes), **validated["cuda_trace"]}
+        )
+    residual = duration - totals["prefill"]
+    if residual <= 0:
+        raise ValueError("Pure-prefill estimate exceeds benchmark wall time")
+    decode_tokens = result["total_output_tokens"] - len(request_ids)
+    return {
+        "status": "analyzed",
+        "request_count": len(request_ids),
+        "end_to_end": {
+            "duration_seconds": duration,
+            "output_throughput_tokens_per_second": result["output_throughput"],
+            **{
+                key: result.get(key)
+                for key in (
+                    "mean_ttft_ms",
+                    "mean_tpot_ms",
+                    "p99_ttft_ms",
+                    "p99_tpot_ms",
+                )
+            },
+        },
+        "cuda_trace": {
+            "parallel_strategy": "attention_dp4_ep4",
+            "tp_size": 4,
+            "attn_dp_size": 4,
+            "ep_size": 4,
+            "prefill_forward_seconds": totals["prefill"],
+            "decode_forward_seconds": totals["decode"],
+            "mixed_forward_seconds": totals["mixed"],
+            "mixed_steps": counts["mixed"],
+            "prefill_batches": counts["prefill"],
+            "decode_batches": counts["decode"],
+            "aggregation": "max_rank_duration_per_verified_ep_step",
+            "per_rank": per_rank,
+            "request_owners": owners,
+        },
+        "decode_only_estimate": {
+            "method": "wall_time_minus_pure_prefill_ep_step_maxima",
+            "residual_seconds": residual,
+            "decode_output_tokens": decode_tokens,
+            "decode_throughput_tokens_per_second": decode_tokens / residual,
+            "all_output_throughput_tokens_per_second": result["total_output_tokens"]
+            / residual,
+            "limitations": [
+                "NoPD estimate, not an executed decode-only service; actual TTFT/TPOT are unchanged.",
+                "Mixed prefill/decode EP steps are retained in full to avoid subtracting concurrent decode work.",
+                "Unsynchronized CUDA event starts and inter-step CPU/EP waits prevent an exact wall-time decomposition.",
+                "Per-rank request ownership differs; rank durations are never summed.",
+            ],
+        },
+    }
 
 
 def read_capacities(traces, tp_size, request_ids=None, *, require_idle=False):
@@ -297,10 +520,15 @@ def read_capacities(traces, tp_size, request_ids=None, *, require_idle=False):
     those forwards at the current final idle marker.
     """
     expected = set(request_ids or [])
+    dp_mode = any(trace and trace[0].get("attn_dp_size", 1) > 1 for trace in traces)
+    if dp_mode:
+        traces = _dp_traces(traces)
+        if expected:
+            _request_owners(traces, expected)
     matches = [
         trace
         for trace in traces
-        if trace and (not expected or _selected(trace, expected))
+        if trace and (dp_mode or not expected or _selected(trace, expected))
     ]
     by_rank = {}
     for trace in matches:
@@ -312,7 +540,7 @@ def read_capacities(traces, tp_size, request_ids=None, *, require_idle=False):
             raise ValueError("Multiple scheduler lifetimes for one TP rank")
         records = _selected(trace, expected)
         seen = {rid for record in records for rid in record["request_ids"]}
-        if not expected <= seen:
+        if not dp_mode and not expected <= seen:
             raise ValueError("Not all request IDs are visible on every TP rank")
         if trace[-1].get("type") != "idle_flush":
             raise ValueError("Capacity must be sampled at scheduler idle")

@@ -26,6 +26,10 @@ def load_stage(path):
         )
     if stage["tp_size"] not in (1, 4) or stage["variant"] not in ("cpu", "mpu"):
         raise ValueError("Stages support TP1/TP4 and CPU or MPU backing")
+    if stage.get("attn_dp_size", 1) > 1 and (
+        stage["tp_size"] != 4 or stage["attn_dp_size"] != 4 or stage.get("ep_size") != 4
+    ):
+        raise ValueError("Multi-rank MPU recipes require Attention-DP4 + EP4")
     if "cpu" not in stage["variants"] or stage["variant"] not in stage["variants"]:
         raise ValueError("Every stage requires its CPU HiSparse reference recipe")
     if stage.get("graph_max_bs_flag", "--cuda-graph-max-bs") not in (
@@ -305,6 +309,23 @@ def server_command(stage, args, variant, input_len, ratio, *, eager=None):
         stage.get("graph_max_bs_flag", "--cuda-graph-max-bs"): max(args.concurrencies),
         "--random-seed": args.seed,
     }
+    if stage.get("attn_dp_size", 1) > 1:
+        options.update(
+            {
+                "--attn-dp-size": 4,
+                "--ep-size": 4,
+                "--moe-dense-tp-size": 1,
+                "--moe-a2a-backend": "deepep",
+                "--deepep-mode": "low_latency",
+                "--load-balance-method": "round_robin",
+                # A decode converted to an extend graph is still a decode token.
+                # Keep prefill eager for unambiguous phase accounting in this PoC.
+                "--cuda-graph-config": '{"prefill":{"backend":"disabled"}}',
+            }
+        )
+        for flag in ("--enable-dp-lm-head", "--enable-dense-mlp-attn-tp"):
+            if flag not in cmd:
+                cmd.append(flag)
     if args.revision:
         options["--revision"] = args.revision
     config = config_for(stage, args, variant, ratio)

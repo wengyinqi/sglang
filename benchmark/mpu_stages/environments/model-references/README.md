@@ -7,8 +7,11 @@
 | 文件 | 模型固定 revision | 元数据文件 | 权重文件 |
 |---|---|---:|---:|
 | `qwen.json` | `144afc2f379b542fdd4e85a1fcd5e1f79112d95d` | 8 | 16 |
-| `deepseek-v4-flash.json` | `60d8d70770c6776ff598c94bb586a859a38244f1` | 11 | 46 |
+| `deepseek-v4-flash.json` | `ae01d80c06cdfe30581edfd0e1c5449dc7ed7f17` | 5 | 46 |
 | `glm-5.3-flash.json` | `46a050bec13002ad29ee795c16e61cf4fa3c4a9c` | 7 | 62 |
+
+V4 参考于 2026-10-27 更新为 `sgl-project/DeepSeek-V4-Flash-FP8`，用于
+Attention-DP4+EP4 的 H200 FP8/DeepGEMM 配方；CPU/MPU 配对同时更新。
 
 这些是有来源、可检查的校验和清单，不是签名，也不是本地权重已经校验的证据。
 将所选模型的 JSON 传给 `model_snapshot.py create --reference ... --full-checksum`，

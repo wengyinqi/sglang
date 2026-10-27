@@ -91,6 +91,22 @@ def verify_capacities(capacities, stage, args, variant, ratio):
             raise ValueError("Capacity TP metadata differs from the stage")
         if capacity.get("backing_store") != expected_backing:
             raise ValueError("Measured backing store differs from selected variant")
+        if stage.get("attn_dp_size", 1) > 1:
+            for key, value in {
+                "attn_dp_size": 4,
+                "attn_dp_rank": rank,
+                "attn_tp_size": 1,
+                "ep_size": 4,
+                "moe_tp_size": 1,
+                "parallel_strategy": "attention_dp4_ep4",
+            }.items():
+                if capacity.get(key) != value:
+                    raise ValueError(
+                        f"Runtime capacity has wrong DP+EP topology: {key}"
+                    )
+            audit = capacity.get("tensor_parallel_audit", {})
+            if audit.get("status") != "passed" or not audit.get("checked_modules"):
+                raise ValueError("Runtime model tensor-parallel audit is missing")
         for key in ("physical_compute_slots", "compute_kv_bytes"):
             if type(capacity.get(key)) is not int or capacity[key] <= 0:
                 raise ValueError(f"Missing positive actual {key}")
@@ -302,7 +318,7 @@ def execute(stage, args, manifest, path):
     for group in manifest["groups"]:
         process = None
         try:
-            with (args.output_dir / f'{group["id"]}-server.log').open(
+            with (args.output_dir / f"{group['id']}-server.log").open(
                 "w", encoding="utf-8"
             ) as log:
                 process = COMMON.start_server(
@@ -313,7 +329,7 @@ def execute(stage, args, manifest, path):
                 COMMON.wait_ready(process, args.port, args.startup_timeout)
                 info = COMMON.request_json(args.port, "get_server_info")
                 COMMON.write_manifest(
-                    args.output_dir / f'{group["id"]}-server-info.json', info
+                    args.output_dir / f"{group['id']}-server-info.json", info
                 )
                 group["capacity"] = wait_capacities(
                     group["trace_dir"], stage, args, group["variant"], group["ratio"]
@@ -325,7 +341,7 @@ def execute(stage, args, manifest, path):
                     )
                 for case in group["cases"]:
                     try:
-                        with (args.output_dir / f'{case["id"]}.log').open(
+                        with (args.output_dir / f"{case['id']}.log").open(
                             "w", encoding="utf-8"
                         ) as bench_log:
                             subprocess.run(
@@ -366,7 +382,7 @@ def execute(stage, args, manifest, path):
                                 physical_references[key], case["idle_capacity"]
                             )
                         COMMON.write_manifest(
-                            args.output_dir / f'{case["id"]}-timing.json',
+                            args.output_dir / f"{case['id']}-timing.json",
                             case["analysis"],
                         )
                         case["status"] = "success"

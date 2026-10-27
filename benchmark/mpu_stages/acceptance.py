@@ -54,6 +54,7 @@ def portable_targets(stage):
         "test/manual/mpu_stages/test_capacity_analysis.py",
         "test/manual/mpu_stages/test_profile_tools.py",
         "test/manual/mpu_stages/test_model_snapshot.py",
+        "test/manual/mpu_stages/test_attention_dp_ep.py",
         "test/manual/mpu_stages/test_hardware_probe.py",
         "test/manual/mpu_stages/test_jit_matrix.py",
         "test/manual/mpu_stages/test_lifecycle_cpu.py",
@@ -366,7 +367,12 @@ def make_steps(stage, args, control, stage_argv):
                 "phase": mode,
                 "kind": "probe",
                 "expected_stage": {
-                    key: stage[key] for key in ("id", "family", "tp_size", "variant")
+                    **{
+                        key: stage[key]
+                        for key in ("id", "family", "tp_size", "variant")
+                    },
+                    "attn_dp_size": stage.get("attn_dp_size", 1),
+                    "ep_size": stage.get("ep_size", 1),
                 },
                 "expected_jit_cases": (
                     load("jit_matrix").cases_for(
@@ -424,6 +430,7 @@ def make_steps(stage, args, control, stage_argv):
                 "id": kind,
                 "phase": kind,
                 "kind": "model_run",
+                "expected_model_stage": stage,
                 "commands": [
                     {
                         "name": kind,
@@ -568,6 +575,14 @@ def external_result(step, job, returncode):
             return {"status": status, "evidence": report}
         groups = report.get("groups", [])
         if (
+            step.get("expected_model_stage") is not None
+            and report.get("stage") != step["expected_model_stage"]
+        ):
+            return {
+                "status": "failed",
+                "reason": "Model report has a different stage/parallelism contract",
+            }
+        if (
             returncode
             or status != "success"
             or not groups
@@ -594,6 +609,27 @@ def external_result(step, job, returncode):
                         "status": "failed",
                         "reason": "Missing required abort/retract recovery evidence",
                     }
+                if report.get("stage", {}).get("attn_dp_size", 1) > 1:
+                    owner_rounds = group.get("round_attention_owners", [])
+                    if len(owner_rounds) != 3 or any(
+                        set(row.values()) != set(range(4)) for row in owner_rounds
+                    ):
+                        return {
+                            "status": "failed",
+                            "reason": "Missing correctness request coverage across all Attention-DP owners",
+                        }
+                    for rank in range(4):
+                        covered = {
+                            item.get("case")
+                            for item in group.get("lifecycle_results", [])
+                            if item.get("status") == "passed"
+                            and item.get("attention_dp_rank") == rank
+                        }
+                        if not required <= covered:
+                            return {
+                                "status": "failed",
+                                "reason": f"Missing lifecycle coverage for Attention-DP rank {rank}",
+                            }
         return {"status": "passed", "runner_status": status, "groups": len(groups)}
     except (OSError, ValueError, TypeError, KeyError) as error:
         return {"status": "failed", "reason": f"Invalid delegated report: {error}"}
@@ -745,7 +781,7 @@ def main(argv=None):
             "+0 is HiSparse CPU DDR backing; the correctness gate also requires the same-selector HBM reference.",
             "Compile gate builds production MPU objects only; native load and GPU execution are separate evidence.",
             "Required pytest skips block the next layer. Passing a requested subset does not pass later layers.",
-            "TP4 kernel acceptance includes four concurrent compute processes; it does not certify TP collectives or measured GPU traffic overlap.",
+            "Four-compute kernel acceptance tests concurrent data paths; it does not certify Attention-DP/DeepEP collectives or measured GPU traffic overlap.",
             "GLM MPU tests use real KPool selection and resolve-to-peer replay; model correctness also requires observed abort/retract recovery.",
             "Economic/SLO acceptance remains separate from successful data-path and model tests.",
             "Target model acceptance requires both full local fingerprints and a matching trusted fixed-revision reference.",
