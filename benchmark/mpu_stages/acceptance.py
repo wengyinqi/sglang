@@ -23,6 +23,7 @@ REPO = HERE.parents[1]
 PHASES = (
     "portable",
     "compile",
+    "jit",
     "imports",
     "device",
     "kernels",
@@ -49,8 +50,10 @@ def portable_targets(stage):
         "test/manual/mpu_stages/test_stage_tools.py",
         "test/manual/mpu_stages/test_acceptance.py",
         "test/manual/mpu_stages/test_environment_packaging.py",
+        "test/manual/mpu_stages/test_native_environment.py",
         "test/manual/mpu_stages/test_model_snapshot.py",
         "test/manual/mpu_stages/test_hardware_probe.py",
+        "test/manual/mpu_stages/test_jit_matrix.py",
         "test/manual/mpu_stages/test_lifecycle_cpu.py",
         "test/manual/mpu_stages/test_lifecycle_tools.py",
     ]
@@ -330,7 +333,7 @@ def make_steps(stage, args, control, stage_argv):
             ],
         }
     ]
-    for mode in ("compile", "imports", "device"):
+    for mode in ("compile", "jit", "imports", "device"):
         report = root / f"{mode}.json"
         command = [
             sys.executable,
@@ -346,6 +349,8 @@ def make_steps(stage, args, control, stage_argv):
         ]
         if mode == "compile":
             command.append("--compile-only")
+        if mode == "jit":
+            command += ["--jit-matrix", getattr(control, "jit_matrix", "default")]
         if args.mpu_device_ids is not None:
             command += ["--mpu-device-ids", *map(str, args.mpu_device_ids)]
         if args.mpu_memory_reserve_bytes is not None:
@@ -361,6 +366,15 @@ def make_steps(stage, args, control, stage_argv):
                 "expected_stage": {
                     key: stage[key] for key in ("id", "family", "tp_size", "variant")
                 },
+                "expected_jit_cases": (
+                    load("jit_matrix").cases_for(
+                        stage,
+                        load("hardware_probe").FAMILIES[stage["family"]],
+                        getattr(control, "jit_matrix", "default"),
+                    )
+                    if mode == "jit"
+                    else None
+                ),
                 "commands": [
                     {"name": mode, "command": command, "report": str(report), "env": {}}
                 ],
@@ -534,6 +548,21 @@ def external_result(step, job, returncode):
                             digest.update(chunk)
                     if digest.hexdigest() != item.get("sha256"):
                         raise ValueError("Production CUDA object checksum changed")
+                if step["id"] == "jit":
+                    artifacts = load("jit_matrix").validate_report(
+                        report, step.get("expected_jit_cases")
+                    )
+                    for item in artifacts:
+                        artifact = Path(item.get("path", ""))
+                        if (
+                            not artifact.is_file()
+                            or artifact.stat().st_size != item.get("bytes")
+                            or hashlib.sha256(artifact.read_bytes()).hexdigest()
+                            != item.get("sha256")
+                        ):
+                            raise ValueError(
+                                "Production JIT shared library is missing or changed"
+                            )
             return {"status": status, "evidence": report}
         groups = report.get("groups", [])
         if (
@@ -662,6 +691,7 @@ def execute(manifest, args, control, runner=run_command):
     manifest["evidence_scope"] = {
         "requested_scope_passed": passed,
         "cuda_object_compiled": "compile" in completed,
+        "production_jit_modules_loaded": "jit" in completed,
         "production_python_imports": "imports" in completed,
         "device_smoke_executed": "device" in completed,
         "selected_kernel_tests_executed": "kernels" in completed,
@@ -675,6 +705,9 @@ def execute(manifest, args, control, runner=run_command):
 def main(argv=None):
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--through", choices=PHASES, default="correctness")
+    parser.add_argument(
+        "--jit-matrix", choices=("default", "boundaries"), default="default"
+    )
     parser.add_argument("--model-manifest", type=Path)
     parser.add_argument("--probe-timeout", type=int, default=600)
     parser.add_argument("--layer-timeout", type=int, default=3600)
