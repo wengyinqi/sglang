@@ -152,6 +152,7 @@ def test_dp_stage_commands_and_coverage():
             ("--ep-size", "4"),
             ("--dp-size", "1"),
             ("--moe-a2a-backend", "deepep"),
+            ("--deepep-mode", "auto"),
             ("--moe-dense-tp-size", "1"),
         ):
             assert command[command.index(key) + 1] == value
