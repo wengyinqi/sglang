@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "minimum_repeats": 5,
+  "slo": {},
+  "costs": [],
+  "currency": null,
+  "cost_basis": "simulator_hardware",
+  "source": "Pending measured-latency SLO and quoted total configuration costs; no economic acceptance until supplied"
+}

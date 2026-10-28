@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "id": "mpu-nopd-poc-v1",
+  "input_lens": [8192, 32768],
+  "output_len": 256,
+  "repeats": 5,
+  "seed": 1729,
+  "mem_fraction_static": 0.8,
+  "logprob_atol": 0.02,
+  "plateau_threshold": 0.05,
+  "plateau_consecutive_edges": 2,
+  "profiles": {
+    "baseline": {"cpu_capacity_ratio": 2, "capacity_ratios": [2]},
+    "capacity": {"cpu_capacity_ratio": 8, "capacity_ratios": [1, 2, 4, 8]}
+  },
+  "families": {
+    "qwen": {
+      "selector": "quest",
+      "top_k": 2048,
+      "device_buffer_size": 4096,
+      "max_total_tokens": 65536,
+      "chunked_prefill_size": 8192,
+      "concurrencies": [1, 4, 8, 16, 32],
+      "num_prompts": 256,
+      "warmup_requests": 32,
+      "correctness_input_lens": [8193, 8256, 32768],
+      "correctness_output_len": 80
+    },
+    "deepseek-v4-flash": {
+      "selector": "deepseek-v4-c4-indexer",
+      "top_k": 512,
+      "device_buffer_size": 1024,
+      "max_total_tokens": 131072,
+      "chunked_prefill_size": 4096,
+      "concurrencies": [4, 8, 16, 32, 64],
+      "num_prompts": 512,
+      "warmup_requests": 64,
+      "correctness_input_lens": [8193, 8448, 32768],
+      "correctness_output_len": 257
+    },
+    "glm-5.3-flash": {
+      "selector": "glm53-dsa-kpool-tail",
+      "top_k": 2048,
+      "device_buffer_size": 4096,
+      "max_total_tokens": 131072,
+      "chunked_prefill_size": 4096,
+      "concurrencies": [4, 8, 16, 32, 64],
+      "num_prompts": 512,
+      "warmup_requests": 64,
+      "correctness_input_lens": [8193, 8256, 32768],
+      "correctness_output_len": 80
+    }
+  }
+}
