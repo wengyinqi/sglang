@@ -56,11 +56,17 @@
   预算。这个 CPU 参考是固定的大容量基线，不能称为每个 MPU 点的等容量对照。
 
 每个输入长度内，所有点必须保持实际计算 KV slots、bytes 一致。V4/GLM 还强制核对
-模型留存 GPU 池的形状/stride/dtype/storage 别名。Qwen 当前容量报告仅覆盖 K/V 层，
-排除 Quest selector 元数据；因此其固定预算结论只针对 K/V 池，不能扩大为整个 GPU
-分配已冻结。不同上下文长度单独形成曲线，不自动合并。
+模型留存 GPU 池的形状/stride/dtype/storage 别名。Qwen 的 `qwen_quest_v1` 账本额外
+记录 Quest selector、coordinator、请求映射、K/V 指针、逻辑地址映射及 allocator。
+K/V 和 fixed 组在同一输入长度内跨 CPU/MPU、容量比例、idle 快照保持一致；
+capacity_dependent 与 backend_specific 组只要求同一容量点内稳定，allocator_dynamic
+逐快照报告。按实际 storage 去重，含 padding，不读取张量值或启动 kernel。
+它不覆盖权重、activation、attention workspace、graph private pool、未用 reserved
+显存，不能扩大为整个 GPU 分配已冻结。不同上下文长度单独形成曲线，不自动合并。
 容量比使用 **实际后备 KV 分配字节 / 实际计算 KV 分配字节**，逐 rank 和汇总均保存；
-汇总为 `sum(backing_kv_bytes) / sum(compute_kv_bytes)`。同时保留 slot 比例、单位、
+Qwen 优先使用 `allocated_backing_kv_bytes / allocated_compute_kv_bytes`，包含真实 storage
+padding；其他模型沿用其报告的 KV bytes。`kv_byte_ratio_basis_by_rank` 标明口径，汇总
+使用对应字节数求和后相除。同时保留 slot 比例、单位、
 padding 和 GPU 留存池。不得使用显卡标称显存或仅用卡数代替实际 KV 容量比。
 此分母是当前模型 offload pool 的计算 KV，不包含权重及其他留存池；跨模型布局不可混比。
 
@@ -110,13 +116,26 @@ greedy token ID 完全相同，logprob 绝对误差不超过 0.02。四卡阶段
 快照。每个 profile 保留原生结果、trace、server-info、门禁和分析 JSON。完整测量记为
 `measured`，不自动标记“性能收益通过”。运行中不要切分支或改生产源码。
 
+性能入口 `paired_run.py` 以一个输入长度 × repeat 为一块，包含全部 CPU/MPU 变体、
+容量点和并发。固定种子先打乱变体顺序，每轮循环轮换位置；并发顺序随机但同块一致。
+每个变体重新启动并 warmup，启动时间不计入原生 benchmark。循环轮换减轻顺序漂移，
+不能证明温度、频率等系统偏差被消除；重复数不是变体数的倍数时位置不会完全均衡。
+
+中断后用完全相同的命令加 `--resume --execute`。OS 独占锁阻止双进程写入，锁随进程退出
+释放。完整 block 的所有文件以 SHA-256 封存；缺失、增加或修改文件均拒绝复用。
+未完成块在新 `attempt-NNNN` 目录整块重跑，保留失败证据，不混入部分成功样本。
+已通过且封存的 correctness gate 可复用；失败 gate 使用新目录重新执行。
+续跑核对源码 commit/内容、可信模型 manifest/完整内容校验、Python/依赖版本、GPU
+UUID/driver、拓扑、CUDA/NCCL/allocator 环境以及所有命令和配置；发生变化须新建实验。
+这会重新读取模型以核对完整校验和，可能较慢。SLO/价格更改应使用独立重分析入口。
+
 ## 收益、平台与成本判据
 
 1. TTFT、TPOT、端到端吞吐保存实测值。另算 `(输出 token - 请求数)/(wall time - P)`；
    `P` 只累加全局纯 prefill 步骤的逐步 rank 最大 CUDA 时长，mixed 步骤不扣。
    这是 NoPD 的 decode 估算；不能当作实测 PD decode-only 吞吐。
 2. 复用 2000 次配对 bootstrap 的 95% 区间，同时报告 CPU→MPU 的端到端与 decode 估算
-   吞吐增幅。区间含 0 时不声称明确正收益。固定 CPU-first 顺序的热/频率漂移不在区间内，
+   吞吐增幅。区间含 0 时不声称明确正收益。轮换顺序仍不能把热/频率漂移纳入区间，
    首轮结果需要结合独立重跑与硬件状态解释，不能宣称已排除系统偏差。
 3. 每个 rank 的实际 slot 比例和 KV 字节比例都必须增长；至少 5 次完整重复。
    在扫描尾部至少连续两次容量增加的 decode 增益区间上界低于 5%，且不判为回退，才
@@ -129,5 +148,23 @@ greedy token ID 完全相同，logprob 绝对误差不超过 0.02。四卡阶段
 6. 满足重复数和 SLO、有成本的点才参加“已测点中 tokens/货币最高”比较。端到端与
    decode 估算分列；不声称统计上胜者已分离、全局经济最优或真实 MPU 已获收益。
 
-本轮只改实验工具、配置和测试，未改生产 CUDA/模型实现。旧离线包固定的源码提交和
-bundle 哈希保持原样；使用新入口需获取本轮实验分支代码，不能将旧包声称为已包含新矩阵。
+规划时自动生成 `decision-inputs.json`，P99 TTFT/TPOT 和 CPU/MPU 整套配置小时成本均为
+`null`。保留待填不会生成延迟通过或经济最优结论。填入已确定标准与报价后：
+
+```sh
+python benchmark/mpu_stages/decision_policy.py compile \
+  --matrix-report /results/plan-stage/matrix.json \
+  --inputs /results/plan-stage/decision-inputs.json --output /results/policy.json
+
+# 已有测量只重新分析，输出新文件，不启动模型、不修改原计划或测量。
+python benchmark/mpu_stages/decision_policy.py review \
+  --matrix-report /results/baseline/matrix.json \
+  --inputs /results/filled-decision-inputs.json --output /results/decision-review.json
+```
+
+策略绑定模型、revision、selector、计算卡数和存储 ordinal，1+1/1+4 不能串用。
+review 先核对命令、workload、门禁、完整测量及封存 block；缺测量或错误证据单独标记。
+
+2026-10-28 本轮新增 Qwen 生产端的只读内存观察器及公共实验工具。用户已要求暂跳过
+WSL；新版本 Linux 构建、Docker 镜像和隔离恢复验收暂缓。旧离线包及其哈希保持原样。
+本轮源码更新包不包含已验收的新服务镜像，不得把旧镜像换标签当作本轮构建。
