@@ -369,7 +369,11 @@ class TestStagePlanning(unittest.TestCase):
             )
             stack.enter_context(patch.object(RUN.COMMON, "wait_ready"))
             stack.enter_context(
-                patch.object(RUN.COMMON, "request_json", return_value={})
+                patch.object(
+                    RUN.COMMON,
+                    "request_json",
+                    return_value={"disable_cuda_graph": False},
+                )
             )
             stack.enter_context(
                 patch.object(
@@ -420,8 +424,9 @@ class TestTPAccounting(unittest.TestCase):
     def test_missing_duplicate_or_misaligned_rank_is_rejected(self):
         traces = [trace(rank, 4) for rank in range(4)]
         for bad in (traces[:3], [*traces, traces[0]]):
-            with self.subTest(count=len(bad)), self.assertRaisesRegex(
-                ValueError, "every TP rank"
+            with (
+                self.subTest(count=len(bad)),
+                self.assertRaisesRegex(ValueError, "every TP rank"),
             ):
                 RUN.ANALYZE.analyze(benchmark(), bad)
         bad = copy.deepcopy(traces)
