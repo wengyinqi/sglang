@@ -1,11 +1,11 @@
 name: MPU CPU acceptance
 
 on:
-  push:
-    branches: ['mpu-exp/**']
-  pull_request:
-    branches: ['mpu-exp/**']
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      expected_sha:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,6 +21,10 @@ jobs:
       MPU_CPU_CONTROL_EVIDENCE: ${{ github.workspace }}/cpu-evidence/processes
     steps:
       - uses: actions/checkout@v4
+      - name: Verify tested commit
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
