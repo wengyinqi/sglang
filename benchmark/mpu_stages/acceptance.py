@@ -59,7 +59,10 @@ def portable_targets(stage):
         "test/manual/mpu_stages/test_jit_matrix.py",
         "test/manual/mpu_stages/test_lifecycle_cpu.py",
         "test/manual/mpu_stages/test_lifecycle_tools.py",
+        "test/manual/mpu_stages/test_delivery_bundle.py",
     ]
+    if sys.platform == "linux":
+        targets.append("test/manual/mpu_stages/test_cpu_processes_linux.py")
     if stage["family"] == "qwen":
         targets += [
             "test/manual/hisparse/test_quest_selector.py::TestQuestSelectorCPU",
@@ -331,7 +334,9 @@ def make_steps(stage, args, control, stage_argv):
                         portable_targets(stage), root / "portable.xml"
                     ),
                     "report": str(root / "portable.xml"),
-                    "env": {},
+                    "env": {"MPU_CPU_CONTROL_EVIDENCE": str(root / "cpu-processes")}
+                    if sys.platform == "linux"
+                    else {},
                 }
             ],
         }
@@ -728,6 +733,8 @@ def execute(manifest, args, control, runner=run_command):
     completed = {step["id"] for step in manifest["steps"] if step["status"] == "passed"}
     manifest["evidence_scope"] = {
         "requested_scope_passed": passed,
+        "linux_cpu_control_executed": sys.platform == "linux"
+        and "portable" in completed,
         "cuda_object_compiled": "compile" in completed,
         "production_jit_modules_loaded": "jit" in completed,
         "production_python_imports": "imports" in completed,
