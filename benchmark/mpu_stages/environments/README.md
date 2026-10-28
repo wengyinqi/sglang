@@ -72,6 +72,21 @@ Linux 文件系统，避免将 Docker overlay 数据直接放在 Windows 挂载�
 避免混入 13.4 的 NVVM 并产生 PTX 版本冲突。13.0.3 的 runtime 为 13.0.96，其余上述
 编译组件仍是 13.0.88/13.0.85。V4/GLM 的 TVM-FFI 必须匹配源码的 0.1.11。
 
+### Ubuntu 24.04 原生构建的系统依赖
+
+`native_environment.py execute` 在安装 Python 依赖和编译前，检查
+`native-platform.json` 列出的系统包是否已完整安装。编译工具之外还需要
+`libnuma1`，供 `sglang-kernel` 加载 `libnuma.so.1`；仅安装 CUDA/Python wheel
+不能补齐这个系统库。缺包、仅残留配置或错误架构的包均不能通过检查。
+
+```bash
+sudo apt-get install -y python3 python3-venv gcc-13 g++-13 pkg-config \
+  libssl-dev protobuf-compiler git ninja-build libnuma1
+```
+
+构建回执分别记录必备包状态与实际系统包版本。无 GPU 主机上的编译/JIT 成功
+不代表生产模块导入、设备或模型验收通过；缺少 NVIDIA 驱动仍须单独记录。
+
 ## 本地模型与 tokenizer 身份
 
 三个模型的预期仓库和固定 revision 取自各阶段 stage.json：Qwen 阶段共用一个模型身份，DeepSeek-V4 阶段共用一个身份，GLM-5.3 阶段共用一个身份。工具不把本地路径、HF 缓存目录名或声明的 revision 当作权重身份已经验证。
