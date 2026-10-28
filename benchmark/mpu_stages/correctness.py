@@ -118,6 +118,7 @@ def execute(stage, args, manifest, path):
                 group["capacity"] = RUN.wait_capacities(
                     group["trace_dir"], stage, args, group["variant"], group["ratio"]
                 )
+                point_memory = RUN.enforce_point_memory(None, group["capacity"])
                 if group["variant"] != "hbm":
                     physical_reference = RUN.enforce_fixed_compute(
                         physical_reference, group["capacity"]
@@ -179,6 +180,9 @@ def execute(stage, args, manifest, path):
                     if group["variant"] != "hbm":
                         RUN.enforce_fixed_compute(
                             physical_reference, group["round_idle_capacity"][-1]
+                        )
+                        RUN.enforce_point_memory(
+                            point_memory, group["round_idle_capacity"][-1]
                         )
                 if reference is None:
                     reference = records

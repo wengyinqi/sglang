@@ -37,6 +37,7 @@ def load_policy(path):
             "currency",
             "cost_basis",
             "source",
+            "topology_scope",
         }:
             raise ValueError("Unknown analysis policy field")
         policy.update(supplied)
@@ -85,6 +86,48 @@ def percentile(values, probability):
     return values[low] + (values[min(low + 1, len(values) - 1)] - values[low]) * (
         index - low
     )
+
+
+def kv_allocation(capacity):
+    allocated = any(
+        k in capacity
+        for k in ("allocated_compute_kv_bytes", "allocated_backing_kv_bytes")
+    )
+    keys = (
+        ("allocated_compute_kv_bytes", "allocated_backing_kv_bytes")
+        if allocated
+        else ("compute_kv_bytes", "backing_kv_bytes")
+    )
+    compute, backing = (capacity.get(k) for k in keys)
+    if compute is None or backing is None:
+        return None, None, "unavailable"
+    number(compute)
+    number(backing)
+    return (
+        compute,
+        backing,
+        "allocated_storage_with_padding" if allocated else "reported_kv_payload_bytes",
+    )
+
+
+def verify_manifest_scope(policy, manifest):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "capacity_decision", Path(__file__).with_name("decision_policy.py")
+    )
+    decision = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(decision)
+    if policy.get("topology_scope") is None and not policy["costs"]:
+        return
+    stage = manifest["stage"]
+    storage = []
+    if stage["variant"] == "mpu":
+        storage = (
+            manifest["settings"].get("mpu_device_ids")
+            or stage["variants"]["mpu"]["hisparse_config"]["mpu_device_ids"]
+        )
+    decision.verify_scope(policy, stage, storage)
 
 
 def bootstrap(values, other=None):
@@ -164,20 +207,20 @@ def enrich(summary, groups, policy):
         capacities = row.get("per_rank_capacity") or []
         effective = [p.get("effective_capacity_ratio") for p in capacities]
         row["effective_slot_ratios_by_rank"] = effective
+        allocated = [kv_allocation(p) for p in capacities]
         row["backing_to_compute_kv_byte_ratios_by_rank"] = [
-            (
-                p["backing_kv_bytes"] / p["compute_kv_bytes"]
-                if p.get("backing_kv_bytes") is not None
-                and p.get("compute_kv_bytes", 0) > 0
-                else None
-            )
-            for p in capacities
+            backing / compute if compute is not None else None
+            for compute, backing, _ in allocated
         ]
+        row["kv_byte_ratio_basis_by_rank"] = [basis for _, _, basis in allocated]
         byte_ratios = row["backing_to_compute_kv_byte_ratios_by_rank"]
         if byte_ratios and all(value is not None for value in byte_ratios):
             row["aggregate_backing_to_compute_kv_byte_ratio"] = sum(
-                p["backing_kv_bytes"] for p in capacities
-            ) / sum(p["compute_kv_bytes"] for p in capacities)
+                backing for _, backing, _ in allocated
+            ) / sum(compute for compute, _, _ in allocated)
+        row["gpu_memory_ledgers_by_rank"] = [
+            p.get("gpu_memory_ledger") for p in capacities
+        ]
         row["slo"] = {
             "status": "not_specified",
             "scope": "each successful repeat's measured request-latency metric",
@@ -311,6 +354,7 @@ def add_cpu_comparisons(summary, groups, policy):
         fields = (
             "physical_compute_slots",
             "compute_kv_bytes",
+            "allocated_compute_kv_bytes",
             "retained_gpu_pool_bytes",
             "retained_gpu_pool_shapes",
         )
@@ -358,18 +402,20 @@ def add_cpu_comparisons(summary, groups, policy):
             "requested_ratio": reference[0]["ratio"],
             "requested_capacity_matched": reference[0]["ratio"] == row["ratio"],
             "physical_capacity_match_proven": all(
-                a.get("backing_kv_bytes") is not None
-                and a.get("backing_kv_bytes") == b.get("backing_kv_bytes")
+                kv_allocation(a)[1] is not None
+                and kv_allocation(a)[1:] == kv_allocation(b)[1:]
                 and a.get("backing_slots") is not None
                 and a.get("backing_slots") == b.get("backing_slots")
                 for a, b in zip(*capacities)
             ),
             "cpu_backing_kv_bytes_by_rank": [
-                p.get("backing_kv_bytes") for p in capacities[0]
+                kv_allocation(p)[1] for p in capacities[0]
             ],
             "mpu_backing_kv_bytes_by_rank": [
-                p.get("backing_kv_bytes") for p in capacities[1]
+                kv_allocation(p)[1] for p in capacities[1]
             ],
+            "cpu_kv_byte_basis_by_rank": [kv_allocation(p)[2] for p in capacities[0]],
+            "mpu_kv_byte_basis_by_rank": [kv_allocation(p)[2] for p in capacities[1]],
         }
         for label, section, field in (
             (
@@ -408,10 +454,12 @@ def main(argv=None):
     )
     run = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(run)
+    policy = load_policy(args.policy)
+    verify_manifest_scope(policy, manifest)
     report = run.summarize(
         manifest["groups"],
         manifest["settings"]["plateau_threshold"],
-        load_policy(args.policy),
+        policy,
     )
     report["input_manifest"] = {
         "path": str(args.manifest.resolve()),
