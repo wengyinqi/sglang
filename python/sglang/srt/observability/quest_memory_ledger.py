@@ -8,11 +8,34 @@ from sglang.srt.observability.mpu_stage_timing import describe_retained_gpu_pool
 
 
 def cuda_attributes(owner, exclude=()):
+    def select(value):
+        # CUDA streams/events also have a .device; they are not tensors.
+        if callable(getattr(value, "untyped_storage", None)):
+            return (
+                value
+                if getattr(getattr(value, "device", None), "type", None) == "cuda"
+                else None
+            )
+        if isinstance(value, (list, tuple)):
+            items = {
+                str(i): selected
+                for i, item in enumerate(value)
+                if (selected := select(item)) is not None
+            }
+            return items or None
+        if isinstance(value, dict):
+            items = {
+                str(k): selected
+                for k, item in value.items()
+                if (selected := select(item)) is not None
+            }
+            return items or None
+        return None
+
     return {
-        name: value
+        name: selected
         for name, value in vars(owner).items()
-        if name not in exclude
-        and getattr(getattr(value, "device", None), "type", None) == "cuda"
+        if name not in exclude and (selected := select(value)) is not None
     }
 
 
@@ -64,10 +87,19 @@ def collect_quest_memory(coordinator):
             "logical_to_physical": pool.full_to_hisparse_device_index_mapping,
             "allocator_mapping_alias": c.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping,
         },
-        "backend_specific": cuda_attributes(backing),
-        "allocator_dynamic": cuda_attributes(
-            c.token_to_kv_pool_allocator.hisparse_attn_allocator
-        ),
+        "backend_specific": cuda_attributes(backing, exclude=("shards", "_local_refs")),
+        "allocator_dynamic": {
+            "physical": cuda_attributes(
+                c.token_to_kv_pool_allocator.hisparse_attn_allocator
+            ),
+            "logical": cuda_attributes(
+                c.token_to_kv_pool_allocator.logical_attn_allocator
+            ),
+            "outer": cuda_attributes(
+                c.token_to_kv_pool_allocator,
+                exclude=("full_to_hisparse_device_index_mapping",),
+            ),
+        },
     }
     groups = {key: describe_retained_gpu_pools(value) for key, value in trees.items()}
     combined = describe_retained_gpu_pools(trees)
