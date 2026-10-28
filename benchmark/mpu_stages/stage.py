@@ -92,6 +92,7 @@ def parse_args(argv=None, *, correctness=False):
     )
     p.add_argument("--num-prompts", type=int, default=defaults.get("num_prompts", 32))
     p.add_argument("--repeats", type=int, default=defaults.get("repeats", 3))
+    p.add_argument("--warmup-requests", type=int, default=1)
     p.add_argument(
         "--max-total-tokens", type=int, default=defaults.get("max_total_tokens", 65536)
     )
@@ -169,6 +170,7 @@ def validate(stage, args):
         "output_len",
         "num_prompts",
         "repeats",
+        "warmup_requests",
         "max_total_tokens",
         "chunked_prefill_size",
         "startup_timeout",

@@ -31,6 +31,8 @@ def group(ratio, rates, effective=None):
                 "effective_capacity_ratio": effective or ratio,
                 "backing_kv_bytes": 100 * ratio,
                 "compute_kv_bytes": 100,
+                "physical_compute_slots": 10,
+                "backing_slots": 10 * ratio,
             }
         ],
         "cases": [
@@ -40,7 +42,8 @@ def group(ratio, rates, effective=None):
                 "repeat": i,
                 "analysis": {
                     "decode_only_estimate": {
-                        "decode_throughput_tokens_per_second": rate
+                        "method": "synthetic_fixture",
+                        "decode_throughput_tokens_per_second": rate,
                     },
                     "end_to_end": {
                         "output_throughput_tokens_per_second": rate / 2,
@@ -57,6 +60,35 @@ def group(ratio, rates, effective=None):
 
 
 class CapacityTests(unittest.TestCase):
+    def test_slot_growth_without_byte_growth_is_not_a_plateau(self):
+        groups = [group(1, [100] * 5), group(2, [101] * 5)]
+        groups[1]["capacity"][0]["backing_kv_bytes"] = 100
+        report = RUN.summarize(groups, 0.05, CAP.load_policy(None))
+        self.assertEqual(
+            report["rows"][1]["decode_plateau_evidence"],
+            "allocation_not_increased_or_unknown",
+        )
+        self.assertEqual(
+            report["rows"][1]["aggregate_backing_to_compute_kv_byte_ratio"], 1
+        )
+
+    def test_cpu_comparison_keeps_larger_reference_capacity_explicit(self):
+        cpu = group(8, [100] * 5)
+        cpu["variant"] = "cpu"
+        groups = [cpu, group(2, [110] * 5)]
+        result = RUN.summarize(groups, 0.05, CAP.load_policy(None))["rows"][1][
+            "cpu_reference"
+        ]
+        self.assertEqual(result["status"], "compared")
+        self.assertFalse(result["requested_capacity_matched"])
+        self.assertFalse(result["physical_capacity_match_proven"])
+        self.assertAlmostEqual(result["actual_output_gain_ci95"][0], 0.1)
+        groups[1]["capacity"][0]["compute_kv_bytes"] = 200
+        result = RUN.summarize(groups, 0.05, CAP.load_policy(None))["rows"][1][
+            "cpu_reference"
+        ]
+        self.assertEqual(result["status"], "compute_budget_unknown_or_different")
+
     def test_no_costs_or_slo_never_produces_an_economic_winner(self):
         report = RUN.summarize(
             [group(1, [100] * 5), group(2, [101] * 5)], 0.05, CAP.load_policy(None)

@@ -48,7 +48,7 @@ def benchmark_command(args, input_len, concurrency, repeat, output):
         "--seed",
         str(args.seed + repeat),
         "--warmup-requests",
-        "1",
+        str(getattr(args, "warmup_requests", 1)),
         "--flush-cache",
         "--output-details",
         "--output-file",
