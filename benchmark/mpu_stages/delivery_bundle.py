@@ -131,6 +131,38 @@ def save_image(image_id, path):
     partial.rename(path)
 
 
+def image_metadata(image, native, native_receipt_sha256):
+    """Read native-image plans while keeping their original receipt intact."""
+    if "plan" not in image:
+        return image
+    plan = image["plan"]
+    smoke = image.get("smoke", {})
+    if (
+        plan.get("build_route") != "verified-native-runtime"
+        or plan.get("native_receipt_sha256") != native_receipt_sha256
+        or plan.get("source_commit") != native["plan"]["source_commit"]
+        or plan.get("prefix") != native["plan"]["prefix"]
+        or plan.get("native_extensions") != native["wheel"]["packaged_extensions"]
+        or smoke.get("source_commit") != plan.get("source_commit")
+        or smoke.get("native_extensions_loaded")
+        != len(native["wheel"]["packaged_extensions"])
+        or smoke.get("gpu_executed") is not False
+    ):
+        raise ValueError("Native image plan, receipt or container evidence mismatch")
+    # Stage and wheel identity come from the hash-bound native receipt; they
+    # are not guessed from an image tag or copied into the original evidence.
+    return dict(
+        image,
+        source_commit=plan["source_commit"],
+        stage=native["plan"]["stage"],
+        native_receipt_sha256=plan["native_receipt_sha256"],
+        wheel_sha256=native["wheel"]["sha256"],
+        runtime_prefix=plan["prefix"],
+        source_prefix=plan["prefix"],
+        image_tag=plan["image_tag"],
+    )
+
+
 def stage_artifacts(repo, spec, root):
     image, native, jit = (
         read(spec[key]) for key in ("image_receipt", "native_receipt", "jit_receipt")
@@ -143,6 +175,7 @@ def stage_artifacts(repo, spec, root):
         raise ValueError("A CPU-verified experimental image receipt is required")
     if native.get("status") != "built_jit_verified" or native.get("built") is not True:
         raise ValueError("A verified native receipt is required")
+    image = image_metadata(image, native, sha(spec["native_receipt"]))
     runtime_commit = image["source_commit"]
     if (
         native["plan"]["source_commit"] != runtime_commit
