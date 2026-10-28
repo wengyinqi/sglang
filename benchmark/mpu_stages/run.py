@@ -331,6 +331,11 @@ def execute(stage, args, manifest, path):
                 COMMON.write_manifest(
                     args.output_dir / f"{group['id']}-server-info.json", info
                 )
+                group["decode_cuda_graph_enabled"] = decode_graph_enabled(info)
+                if group["decode_cuda_graph_enabled"] == args.disable_cuda_graph:
+                    raise ValueError(
+                        "Actual decode CUDA graph mode differs from the benchmark plan"
+                    )
                 group["capacity"] = wait_capacities(
                     group["trace_dir"], stage, args, group["variant"], group["ratio"]
                 )
