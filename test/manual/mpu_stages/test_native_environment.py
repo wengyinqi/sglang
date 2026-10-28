@@ -26,6 +26,26 @@ NATIVE, IMAGE = load("native_environment"), load("runtime_image")
 
 
 class NativeEnvironmentTests(unittest.TestCase):
+    def test_native_prerequisites_accept_installed_amd64_runtime_library(self):
+        self.assertEqual(
+            NATIVE.check_required_os_packages(
+                ["gcc-13", "libnuma1"],
+                "gcc-13\tinstalled\nlibnuma1:amd64\tinstalled\n",
+            ),
+            {"gcc-13": "installed", "libnuma1": "installed"},
+        )
+
+    def test_missing_or_unconfigured_numa_fails_before_dependency_install(self):
+        for snapshot in (
+            "gcc-13\tinstalled\n",
+            "libnuma1:amd64\tconfig-files\n",
+            "libnuma1:amd64\thalf-configured\n",
+            "libnuma1:i386\tinstalled\n",
+        ):
+            with self.subTest(snapshot=snapshot):
+                with self.assertRaisesRegex(ValueError, "libnuma1"):
+                    NATIVE.check_required_os_packages(["libnuma1"], snapshot)
+
     def test_source_and_locks_come_from_commit_not_dirty_worktree(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
