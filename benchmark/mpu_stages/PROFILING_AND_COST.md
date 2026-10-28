@@ -67,6 +67,10 @@ trace；有界诊断中不会插入用于正确性对比的 `.cpu()` 操作。
 
 ## 容量、SLO 和成本
 
+本项目 v1 固定矩阵与统一入口见 [EXPERIMENT_MATRIX.md](EXPERIMENT_MATRIX.md)。
+通用分析器保留单个相邻增量证据；正式矩阵要求扫描尾部至少两个连续增量低于阈值，
+并同时检查实际 KV 字节容量增长。CPU 参考增益报告区分等请求容量与固定大容量参考。
+
 `run.py` 的原始 TTFT、TPOT、端到端吞吐和扣除 prefill 的 decode 估算继续分别保存。
 DP4 只扣除全局纯 prefill 的 EP 步骤，混合 prefill/decode 步骤完整保留；每次重复
 记录混合步骤数量，见 [ATTENTION_DP_EP.md](ATTENTION_DP_EP.md)。不能混合旧 TP
