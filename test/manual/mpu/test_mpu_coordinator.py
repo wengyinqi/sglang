@@ -123,6 +123,9 @@ def coordinator_type():
         load_cache_to_device_buffer_mla=Mock(),
     )
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), namespace)
+    # These CPU dispatch fixtures do not provide CUDA tensor metadata. The
+    # production ledger is exercised separately with metadata-only tensor spies.
+    namespace["HiSparseCoordinator"]._quest_memory_ledger = lambda self: {}
     return namespace["HiSparseCoordinator"], namespace
 
 

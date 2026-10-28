@@ -301,7 +301,15 @@ class HiSparseCoordinator:
             ),
             "used_slots": pool.size - pool.available_size(),
             "scope": "all Qwen MHA/GQA K and V layers; excludes Quest selector metadata",
+            **self._quest_memory_ledger(),
         }
+
+    def _quest_memory_ledger(self):
+        if self.mode != MODE_QUEST:
+            return {}
+        from sglang.srt.observability.quest_memory_ledger import collect_quest_memory
+
+        return collect_quest_memory(self)
 
     def get_mpu_capacity_info(self) -> Optional[dict]:
         if self.backing_store != "mpu":

@@ -8,6 +8,7 @@
   "variant": "cpu",
   "selector": "quest",
   "physical_budget_exact": true,
+  "gpu_memory_ledger": "qwen_quest_v1",
   "hbm_preserves_selector": true,
   "capacity_padding_slots": 1,
   "sparse_context_multiplier": 1,

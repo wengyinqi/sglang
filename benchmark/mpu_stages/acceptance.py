@@ -66,6 +66,7 @@ def portable_targets(stage):
         targets.append("test/manual/mpu_stages/test_cpu_processes_linux.py")
     if stage["family"] == "qwen":
         targets += [
+            "test/manual/mpu_stages/test_quest_memory_ledger.py",
             "test/manual/hisparse/test_quest_selector.py::TestQuestSelectorCPU",
             "test/manual/hisparse/test_quest_backend_contracts.py",
             "test/manual/hisparse/test_quest_lifecycle_ordering.py",
