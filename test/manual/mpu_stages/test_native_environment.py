@@ -26,6 +26,29 @@ NATIVE, IMAGE = load("native_environment"), load("runtime_image")
 
 
 class NativeEnvironmentTests(unittest.TestCase):
+    def test_image_configuration_preserves_base_path_and_checks_launch_identity(self):
+        expected = IMAGE.runtime_config(
+            "/opt/mpu/fixture", "a" * 40, {"Env": ["PATH=/base/bin"]}
+        )
+        self.assertEqual(
+            expected["Env"]["PATH"], "/opt/mpu/fixture/runtime/bin:/base/bin"
+        )
+        actual = dict(
+            expected,
+            Env=[f"{key}={value}" for key, value in expected["Env"].items()]
+            + ["HOME=/root"],
+        )
+        IMAGE.verify_runtime_config(expected, actual)
+        for key, value in (
+            ("Entrypoint", ["/bin/false"]),
+            ("WorkingDir", "/tmp"),
+            ("Env", ["PATH=/another/runtime/bin"]),
+            ("Labels", {}),
+        ):
+            with self.subTest(field=key):
+                with self.assertRaisesRegex(ValueError, "Runtime image"):
+                    IMAGE.verify_runtime_config(expected, dict(actual, **{key: value}))
+
     def test_native_prerequisites_accept_installed_amd64_runtime_library(self):
         self.assertEqual(
             NATIVE.check_required_os_packages(
