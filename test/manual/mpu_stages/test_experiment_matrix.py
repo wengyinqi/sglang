@@ -172,6 +172,7 @@ def test_simulator_cost_does_not_scale_with_allocated_ratio(tmp_path):
     with pytest.raises(ValueError, match="one total cost"):
         M.make_plan(matrix, stage, policy, args)
     policy["cost_basis"] = "hypothetical_mpu"
+    policy["topology_scope"] = M.DECISION.scope(stage, [1])
     assert M.make_plan(matrix, stage, policy, args)["status"] == "planned"
 
 
@@ -213,7 +214,10 @@ def test_failed_gate_stops_performance_and_later_profiles(tmp_path):
         calls.append(command)
         return {"returncode": 1}
 
-    with patch.object(M.sys, "platform", "linux"):
+    with (
+        patch.object(M.sys, "platform", "linux"),
+        patch.object(M.CHECK, "identity", return_value={"synthetic": True}),
+    ):
         assert not M.execute(plan, args, runner=fail)
     assert len(calls) == 1
     assert plan["status"] == "failed"
@@ -411,3 +415,111 @@ def test_partial_p99_policy_is_not_formal_latency_acceptance(tmp_path):
     policy["slo"] = {"p99_tpot_ms": 50}
     with pytest.raises(ValueError, match="both P99"):
         M.make_plan(matrix, stage, policy, args)
+
+
+def test_identity_failure_records_blocked_before_any_process(tmp_path):
+    values = fixture(tmp_path)
+    plan, args = M.make_plan(*values), values[-1]
+    args.output_dir.mkdir()
+    with (
+        patch.object(M.sys, "platform", "linux"),
+        patch.object(
+            M.CHECK, "identity", side_effect=ValueError("model hash mismatch")
+        ),
+    ):
+        assert not M.execute(
+            plan, args, runner=lambda *a: pytest.fail("must not launch")
+        )
+    saved = M.read_json(args.output_dir / "matrix.json")
+    assert saved["status"] == "blocked" and "model hash" in saved["reason"]
+
+
+def test_resume_reuses_sealed_gate_and_retries_failed_performance(tmp_path):
+    values = fixture(tmp_path, variant="cpu")
+    plan, args = M.make_plan(*values), values[-1]
+    args.output_dir.mkdir()
+    job = plan["jobs"][0]
+    calls = []
+
+    def runner(command, env, log, timeout):
+        calls.append(command)
+        gates = "--through" in command
+        output = Path(command[command.index("--output-dir") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        M.RUN.COMMON.write_manifest(
+            output / ("acceptance.json" if gates else "manifest.json"), {"groups": []}
+        )
+        return {"returncode": 0 if gates or "--resume" in command else 1}
+
+    with (
+        patch.object(M.sys, "platform", "linux"),
+        patch.object(M.CHECK, "identity", return_value={"synthetic": True}),
+        patch.object(M, "verify_gate"),
+        patch.object(M, "verify_performance"),
+        patch.object(
+            M.RUN,
+            "summarize",
+            return_value={"rows": [], "best_observed_cost_points": []},
+        ),
+    ):
+        assert not M.execute(plan, args, runner)
+        gate_bytes = Path(job["gate_report"]).read_bytes()
+        assert M.execute(plan, args, runner)
+        assert len(calls) == 3 and "--resume" in calls[-1]
+        assert Path(job["gate_report"]).read_bytes() == gate_bytes
+        assert job["gates_process"]["reused_sealed_gate"]
+        Path(job["gate_report"]).write_text("changed", encoding="utf-8")
+        assert not M.execute(plan, args, runner)
+        assert len(calls) == 3  # A changed gate cannot trigger any benchmark.
+
+
+def test_failed_gate_uses_fresh_directory_on_resume(tmp_path):
+    values = fixture(tmp_path, variant="cpu")
+    plan, args = M.make_plan(*values), values[-1]
+    args.output_dir.mkdir()
+    attempts = []
+
+    def fail(command, env, log, timeout):
+        output = Path(command[command.index("--output-dir") + 1])
+        output.mkdir(parents=True)
+        attempts.append(output)
+        (output / "partial.json").write_text("{}", encoding="utf-8")
+        return {"returncode": 1}
+
+    with (
+        patch.object(M.sys, "platform", "linux"),
+        patch.object(M.CHECK, "identity", return_value={"synthetic": True}),
+    ):
+        assert not M.execute(plan, args, fail)
+        assert not M.execute(plan, args, fail)
+    assert attempts[0].name == "gates"
+    assert attempts[1].name == "gates-attempt-0002"
+    assert (attempts[0] / "partial.json").exists()
+
+
+@pytest.mark.parametrize(
+    "field", ["gate_command", "performance_command", "performance_settings", "topology"]
+)
+def test_resume_rejects_plan_mutation(tmp_path, field):
+    values = fixture(tmp_path)
+    expected, args = M.make_plan(*values), values[-1]
+    args.output_dir.mkdir()
+    M.RUN.COMMON.write_manifest(args.output_dir / "policy.json", values[2])
+    saved = copy.deepcopy(expected)
+    M.validate_resume(saved, expected, args)
+    if field == "topology":
+        saved[field]["storage_device_ids"] = [1, 2, 3, 4]
+    elif field == "performance_settings":
+        saved["jobs"][0][field]["seed"] += 1
+    else:
+        saved["jobs"][0][field].append("--extra")
+    with pytest.raises(ValueError, match="changed"):
+        M.validate_resume(saved, expected, args)
+
+
+def test_main_plans_and_resumes_without_cuda(tmp_path):
+    output = tmp_path / "matrix"
+    command = ["--output-dir", str(output)]
+    assert M.main(command) == 0
+    assert M.main(command + ["--resume"]) == 0
+    assert M.read_json(output / "decision-inputs.json")["slo_ms"]["p99_ttft_ms"] is None

@@ -60,6 +60,18 @@ def group(ratio, rates, effective=None):
 
 
 class CapacityTests(unittest.TestCase):
+    def test_allocated_ratio_includes_padding_and_records_basis(self):
+        data = group(2, [100] * 5)
+        data["capacity"][0].update(
+            allocated_compute_kv_bytes=128, allocated_backing_kv_bytes=320
+        )
+        row = RUN.summarize([data], 0.05, CAP.load_policy(None))["rows"][0]
+        self.assertEqual(row["backing_to_compute_kv_byte_ratios_by_rank"], [2.5])
+        self.assertEqual(row["aggregate_backing_to_compute_kv_byte_ratio"], 2.5)
+        self.assertEqual(
+            row["kv_byte_ratio_basis_by_rank"], ["allocated_storage_with_padding"]
+        )
+
     def test_slot_growth_without_byte_growth_is_not_a_plateau(self):
         groups = [group(1, [100] * 5), group(2, [101] * 5)]
         groups[1]["capacity"][0]["backing_kv_bytes"] = 100

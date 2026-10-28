@@ -114,6 +114,8 @@ def verify_capacities(capacities, stage, args, variant, ratio):
             verify_retained_pools(
                 capacity, required=stage.get("frozen_host_budget", False)
             )
+            if stage.get("gpu_memory_ledger"):
+                verify_memory_ledger(capacity, stage["gpu_memory_ledger"])
         if (
             variant != "hbm"
             and stage.get("physical_budget_exact", True)
@@ -194,6 +196,64 @@ def verify_retained_pools(capacity, *, required=False):
         raise ValueError("Retained GPU total bytes disagree with deduplicated storage")
 
 
+def verify_memory_ledger(capacity, contract):
+    ledger = capacity.get("gpu_memory_ledger", {})
+    groups = ledger.get("groups", {})
+    if (
+        ledger.get("schema_version") != 1
+        or ledger.get("contract") != contract
+        or set(groups)
+        != {
+            "kv",
+            "fixed",
+            "capacity_dependent",
+            "backend_specific",
+            "allocator_dynamic",
+        }
+    ):
+        raise ValueError("Missing or incompatible GPU memory ledger")
+    for name, group in groups.items():
+        verify_retained_pools(
+            group, required=name in ("kv", "fixed", "capacity_dependent")
+        )
+    verify_retained_pools(
+        {
+            "retained_gpu_pool_bytes": ledger.get("named_compute_bytes"),
+            "retained_gpu_pool_shapes": ledger.get("named_compute_shapes"),
+        },
+        required=True,
+    )
+    if any(
+        capacity.get(k) != groups["fixed"].get(k)
+        for k in ("retained_gpu_pool_bytes", "retained_gpu_pool_shapes")
+    ):
+        raise ValueError("Fixed GPU signature disagrees with memory ledger")
+    if (
+        capacity.get("allocated_compute_kv_bytes")
+        != groups["kv"]["retained_gpu_pool_bytes"]
+    ):
+        raise ValueError("Allocated KV bytes disagree with actual tensor storage")
+    for key in ("allocated_compute_kv_bytes", "allocated_backing_kv_bytes"):
+        if type(capacity.get(key)) is not int or capacity[key] <= 0:
+            raise ValueError("Missing positive allocated KV bytes")
+
+
+def enforce_point_memory(reference, capacities):
+    """Logical maps and backend descriptors are stable within one measured point."""
+    signature = [
+        {
+            key: copy.deepcopy(
+                p.get("gpu_memory_ledger", {}).get("groups", {}).get(key)
+            )
+            for key in ("capacity_dependent", "backend_specific")
+        }
+        for p in capacities
+    ]
+    if reference is not None and reference != signature:
+        raise ValueError("GPU metadata changed within the same capacity point")
+    return signature
+
+
 def decode_graph_enabled(server_info):
     """The new phase backend is authoritative; legacy bool is old-checkout fallback."""
     config = server_info.get("cuda_graph_config")
@@ -240,6 +300,9 @@ def enforce_fixed_compute(reference, capacities):
             capacity["compute_kv_bytes"],
             capacity.get("retained_gpu_pool_bytes"),
             copy.deepcopy(capacity.get("retained_gpu_pool_shapes")),
+            copy.deepcopy(
+                capacity.get("gpu_memory_ledger", {}).get("groups", {}).get("kv")
+            ),
         )
         for capacity in capacities
     ]
@@ -339,6 +402,7 @@ def execute(stage, args, manifest, path):
                 group["capacity"] = wait_capacities(
                     group["trace_dir"], stage, args, group["variant"], group["ratio"]
                 )
+                point_memory = enforce_point_memory(None, group["capacity"])
                 key = group["input_len"]
                 if group["variant"] != "hbm":
                     physical_references[key] = enforce_fixed_compute(
@@ -386,6 +450,7 @@ def execute(stage, args, manifest, path):
                             enforce_fixed_compute(
                                 physical_references[key], case["idle_capacity"]
                             )
+                            enforce_point_memory(point_memory, case["idle_capacity"])
                         COMMON.write_manifest(
                             args.output_dir / f"{case['id']}-timing.json",
                             case["analysis"],
@@ -424,7 +489,7 @@ def new_manifest(stage, args, groups, kind):
         allocator_config=os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
         allocator_config_new=os.environ.get("PYTORCH_ALLOC_CONF"),
     )
-    return {
+    manifest = {
         "analysis_policy": load("capacity_analysis").load_policy(
             getattr(args, "analysis_policy", None)
         ),
@@ -440,6 +505,10 @@ def new_manifest(stage, args, groups, kind):
         "runtime": runtime,
         "groups": groups,
     }
+    load("capacity_analysis").verify_manifest_scope(
+        manifest["analysis_policy"], manifest
+    )
+    return manifest
 
 
 def main():
