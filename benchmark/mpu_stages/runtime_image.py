@@ -8,9 +8,11 @@ This is separate from the upstream Dockerfile's BUILD_TYPE=all route.
 import argparse
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tarfile
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -46,9 +48,114 @@ def verify_base_reference(reference, expected):
     return details[0]
 
 
-def prepare(native_result, output, base_image_id, tag):
-    import re
+def runtime_config(prefix, commit, base):
+    environment = dict(item.split("=", 1) for item in base.get("Env") or [])
+    return {
+        "Env": {
+            "PATH": prefix
+            + "/runtime/bin:"
+            + environment.get(
+                "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+            "PYTHONPATH": prefix + "/source/python",
+            "CUDA_HOME": prefix + "/toolchain/lib/python3.12/site-packages/nvidia/cu13",
+            "CXX": "/usr/bin/g++-13",
+            "MAX_JOBS": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        "Labels": {
+            "org.opencontainers.image.revision": commit,
+            "ai.sglang.mpu.build_route": "verified-native-runtime",
+        },
+        "WorkingDir": prefix + "/source",
+        "Entrypoint": [prefix + "/runtime/bin/python", "-m", "sglang.launch_server"],
+        "Cmd": ["--help"],
+    }
 
+
+def verify_runtime_config(expected, actual):
+    for key in ("WorkingDir", "Entrypoint", "Cmd"):
+        if actual.get(key) != expected[key]:
+            raise ValueError(
+                f"Runtime image {key} differs from the prepared configuration"
+            )
+    environment = dict(item.split("=", 1) for item in actual.get("Env") or [])
+    for key, value in expected["Env"].items():
+        if environment.get(key) != value:
+            raise ValueError(f"Runtime image environment differs: {key}")
+    for key, value in expected["Labels"].items():
+        if (actual.get("Labels") or {}).get(key) != value:
+            raise ValueError(f"Runtime image label differs: {key}")
+
+
+def build_single_commit(plan, output):
+    """Avoid VFS copying the entire rootfs for each Dockerfile metadata step."""
+    container = None
+    with (output / "docker-build.log").open("w") as log:
+        try:
+            created = subprocess.check_output(
+                [
+                    "docker",
+                    "create",
+                    "--name",
+                    "mpu-image-" + uuid.uuid4().hex,
+                    "--network",
+                    "none",
+                    "--entrypoint",
+                    "/bin/true",
+                    plan["base_reference"],
+                ],
+                text=True,
+                stderr=log,
+            ).strip()
+            if not re.fullmatch(r"[0-9a-f]{64}", created):
+                raise ValueError("Docker create returned no valid container identity")
+            container = created
+            with (output / "environment.tar").open("rb") as archive:
+                subprocess.run(
+                    ["docker", "cp", "-", container + ":/"],
+                    stdin=archive,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                )
+            changes = []
+            config = plan["runtime_config"]
+            for instruction, key in (("LABEL", "Labels"), ("ENV", "Env")):
+                for name, value in config[key].items():
+                    changes.extend(
+                        ["--change", f"{instruction} {name}={json.dumps(value)}"]
+                    )
+            for instruction, key in (
+                ("WORKDIR", "WorkingDir"),
+                ("ENTRYPOINT", "Entrypoint"),
+                ("CMD", "Cmd"),
+            ):
+                value = config[key]
+                changes.extend(
+                    [
+                        "--change",
+                        instruction
+                        + " "
+                        + (json.dumps(value) if isinstance(value, list) else value),
+                    ]
+                )
+            subprocess.run(
+                ["docker", "commit", *changes, container, plan["image_tag"]],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=True,
+            )
+        finally:
+            if container:
+                subprocess.run(
+                    ["docker", "rm", "--force", container],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+
+
+def prepare(native_result, output, base_image_id, tag):
     if sys.platform != "linux":
         raise ValueError("Package Linux environments on the Linux build host")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", base_image_id):
@@ -135,6 +242,17 @@ CMD ["--help"]
         "native_extensions": result["wheel"]["packaged_extensions"],
         "all_dependencies_locked": False,
         "gpu_model_validated": False,
+        "packaging_strategy": (
+            "single_commit"
+            if subprocess.check_output(
+                ["docker", "info", "--format", "{{.Driver}}"], text=True
+            ).strip()
+            == "vfs"
+            else "dockerfile"
+        ),
+        "runtime_config": runtime_config(
+            str(prefix), result["plan"]["source_commit"], details.get("Config") or {}
+        ),
     }
     BUILD.write_json(output / "image-plan.json", plan)
     return plan
@@ -157,7 +275,13 @@ def execute(output):
         "gpu_model_validated": False,
     }
     try:
-        verify_base_reference(plan["base_reference"], plan["base_image_id"])
+        base = verify_base_reference(plan["base_reference"], plan["base_image_id"])
+        if "runtime_config" in plan and plan["runtime_config"] != runtime_config(
+            plan["prefix"], plan["source_commit"], base.get("Config") or {}
+        ):
+            raise ValueError(
+                "Prepared runtime configuration differs from the pinned inputs"
+            )
         command = [
             "docker",
             "build",
@@ -168,14 +292,21 @@ def execute(output):
             plan["image_tag"],
             str(output),
         ]
-        with (output / "docker-build.log").open("w") as log:
-            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+        if plan.get("packaging_strategy") == "single_commit":
+            build_single_commit(plan, output)
+        else:
+            with (output / "docker-build.log").open("w") as log:
+                subprocess.run(
+                    command, stdout=log, stderr=subprocess.STDOUT, check=True
+                )
         details = json.loads(
             subprocess.check_output(
                 ["docker", "image", "inspect", plan["image_tag"]], text=True
             )
         )[0]
         image_id = details["Id"]
+        if "runtime_config" in plan:
+            verify_runtime_config(plan["runtime_config"], details["Config"])
         verify_base_reference(plan["base_reference"], plan["base_image_id"])
         layers = plan["base_rootfs_layers"]
         if details["RootFS"]["Layers"][: len(layers)] != layers:
