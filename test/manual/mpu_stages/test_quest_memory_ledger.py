@@ -91,6 +91,7 @@ def fixture(variant="mpu", mapping_size=512):
         token_to_kv_pool_allocator=SimpleNamespace(
             full_to_hisparse_device_index_mapping=mapping,
             hisparse_attn_allocator=SimpleNamespace(free_pages=Tensor(14)),
+            logical_attn_allocator=SimpleNamespace(free_pages=Tensor(17)),
         ),
         req_to_device_buffer=Tensor(15),
         num_real_reqs=Tensor(16),
@@ -142,7 +143,9 @@ def test_every_persistent_selector_tensor_is_inventoried_including_future_fields
         in LEDGER.collect_quest_memory(value)["retained_gpu_pool_shapes"]
     )
     tree = ast.parse(
-        (ROOT / "python/sglang/srt/managers/hisparse_coordinator.py").read_text()
+        (ROOT / "python/sglang/srt/managers/hisparse_coordinator.py").read_text(
+            encoding="utf-8"
+        )
     )
     method = next(
         n
@@ -150,3 +153,33 @@ def test_every_persistent_selector_tensor_is_inventoried_including_future_fields
         if isinstance(n, ast.FunctionDef) and n.name == "get_stage_capacity_info"
     )
     assert "self._quest_memory_ledger()" in ast.unparse(method)
+
+
+def test_streams_are_not_tensors_and_allocator_tensor_lists_are_reported():
+    value = fixture()
+    value.write_staging_stream = SimpleNamespace(device=Device())
+    value.mem_pool_host._local_refs = value.mem_pool_device.k_buffer
+    value.token_to_kv_pool_allocator.hisparse_attn_allocator.free_group = [
+        Tensor(42, 256)
+    ]
+    result = LEDGER.collect_quest_memory(value)
+    assert (
+        result["gpu_memory_ledger"]["groups"]["allocator_dynamic"][
+            "retained_gpu_pool_bytes"
+        ]
+        == 384
+    )
+    assert "coordinator.write_staging_stream" not in result["retained_gpu_pool_shapes"]
+
+
+def test_actual_ledger_contract_and_within_point_guards():
+    run = load("benchmark/mpu_stages/run.py", "ledger_runner")
+    cap = LEDGER.collect_quest_memory(fixture())
+    run.verify_memory_ledger(cap, "qwen_quest_v1")
+    reference = run.enforce_point_memory(None, [cap])
+    changed = LEDGER.collect_quest_memory(fixture(mapping_size=1024))
+    with pytest.raises(ValueError, match="same capacity point"):
+        run.enforce_point_memory(reference, [changed])
+    cap["allocated_compute_kv_bytes"] -= 64
+    with pytest.raises(ValueError, match="actual tensor storage"):
+        run.verify_memory_ledger(cap, "qwen_quest_v1")
