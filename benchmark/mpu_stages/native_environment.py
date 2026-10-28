@@ -279,6 +279,27 @@ def build_env(prefix, cache, offline):
     return env
 
 
+def check_required_os_packages(required, snapshot):
+    """Reject missing or partially installed native build/runtime prerequisites."""
+    if not isinstance(required, list) or not required:
+        raise ValueError("Native profile must declare required_os_packages")
+    states = {}
+    for line in snapshot.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2:
+            raise ValueError("Invalid dpkg package status output")
+        package, status = fields
+        name, separator, arch = package.partition(":")
+        if not separator or arch in ("amd64", "all"):
+            states[name] = status
+    missing = [name for name in required if states.get(name) != "installed"]
+    if missing:
+        raise ValueError(
+            "Missing or not fully installed OS packages: " + ", ".join(missing)
+        )
+    return {name: states[name] for name in required}
+
+
 def execute(output, cache, wheelhouse=None, offline=False):
     output, cache = Path(output).resolve(), Path(cache).resolve()
     plan = json.loads((output / "native-plan.json").read_text(encoding="utf-8"))
@@ -362,6 +383,17 @@ def execute(output, cache, wheelhouse=None, offline=False):
             "kernel": platform.release(),
             "python": platform.python_version(),
         }
+        packages = run(
+            "required-os-packages",
+            [
+                "dpkg-query",
+                "-W",
+                "-f=${binary:Package}\t${db:Status-Status}\n",
+            ],
+        )
+        result["required_os_packages"] = check_required_os_packages(
+            plan["profile"].get("required_os_packages"), packages.read_text()
+        )
         for name, command, version in (
             ("uv", ["uv", "--version"], "0.13.5"),
             ("rustc", ["rustc", "--version"], "1.99.1"),
