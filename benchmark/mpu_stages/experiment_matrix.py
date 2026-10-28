@@ -27,6 +27,11 @@ STAGE, RUN, CORRECT, ACCEPT, CAP = [
     load(name)
     for name in ("stage", "run", "correctness", "acceptance", "capacity_analysis")
 ]
+PAIRED, CHECK, DECISION = (
+    load("paired_run"),
+    load("checkpoint"),
+    load("decision_policy"),
+)
 
 
 def digest(path):
@@ -203,6 +208,7 @@ def make_plan(matrix, stage, policy, args):
         else []
     )
     profiles = args.profiles or (["baseline", "capacity"] if is_mpu else ["baseline"])
+    DECISION.verify_scope(policy, stage, storage)
     if len(set(profiles)) != len(profiles) or (not is_mpu and "capacity" in profiles):
         raise ValueError(
             "Capacity scanning belongs to MPU stages; profiles cannot repeat"
@@ -276,8 +282,13 @@ def make_plan(matrix, stage, policy, args):
                 "gate_command": gate_command + ["--execute"],
                 "performance_command": [
                     sys.executable,
-                    str(HERE / "run.py"),
+                    str(HERE / "paired_run.py"),
                     *perf,
+                    *(
+                        ["--model-manifest", str(args.model_manifest)]
+                        if args.model_manifest
+                        else []
+                    ),
                     "--execute",
                 ],
                 "gate_report": str(root / "gates/acceptance.json"),
@@ -305,7 +316,7 @@ def make_plan(matrix, stage, policy, args):
         },
         "jobs": jobs,
         "claim": "Planned commands are not GPU/model/performance evidence. +0 uses CPU DDR backing.",
-        "run_order": "Profiles in listed order; within each input length CPU first, MPU ratios increasing; paired repeat seeds. Fixed-order drift is not covered by bootstrap.",
+        "run_order": "Seeded cyclic counterbalance across CPU/MPU variants per input length and repeat; shared shuffled concurrency order. Resume retries incomplete paired blocks in full.",
         "decision_inputs_pending": [
             k
             for k, ready in (
@@ -446,7 +457,14 @@ def verify_performance(report, stage, job):
     ):
         raise ValueError("Incomplete performance groups")
     references = {}
-    _, args = STAGE.parse_args(job["performance_command"][2:])
+    _, args, _ = PAIRED.parse_args(job["performance_command"][2:])
+    paired = report.get("paired_execution")
+    if paired:
+        PAIRED.validate_schedule(
+            report, PAIRED.schedule(RUN.make_plan(stage, args), args.repeats, args.seed)
+        )
+        if PAIRED.assemble(stage, args, report) != report["groups"]:
+            raise ValueError("Performance samples disagree with sealed paired blocks")
     for actual, planned in zip(report["groups"], job["performance_groups"]):
         if actual.get("decode_cuda_graph_enabled") is not True:
             raise ValueError(
@@ -467,7 +485,11 @@ def verify_performance(report, stage, job):
         for case, planned_case in zip(actual["cases"], planned["cases"]):
             if case.get("status") != "success" or any(
                 case.get(k) != planned_case[k]
-                for k in ("id", "repeat", "concurrency", "command")
+                for k in (
+                    ("id", "repeat", "concurrency")
+                    if paired
+                    else ("id", "repeat", "concurrency", "command")
+                )
             ):
                 raise ValueError("Performance repeat differs from plan or failed")
             idle = RUN.verify_capacities(
@@ -489,6 +511,19 @@ def execute(manifest, args, runner=ACCEPT.run_command):
         )
         RUN.COMMON.write_manifest(path, manifest)
         return False
+    try:
+        identity = CHECK.identity(
+            RUN.COMMON, ACCEPT, manifest["stage"], args, args.model_manifest
+        )
+        if manifest.get("execution_identity") is not None:
+            CHECK.same_identity(manifest["execution_identity"], identity)
+    except (OSError, ValueError, TypeError, RuntimeError) as error:
+        manifest.update(status="blocked", reason=str(error))
+        RUN.COMMON.write_manifest(path, manifest)
+        return False
+    manifest.pop("reason", None)
+    manifest["execution_identity"] = identity
+    manifest["execution_attempt"] = manifest.get("execution_attempt", 0) + 1
     stopping = False
     for job in manifest["jobs"]:
         if stopping:
@@ -506,18 +541,37 @@ def execute(manifest, args, runner=ACCEPT.run_command):
                     verify_performance,
                 ),
             ):
-                result = runner(
-                    job[command_key],
-                    RUN.COMMON.subprocess_env(),
-                    args.output_dir / f"{job['id']}-{phase}.log",
-                    args.job_timeout,
-                )
+                command = job[command_key].copy()
+                if phase == "gates" and job.get("gates_receipt"):
+                    CHECK.verify(Path(job[report_key]).parent, job["gates_receipt"])
+                    result = {"returncode": 0, "reused_sealed_gate": True}
+                else:
+                    if phase == "gates" and Path(job[report_key]).parent.exists():
+                        new_dir = (
+                            Path(job[report_key]).parent.parent
+                            / f"gates-attempt-{manifest['execution_attempt']:04d}"
+                        )
+                        command[command.index("--output-dir") + 1] = str(new_dir)
+                        job[command_key] = command.copy()
+                        job[report_key] = str(new_dir / "acceptance.json")
+                    if phase == "performance" and Path(job[report_key]).exists():
+                        command.append("--resume")
+                    result = runner(
+                        command,
+                        RUN.COMMON.subprocess_env(),
+                        args.output_dir
+                        / f"{job['id']}-{phase}-attempt-{manifest['execution_attempt']:04d}.log",
+                        args.job_timeout,
+                    )
                 job[phase + "_process"] = result
                 if result["returncode"]:
                     raise ValueError(f"{phase} process failed; later work is blocked")
                 report = read_json(job[report_key])
                 verifier(report, manifest["stage"], job)
                 job[phase + "_sha256"] = digest(job[report_key])
+                if phase == "gates":
+                    job["gates_receipt"] = CHECK.seal(Path(job[report_key]).parent)
+                    RUN.COMMON.write_manifest(path, manifest)
             summary = RUN.summarize(
                 report["groups"],
                 manifest["matrix"]["plateau_threshold"],
@@ -550,6 +604,47 @@ def execute(manifest, args, runner=ACCEPT.run_command):
     return not stopping
 
 
+def validate_resume(manifest, expected, args):
+    """Check the saved plan again under the lock before executing any command."""
+    for key in ("matrix", "stage", "analysis_policy", "topology"):
+        if manifest.get(key) != expected[key]:
+            raise ValueError(f"Resume plan changed: {key}")
+    if (
+        read_json(args.stage) != expected["stage"]
+        or read_json(args.output_dir / "policy.json") != expected["analysis_policy"]
+    ):
+        raise ValueError("Saved stage/policy snapshots changed")
+    if len(manifest["jobs"]) != len(expected["jobs"]):
+        raise ValueError("Resume profiles changed")
+    for actual, planned in zip(manifest["jobs"], expected["jobs"]):
+        for key in (
+            "id",
+            "profile",
+            "correctness_groups",
+            "performance_groups",
+            "performance_command",
+            "performance_settings",
+            "performance_report",
+        ):
+            if actual.get(key) != planned[key]:
+                raise ValueError(f"Resume workload or command changed: {key}")
+        command = actual["gate_command"].copy()
+        index = command.index("--output-dir") + 1
+        directory = Path(command[index])
+        root = Path(planned["gate_report"]).parent.parent
+        allowed = {root / "gates"} | {
+            root / f"gates-attempt-{n:04d}"
+            for n in range(1, manifest.get("execution_attempt", 0) + 1)
+        }
+        if directory not in allowed or actual["gate_report"] != str(
+            directory / "acceptance.json"
+        ):
+            raise ValueError("Resume gate evidence path changed")
+        command[index] = planned["gate_command"][index]
+        if command != planned["gate_command"]:
+            raise ValueError("Resume gate command changed")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--matrix", type=Path, default=HERE / "experiment-matrix.json")
@@ -565,6 +660,7 @@ def main(argv=None):
     parser.add_argument("--job-timeout", type=int, default=604800)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     for key in ("stage", "matrix", "policy", "output_dir", "model_manifest"):
         if getattr(args, key) is not None:
@@ -578,19 +674,29 @@ def main(argv=None):
         STAGE.load_stage(args.stage),
         CAP.load_policy(args.policy),
     )
+    args.model = args.model or stage["default_model"]
     make_plan(matrix, stage, policy, args)  # Reject bad inputs before creating output.
     inputs = {
         key: {"path": str(getattr(args, key)), "sha256": digest(getattr(args, key))}
         for key in ("stage", "matrix", "policy")
     }
-    args.output_dir.mkdir(parents=True, exist_ok=False)
+    if not args.resume:
+        args.output_dir.mkdir(parents=True, exist_ok=False)
     args.stage = args.output_dir / "stage.json"
-    RUN.COMMON.write_manifest(args.stage, stage)
-    RUN.COMMON.write_manifest(args.output_dir / "policy.json", policy)
-    manifest = make_plan(matrix, stage, policy, args)
-    manifest["inputs"] = inputs
-    manifest["runtime"] = RUN.COMMON.runtime_info()
-    RUN.COMMON.write_manifest(args.output_dir / "matrix.json", manifest)
+    if args.resume:
+        expected = make_plan(matrix, stage, policy, args)
+        manifest = read_json(args.output_dir / "matrix.json")
+        validate_resume(manifest, expected, args)
+    else:
+        RUN.COMMON.write_manifest(args.stage, stage)
+        RUN.COMMON.write_manifest(args.output_dir / "policy.json", policy)
+        manifest = make_plan(matrix, stage, policy, args)
+        manifest["inputs"] = inputs
+        manifest["runtime"] = RUN.COMMON.runtime_info()
+        RUN.COMMON.write_manifest(
+            args.output_dir / "decision-inputs.json", DECISION.template(manifest)
+        )
+        RUN.COMMON.write_manifest(args.output_dir / "matrix.json", manifest)
     previous = None
     if sys.platform == "linux":
 
@@ -599,7 +705,14 @@ def main(argv=None):
 
         previous = signal.signal(signal.SIGTERM, interrupt)
     try:
-        passed = execute(manifest, args) if args.execute else True
+        if args.execute:
+            with CHECK.exclusive(args.output_dir):
+                if args.resume:
+                    manifest = read_json(args.output_dir / "matrix.json")
+                    validate_resume(manifest, expected, args)
+                passed = execute(manifest, args)
+        else:
+            passed = True
     finally:
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)

@@ -3,6 +3,8 @@
 项目正式实验矩阵、容量扫描和验收判据见 [EXPERIMENT_MATRIX.md](EXPERIMENT_MATRIX.md)。
 `experiment_matrix.py` 将这些配置接入现有门禁与运行器；默认仅生成计划，
 Qwen 1+4 使用独立 topology，SLO/报价未填写时不生成经济验收结论。
+正式矩阵使用 `paired_run.py` 轮换 CPU/MPU 顺序，并支持整块断点续跑；
+`decision_policy.py` 提供待填 SLO/成本模板及无需 GPU 的独立重分析。
 
 四个多卡阶段现使用 **Attention-DP4 + EP4（有效 Attention/MoE TP=1）**，
 并行约束、逐 owner 故障恢复与 DP 计时规则见 [ATTENTION_DP_EP.md](ATTENTION_DP_EP.md)。

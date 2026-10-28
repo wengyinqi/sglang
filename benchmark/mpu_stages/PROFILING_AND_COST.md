@@ -80,7 +80,12 @@ DP4 只扣除全局纯 prefill 的 EP 步骤，混合 prefill/decode 步骤完�
 实际分配容量未增加、样本缺失、结果波动跨越阈值，都不会给出平台结论；明确下降记为
 regression。区间不覆盖运行顺序、温度、频率、工作负载变化或扣除 prefill 的系统偏差。
 
-先复制 `analysis-policy.example.json`，填入团队选定的 SLO 和每个**完整配置**的小时成本。
+优先使用矩阵自动生成的 `decision-inputs.json`，保持未确定的 SLO/价格为 `null`，
+后续用 `decision_policy.py compile/review` 校验与重分析（命令见实验矩阵文档）。
+策略的 `topology_scope` 绑定模型/revision、selector、计算卡数和存储 ordinal；
+独立 `capacity_analysis.py` 同样拒绝把 1+1 的成本用于 1+4 的测量。
+手动策略可参考 `analysis-policy.example.json`，同时填写上述 scope。
+填入团队选定的 SLO 和每个**完整配置**的小时成本。
 成本条目格式为 `{"variant":"mpu","ratio":2,"hourly_cost":YOUR_NUMBER}`。
 `currency`、`source` 和 `cost_basis` 必填后才能使用成本；`cost_basis` 分别用
 `simulator_hardware` 或 `hypothetical_mpu` 区分 H200 模拟器与假设 MPU 的经济模型。
