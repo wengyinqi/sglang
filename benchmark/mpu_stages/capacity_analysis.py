@@ -173,6 +173,11 @@ def enrich(summary, groups, policy):
             )
             for p in capacities
         ]
+        byte_ratios = row["backing_to_compute_kv_byte_ratios_by_rank"]
+        if byte_ratios and all(value is not None for value in byte_ratios):
+            row["aggregate_backing_to_compute_kv_byte_ratio"] = sum(
+                p["backing_kv_bytes"] for p in capacities
+            ) / sum(p["compute_kv_bytes"] for p in capacities)
         row["slo"] = {
             "status": "not_specified",
             "scope": "each successful repeat's measured request-latency metric",
@@ -204,9 +209,18 @@ def enrich(summary, groups, policy):
             )
         if prior and prior[1] == ids:
             prev_row, _, prev_rates, prev_effective = prior
+            prev_bytes = prev_row["backing_to_compute_kv_byte_ratios_by_rank"]
             increased = len(effective) == len(prev_effective) > 0 and all(
                 a is not None and b is not None and a > b
                 for a, b in zip(effective, prev_effective)
+            )
+            increased = (
+                increased
+                and len(byte_ratios) == len(prev_bytes)
+                and all(
+                    a is not None and b is not None and a > b
+                    for a, b in zip(byte_ratios, prev_bytes)
+                )
             )
             interval = bootstrap(rates, prev_rates)
             row["marginal_decode_gain_ci95"] = interval
@@ -255,6 +269,7 @@ def enrich(summary, groups, policy):
             ):
                 eligible[key] = row
     summary["analysis_policy"] = policy
+    add_cpu_comparisons(summary, groups, policy)
     summary["best_observed_cost_points"] = [
         {k: row[k] for k in ("input_len", "concurrency", "variant", "ratio", "cost")}
         for row in eligible.values()
@@ -271,6 +286,108 @@ def enrich(summary, groups, policy):
         ],
     }
     return summary
+
+
+def add_cpu_comparisons(summary, groups, policy):
+    """Compare within one run/topology only; a large CPU budget is not matched capacity."""
+    for row in summary["rows"]:
+        if row["variant"] != "mpu":
+            continue
+        reference = [
+            g
+            for g in groups
+            if g["variant"] == "cpu" and g["input_len"] == row["input_len"]
+        ]
+        row["cpu_reference"] = {"status": "missing_or_ambiguous_reference"}
+        if len(reference) != 1:
+            continue
+        target = next(
+            g
+            for g in groups
+            if (g["variant"], g["input_len"], g["ratio"])
+            == (row["variant"], row["input_len"], row["ratio"])
+        )
+        capacities = [g.get("capacity") or [] for g in (reference[0], target)]
+        fields = (
+            "physical_compute_slots",
+            "compute_kv_bytes",
+            "retained_gpu_pool_bytes",
+            "retained_gpu_pool_shapes",
+        )
+        if (
+            not capacities[0]
+            or len(capacities[0]) != len(capacities[1])
+            or any(
+                type(p.get(k)) is not int or p[k] <= 0
+                for pool in capacities
+                for p in pool
+                for k in ("physical_compute_slots", "compute_kv_bytes")
+            )
+            or any(
+                any(a.get(k) != b.get(k) for k in fields) for a, b in zip(*capacities)
+            )
+        ):
+            row["cpu_reference"] = {"status": "compute_budget_unknown_or_different"}
+            continue
+        samples = [
+            [c for c in g["cases"] if c["concurrency"] == row["concurrency"]]
+            for g in (reference[0], target)
+        ]
+        if any(
+            len(cases) < policy["minimum_repeats"]
+            or any(c["status"] != "success" for c in cases)
+            for cases in samples
+        ):
+            row["cpu_reference"] = {"status": "insufficient_complete_repeats"}
+            continue
+        indexed = [{c["repeat"]: c for c in cases} for cases in samples]
+        if set(indexed[0]) != set(indexed[1]):
+            row["cpu_reference"] = {"status": "unpaired_repeats"}
+            continue
+        methods = {
+            c["analysis"]["decode_only_estimate"].get("method")
+            for cases in samples
+            for c in cases
+        }
+        if len(methods) != 1 or None in methods:
+            row["cpu_reference"] = {"status": "incompatible_decode_methods"}
+            continue
+        ids = sorted(indexed[0])
+        result = {
+            "status": "compared",
+            "requested_ratio": reference[0]["ratio"],
+            "requested_capacity_matched": reference[0]["ratio"] == row["ratio"],
+            "physical_capacity_match_proven": all(
+                a.get("backing_kv_bytes") is not None
+                and a.get("backing_kv_bytes") == b.get("backing_kv_bytes")
+                and a.get("backing_slots") is not None
+                and a.get("backing_slots") == b.get("backing_slots")
+                for a, b in zip(*capacities)
+            ),
+            "cpu_backing_kv_bytes_by_rank": [
+                p.get("backing_kv_bytes") for p in capacities[0]
+            ],
+            "mpu_backing_kv_bytes_by_rank": [
+                p.get("backing_kv_bytes") for p in capacities[1]
+            ],
+        }
+        for label, section, field in (
+            (
+                "decode_estimate_gain_ci95",
+                "decode_only_estimate",
+                "decode_throughput_tokens_per_second",
+            ),
+            (
+                "actual_output_gain_ci95",
+                "end_to_end",
+                "output_throughput_tokens_per_second",
+            ),
+        ):
+            values = [
+                [index[i]["analysis"][section][field] for i in ids] for index in indexed
+            ]
+            result[label] = bootstrap(values[1], values[0])
+        row["cpu_reference"] = result
 
 
 def main(argv=None):
