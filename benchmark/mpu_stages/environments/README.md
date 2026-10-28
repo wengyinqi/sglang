@@ -75,12 +75,13 @@ Linux 文件系统，避免将 Docker overlay 数据直接放在 Windows 挂载�
 ### Ubuntu 24.04 原生构建的系统依赖
 
 `native_environment.py execute` 在安装 Python 依赖和编译前，检查
-`native-platform.json` 列出的系统包是否已完整安装。编译工具之外还需要
+`native-platform.json` 列出的系统包是否已完整安装。`python3-dev` 提供 DSA
+radix-tree 扩展编译所需的 `Python.h`。编译工具之外还需要
 `libnuma1`，供 `sglang-kernel` 加载 `libnuma.so.1`；仅安装 CUDA/Python wheel
 不能补齐这个系统库。缺包、仅残留配置或错误架构的包均不能通过检查。
 
 ```bash
-sudo apt-get install -y python3 python3-venv gcc-13 g++-13 pkg-config \
+sudo apt-get install -y python3 python3-venv python3-dev gcc-13 g++-13 pkg-config \
   libssl-dev protobuf-compiler git ninja-build libnuma1
 ```
 
