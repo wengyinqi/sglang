@@ -55,8 +55,10 @@
 - `capacity`：CPU 比例固定 8，MPU 扫描 1、2、4、8。V4/GLM 同时固定 host/index 地址
   预算。这个 CPU 参考是固定的大容量基线，不能称为每个 MPU 点的等容量对照。
 
-每个输入长度内，所有点必须保持实际计算 KV slots、bytes 和模型留存 GPU 池的
-形状/stride/dtype/storage 别名一致。不同上下文长度单独形成曲线，不自动合并。
+每个输入长度内，所有点必须保持实际计算 KV slots、bytes 一致。V4/GLM 还强制核对
+模型留存 GPU 池的形状/stride/dtype/storage 别名。Qwen 当前容量报告仅覆盖 K/V 层，
+排除 Quest selector 元数据；因此其固定预算结论只针对 K/V 池，不能扩大为整个 GPU
+分配已冻结。不同上下文长度单独形成曲线，不自动合并。
 容量比使用 **实际后备 KV 分配字节 / 实际计算 KV 分配字节**，逐 rank 和汇总均保存；
 汇总为 `sum(backing_kv_bytes) / sum(compute_kv_bytes)`。同时保留 slot 比例、单位、
 padding 和 GPU 留存池。不得使用显卡标称显存或仅用卡数代替实际 KV 容量比。
