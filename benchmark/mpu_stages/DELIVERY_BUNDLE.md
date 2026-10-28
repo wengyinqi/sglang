@@ -27,8 +27,9 @@ graph eligibility 投票、abort/retract 后全量重分配，以及缺 rank 的
 不执行 HTTP abort API、GPU KV 数据读写、模型 forward 或 DeepEP/NVSHMEM。
 CUDA 流竞态、P2P 数据正确性、模型输出和性能必须在机器到位后另行验收。
 
-`.github/workflows/mpu-cpu-control.yml` 在六个实验分支的 push/PR 上执行 CPU 验收，
-并保留日志、JUnit 和进程证据；不修改 main 或官方 HiSparse 分支。
+六个实验分支使用已登记的 `.github/workflows/run-cpu-ci.yml` 入口，调用可复用的
+`mpu-cpu-control.yml`，在 push/PR 或手动 dispatch 时执行 CPU 验收。保留日志、JUnit
+和进程证据，并核对实际测试 SHA；不修改 main 或官方 HiSparse 分支。
 
 ## 生成交付包
 

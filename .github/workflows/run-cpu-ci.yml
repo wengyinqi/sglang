@@ -1,0 +1,23 @@
+name: MPU CPU acceptance entry
+run-name: MPU CPU ${{ github.ref_name }}
+
+on:
+  push:
+    branches: ['mpu-exp/**']
+  pull_request:
+    branches: ['mpu-exp/**']
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Optional expected commit SHA (must equal the selected ref)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    uses: ./.github/workflows/mpu-cpu-control.yml
+    with:
+      expected_sha: ${{ inputs.git_ref || github.sha }}
