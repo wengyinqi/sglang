@@ -1,0 +1,75 @@
+name: MPU Linux offline delivery
+run-name: MPU Linux delivery ${{ github.ref_name }}
+
+on:
+  push:
+    branches: ['mpu-exp/**']
+    paths:
+      - '.github/workflows/mpu-linux-delivery.yml'
+      - 'benchmark/mpu_stages/ci_native_delivery.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  delivery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      CUDA_VISIBLE_DEVICES: ''
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      LD_LIBRARY_PATH: /usr/local/cuda-13.0/compat
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      RUSTUP_TOOLCHAIN: 1.99.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - id: source
+        name: Record the exact stage and commit
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          /usr/bin/python3 -c 'import json,os; stage=json.load(open("benchmark/mpu_stages/stage.json"))["id"]; open(os.environ["GITHUB_OUTPUT"],"a").write("stage="+stage+"\n")'
+      - name: Prepare disposable hosted runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          # These are preinstalled SDKs on this disposable hosted runner only.
+          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-venv python3-dev gcc-13 g++-13 pkg-config libssl-dev protobuf-compiler git ninja-build libnuma1 curl ca-certificates
+          sudo mkdir -p /opt/mpu
+          sudo chown "$(id -u):$(id -g)" /opt/mpu
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/mpu-bootstrap"
+          "$RUNNER_TEMP/mpu-bootstrap/bin/pip" install uv==0.13.5
+          printf '%s\n' "$RUNNER_TEMP/mpu-bootstrap/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.99.1 --profile minimal
+          curl --fail --location --retry 3 'https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-compat-13-0_580.82.07-0ubuntu1_amd64.deb' --output "$RUNNER_TEMP/cuda-compat.deb"
+          printf '24ac8323d11760e8d080a2d3eb3ba418987353beadedbd08121a1f4d72b8f620  %s\n' "$RUNNER_TEMP/cuda-compat.deb" | sha256sum --check -
+          sudo dpkg -i "$RUNNER_TEMP/cuda-compat.deb"
+          df -h /
+      - name: Build, export and independently restore
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          STAGE: ${{ steps.source.outputs.stage }}
+        run: |
+          /usr/bin/python3 benchmark/mpu_stages/ci_native_delivery.py --stage "$STAGE" --expected-sha "$EXPECTED_SHA" --compat-deb "$RUNNER_TEMP/cuda-compat.deb" --output "$GITHUB_WORKSPACE/ci-delivery-output"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-evidence-${{ steps.source.outputs.stage }}-${{ github.sha }}
+          path: |
+            ci-delivery-output/
+            !ci-delivery-output/bundle/**
+            !ci-delivery-output/image/environment.tar
+          compression-level: 1
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: offline-bundle-${{ steps.source.outputs.stage }}-${{ github.sha }}
+          path: ci-delivery-output/bundle/
+          compression-level: 0
+          retention-days: 1
