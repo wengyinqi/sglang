@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import json
 import subprocess
 import tarfile
 import tempfile
@@ -23,9 +24,56 @@ def load(name):
 
 
 NATIVE, IMAGE = load("native_environment"), load("runtime_image")
+CI = load("ci_native_delivery")
 
 
 class NativeEnvironmentTests(unittest.TestCase):
+    def test_ci_requires_the_exact_checked_out_stage_and_commit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repo = Path(folder)
+            recipe = repo / "benchmark/mpu_stages/stage.json"
+            recipe.parent.mkdir(parents=True)
+            recipe.write_text(json.dumps({"id": CI.STAGES[0]}))
+            for args in (
+                ["init", "-q"],
+                ["add", "."],
+                [
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+            ):
+                subprocess.run(
+                    ["git", "-C", str(repo), *args], check=True, capture_output=True
+                )
+            commit = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            CI.validate_checkout(repo, CI.STAGES[0], commit)
+            with self.assertRaisesRegex(ValueError, "Checkout commit or stage"):
+                CI.validate_checkout(repo, CI.STAGES[1], commit)
+            with self.assertRaisesRegex(ValueError, "Checkout commit or stage"):
+                CI.validate_checkout(repo, CI.STAGES[0], "0" * 40)
+            with self.assertRaisesRegex(ValueError, "complete commit SHA"):
+                CI.validate_checkout(repo, CI.STAGES[0], commit[:12])
+
+    def test_ci_cleanup_rejects_a_parent_or_unowned_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            outside = Path(folder)
+            marker = outside / "keep.txt"
+            marker.write_text("keep")
+            with self.assertRaises(ValueError):
+                CI.remove_owned(outside, outside)
+            with self.assertRaises(ValueError):
+                CI.remove_owned(outside.parent, outside)
+            self.assertEqual(marker.read_text(), "keep")
+
     def test_image_configuration_preserves_base_path_and_checks_launch_identity(self):
         expected = IMAGE.runtime_config(
             "/opt/mpu/fixture", "a" * 40, {"Env": ["PATH=/base/bin"]}
