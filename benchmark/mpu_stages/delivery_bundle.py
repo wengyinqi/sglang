@@ -27,6 +27,7 @@ ALLOWED = (
     "test/manual/mpu_stages/",
     ".github/workflows/mpu-cpu-control.yml",
     ".github/workflows/run-cpu-ci.yml",
+    ".github/workflows/mpu-linux-delivery.yml",
 )
 
 
