@@ -23,6 +23,129 @@ make_logical_allocator = FIXTURES.make_logical_allocator
 coordinator = FIXTURES.coordinator
 
 
+def chunk_abort_fixture(*, backing=True, overlap=False, pp_size=1, mode="null"):
+    """Run real scheduler control methods against owned CPU allocator slots."""
+    pool, audit = make_pool(), []
+    owned, other = pool.alloc(64), pool.alloc(64)
+    req = NS(
+        rid="partial-prefill",
+        req_pool_idx=0,
+        finished_reason=None,
+        to_finish=None,
+        time_stats=NS(set_completion_time=lambda: audit.append("completion")),
+    )
+    req.finished = lambda: req.finished_reason is not None
+
+    class Abort:
+        def __init__(self, rid="", abort_all=False, finished_reason=None):
+            self.rid, self.abort_all, self.finished_reason = (
+                rid,
+                abort_all,
+                finished_reason,
+            )
+
+    def reason(message="Aborted"):
+        return NS(to_json=lambda: {"type": "abort", "message": message})
+
+    def release(target, cache, is_insert=True):
+        assert target is req and target.finished() and is_insert is False
+        assert target.req_pool_idx == 0
+        pool.free(owned)
+        target.req_pool_idx = None
+        audit.append("kv")
+
+    coord = (
+        NS(
+            ack_staging_queue=[],
+            release_mpu_request=lambda target: audit.append("lease"),
+        )
+        if backing
+        else None
+    )
+    state = NS(
+        chunked_req=req,
+        _pending_chunked_abort_req=None,
+        enable_overlap=overlap,
+        pp_size=pp_size,
+        disaggregation_mode=mode,
+        waiting_queue=[],
+        grammar_manager=NS(abort_requests=lambda value: None),
+        hisparse_coordinator=coord,
+        enable_hicache_storage=False,
+        tree_cache=NS(),
+        running_batch=NS(reqs=[]),
+        cur_batch=NS(reqs=[req]),
+        disagg_prefill_bootstrap_queue=NS(queue=[]),
+        disagg_prefill_inflight_queue=[],
+        send_to_tokenizer=NS(send_output=lambda output, target: audit.append(output)),
+    )
+    namespace = {
+        "AbortReq": Abort,
+        "FINISH_ABORT": reason,
+        "DisaggregationMode": NS(NULL="null", PREFILL="prefill", DECODE="decode"),
+        "prepare_abort": lambda target, message: setattr(
+            target, "finished_reason", reason(message)
+        ),
+        "release_kv_cache": release,
+    }
+    path = "python/sglang/srt/managers/scheduler.py"
+    abort = definition(path, "abort_request", namespace, owner="Scheduler")
+    drain = definition(
+        path, "process_pending_chunked_abort", namespace, owner="Scheduler"
+    )
+    state.abort_request = lambda command: abort(state, command)
+    return pool, state, req, audit, Abort, lambda: drain(state), owned, other
+
+
+@pytest.mark.parametrize("backing", [False, True])
+@pytest.mark.parametrize("abort_all", [False, True])
+def test_chunked_abort_releases_only_its_owned_slots_once(backing, abort_all):
+    pool, state, req, audit, Abort, drain, owned, other = chunk_abort_fixture(
+        backing=backing
+    )
+    before = pool.available_size()
+    state.abort_request(Abort(rid="partial", abort_all=abort_all))
+    assert state._pending_chunked_abort_req is req
+    assert pool.available_size() == before and audit == []
+    drain()
+    assert req.finished() and req.req_pool_idx is None
+    assert state.chunked_req is None and state._pending_chunked_abort_req is None
+    assert pool.available_size() == before + len(owned)
+    assert audit[:-1] == (["lease"] if backing else []) + ["kv", "completion"]
+    assert audit[-1].rid == req.rid
+    assert audit[-1].finished_reason["type"] == "abort"
+    state.abort_request(Abort(rid=req.rid))
+    drain()
+    assert len(audit) == (4 if backing else 3)
+    refill = pool.alloc(pool.available_size())
+    assert not set(refill.tolist()) & set(other.tolist())
+    pool.free(refill)
+    pool.free(other)
+    assert pool.available_size() == pool.size
+
+
+@pytest.mark.parametrize(
+    "options", [{"overlap": True}, {"pp_size": 2}, {"mode": "prefill"}]
+)
+def test_legacy_chunked_abort_does_not_release_inflight_overlap_or_pd(options):
+    pool, state, req, audit, Abort, drain, *_ = chunk_abort_fixture(**options)
+    before = pool.available_size()
+    state.abort_request(Abort(rid=req.rid))
+    drain()
+    assert state._pending_chunked_abort_req is None
+    assert state.chunked_req is req and not req.finished()
+    assert pool.available_size() == before and audit == []
+
+
+def test_unrelated_abort_preserves_the_chunked_request():
+    pool, state, req, audit, Abort, drain, *_ = chunk_abort_fixture()
+    before = pool.available_size()
+    state.abort_request(Abort(rid="another-request"))
+    drain()
+    assert state.chunked_req is req and req.to_finish is None
+    assert pool.available_size() == before and audit == []
+
+
 @pytest.mark.parametrize("seed", [0, 1, 7, 19, 41, 97, 251, 2026])
 def test_seeded_append_exhaust_abort_retract_and_reuse(seed):
     rng, history = random.Random(seed), []

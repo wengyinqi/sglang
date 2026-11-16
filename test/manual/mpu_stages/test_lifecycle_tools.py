@@ -24,7 +24,7 @@ def response(reason="abort", tokens=3, retracts=0):
         "meta_info": {
             "finish_reason": {"type": reason},
             "completion_tokens": tokens,
-            "num_retractions": retracts,
+            "total_retractions": retracts,
         }
     }
 
@@ -90,6 +90,32 @@ def test_rank_trace_alignment_and_request_attribution():
         L.forward_facts(bad, "target", 4)
 
 
+@pytest.mark.parametrize("key", ["total_retractions", "num_retractions"])
+def test_native_retraction_count_fields(key):
+    result = response("length", 20)
+    result["meta_info"].pop("total_retractions")
+    result["meta_info"][key] = 1
+    L.validate_fault("retract_decode", result, facts(202, 19), 100, 20)
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {},
+        {"total_retractions": 0},
+        {"total_retractions": True},
+        {"total_retractions": 1.5},
+        {"total_retractions": 1, "num_retractions": 2},
+    ],
+)
+def test_missing_or_inconsistent_retraction_count_is_not_evidence(counts):
+    result = response("length", 20)
+    result["meta_info"].pop("total_retractions")
+    result["meta_info"].update(counts)
+    with pytest.raises(ValueError, match="No real decode retract"):
+        L.validate_fault("retract_decode", result, facts(202, 19), 100, 20)
+
+
 @pytest.mark.parametrize("case", ["abort_decode", "retract_decode"])
 def test_loopback_stream_fault_client_and_cleanup(case):
     state = {"abort": False, "retracts": 0, "routes": []}
@@ -123,7 +149,7 @@ def test_loopback_stream_fault_client_and_cleanup(case):
                         "meta_info": {
                             "id": payload["rid"],
                             "completion_tokens": count,
-                            "num_retractions": state["retracts"],
+                            "total_retractions": state["retracts"],
                             "finish_reason": {"type": reason} if reason else None,
                         }
                     }
@@ -145,7 +171,7 @@ def test_loopback_stream_fault_client_and_cleanup(case):
             assert result["meta_info"]["finish_reason"]["type"] == "abort"
             assert "/abort_request" in state["routes"]
         else:
-            assert result["meta_info"]["num_retractions"] == 1
+            assert result["meta_info"]["total_retractions"] == 1
             assert state["routes"] == [
                 "/generate",
                 "/pause_generation",

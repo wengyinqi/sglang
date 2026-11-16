@@ -951,6 +951,7 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2273,6 +2274,35 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
+    def process_pending_chunked_abort(self) -> None:
+        """Release a NoPD chunk between completed, non-overlapped forwards.
+
+        Follow main's deferred-abort ordering with this branch's legacy KV
+        ownership. abort_request only marks the request; the scheduler boundary
+        is where the completed chunk can be released before another is launched.
+        Overlap and PP require different result-draining logic and are excluded
+        when the marker is set.
+        """
+        req = self._pending_chunked_abort_req
+        self._pending_chunked_abort_req = None
+        if req is None or req.finished() or req.req_pool_idx is None:
+            return
+        if self.chunked_req is not req:
+            self.abort_request(AbortReq(rid=req.rid))
+            return
+
+        prepare_abort(req, "Request aborted during chunked prefill")
+        req.to_finish = None
+        if self.hisparse_coordinator is not None:
+            # Before staging, only the admission lease exists in backing storage.
+            self.hisparse_coordinator.release_mpu_request(req)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        self.chunked_req = None
+        req.time_stats.set_completion_time()
+        self.send_to_tokenizer.send_output(
+            AbortReq(rid=req.rid, finished_reason=req.finished_reason.to_json()), req
+        )
+
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
@@ -2315,6 +2345,7 @@ class Scheduler(
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
+        self.process_pending_chunked_abort()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -3368,6 +3399,15 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        if (
+            self.chunked_req is not None
+            and not self.enable_overlap
+            and self.pp_size == 1
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and (recv_req.abort_all or self.chunked_req.rid.startswith(recv_req.rid))
+        ):
+            self._pending_chunked_abort_req = self.chunked_req
+
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
         to_del = []

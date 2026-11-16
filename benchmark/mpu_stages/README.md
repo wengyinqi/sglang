@@ -6,6 +6,15 @@ Qwen 1+4 使用独立 topology，SLO/报价未填写时不生成经济验收结�
 正式矩阵使用 `paired_run.py` 轮换 CPU/MPU 顺序，并支持整块断点续跑；
 `decision_policy.py` 提供待填 SLO/成本模板及无需 GPU 的独立重分析。
 
+单张 H800 PCIe 80 GB 的 Qwen 1+0 baseline 使用
+`--matrix benchmark/mpu_stages/experiment-matrix.h800-qwen.json --profiles baseline`。
+该硬件配置将 `mem_fraction_static` 固定为 0.85；输入长度、输出长度、并发、
+重复次数、65536 个计算 KV 槽位和 CPU 后备比例均沿用正式矩阵。原 0.8 配置在
+此卡上扣除 Qwen BF16 权重与 Quest 元数据后，实际槽位少于 65536，会触发容量
+门禁；不可将自动缩减的分配算作固定预算实验通过。执行时仍须校验实际容量，
+并完整通过真实权重、eager/graph 对照和生命周期门禁。该配置不是其他模型、
+其他卡型的显存保证，也不表示已经取得模型或性能结果。
+
 四个多卡阶段现使用 **Attention-DP4 + EP4（有效 Attention/MoE TP=1）**，
 并行约束、逐 owner 故障恢复与 DP 计时规则见 [ATTENTION_DP_EP.md](ATTENTION_DP_EP.md)。
 外层 `tp_size=4` 表示承载 DP/EP 的四计算进程组，不能当作 Attention TP4。
@@ -47,6 +56,13 @@ prefill chunk、长短请求混合和 KV slot 复用；每轮保存完整 token 
 逐 token 要求 greedy token IDs 相同，选中 token 的 logprob 默认允许 0.02 绝对误差。
 DP4 每轮至少四个请求并覆盖四个 owner；故障和恢复逐 owner 定向执行。
 Near-tie 导致的分歧也会明确失败，需检查原始证据，不能静默忽略。
+
+本分支为 NoPD、PP=1 且关闭 overlap 的路径补齐分块 prefill 取消：收到取消时
+记录目标，在当前 chunk 的结果处理完成后的调度边界释放 KV 与 HiSparse admission
+预留，避免继续运行剩余 chunks。处理顺序参考 `main@f9257d6c7c45` 的
+`process_pending_chunked_abort`，适配本分支的旧 KV 所有权接口；不扩大为 overlap
+或 PD 取消验收。retract 验收读取原生 `total_retractions`，兼容
+`num_retractions`，并继续要求 trace 证明重算 prefill、输出一致与最终零占用。
 
 每轮完成后，脚本等待每个请求的 Attention owner 提交真实 request ID，并取得所有计算 rank
 这些 forward 之后的空闲容量快照。实际 KV 占用与生命周期预留都必须归零。启动时的

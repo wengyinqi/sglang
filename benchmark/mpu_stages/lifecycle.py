@@ -198,8 +198,13 @@ def validate_fault(case, response, facts, input_len, output_len):
         ):
             raise ValueError("Decode abort was not observed before normal completion")
     elif case == "retract_decode":
+        counts = [
+            meta[key] for key in ("total_retractions", "num_retractions") if key in meta
+        ]
         if (
-            meta.get("num_retractions", 0) < 1
+            not counts
+            or any(type(count) is not int or count < 1 for count in counts)
+            or any(count != counts[0] for count in counts)
             or not facts
             or any(
                 f["decode_forwards"] < 1 or f["prefill_tokens"] <= input_len
