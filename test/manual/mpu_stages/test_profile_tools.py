@@ -32,7 +32,7 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(plan["profile_request"]["profile_stages"], ["decode"])
             self.assertEqual(plan["environment"], {"SGLANG_PROFILE_V2": "1"})
             cmd = plan["server_command"]
-            self.assertEqual(int(cmd[cmd.index("--context-length") + 1]), 8192 + 36)
+            self.assertEqual(int(cmd[cmd.index("--context-length") + 1]), 8192 + 36 + 2)
             self.assertFalse(plan["performance_result"])
             self.assertEqual(plan["workload"]["output_len"], 36)
 

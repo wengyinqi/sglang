@@ -305,8 +305,9 @@ def server_command(stage, args, variant, input_len, ratio, *, eager=None):
         "--pp-size": 1,
         "--max-running-requests": max(args.concurrencies),
         "--max-total-tokens": args.max_total_tokens,
-        # Serving rejects input + max_new_tokens >= context_length.
-        "--context-length": input_len + args.output_len + 1,
+        # Worker/scheduler reserve two generation slots; the input limit also
+        # requires prompt length < context_length - 6 for short generations.
+        "--context-length": input_len + max(args.output_len + 2, 7),
         "--chunked-prefill-size": args.chunked_prefill_size,
         "--mem-fraction-static": args.mem_fraction_static,
         stage.get("graph_max_bs_flag", "--cuda-graph-max-bs"): max(args.concurrencies),

@@ -248,7 +248,41 @@ class TestStagePlanning(unittest.TestCase):
             scope,
         )
         validate_request = scope["_validate_one_request"]
-        for correctness, output_len in ((False, 256), (True, 80)):
+        for filename, name in (
+            ("scheduler.py", "init_req_max_new_tokens"),
+            ("utils.py", "validate_input_length"),
+        ):
+            source = path.with_name(filename)
+            node = copy.deepcopy(
+                next(
+                    n
+                    for n in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
+                    if isinstance(n, ast.FunctionDef) and n.name == name
+                )
+            )
+            node.returns = None
+            for argument in node.args.args:
+                argument.annotation = None
+            exec(
+                compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"),
+                scope,
+            )
+        worker_source = path.with_name("tp_worker.py")
+        limits = [
+            n
+            for n in ast.walk(ast.parse(worker_source.read_text(encoding="utf-8")))
+            if isinstance(n, ast.Assign)
+            and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Attribute)
+            and isinstance(n.targets[0].value, ast.Name)
+            and n.targets[0].value.id == "self"
+            and n.targets[0].attr in ("max_req_len", "max_req_input_len")
+        ]
+        self.assertEqual(len(limits), 2)
+        initialize_limits = compile(
+            ast.Module(body=limits, type_ignores=[]), str(worker_source), "exec"
+        )
+        for correctness, output_len in ((False, 2), (False, 256), (True, 80)):
             stage, args = self.parse(
                 recipe(),
                 [
@@ -276,7 +310,12 @@ class TestStagePlanning(unittest.TestCase):
                     validate_total_tokens=True,
                     is_generation=True,
                     server_args=SimpleNamespace(allow_auto_truncate=False),
+                    model_config=SimpleNamespace(context_len=context_len),
+                    model_runner=SimpleNamespace(
+                        max_token_pool_size=args.max_total_tokens
+                    ),
                 )
+                exec(initialize_limits, {"self": state})
                 request = generate_type(
                     sampling_params={"max_new_tokens": output_len},
                     return_hidden_states=False,
@@ -289,6 +328,19 @@ class TestStagePlanning(unittest.TestCase):
                         validate_request(state, request, [1] * length)
                         self.assertEqual(
                             request.sampling_params["max_new_tokens"], output_len
+                        )
+                        scheduled = SimpleNamespace(
+                            origin_input_ids=[1] * length,
+                            sampling_params=SimpleNamespace(max_new_tokens=output_len),
+                        )
+                        self.assertIsNone(
+                            scope["validate_input_length"](
+                                scheduled, state.max_req_input_len, False
+                            )
+                        )
+                        scope["init_req_max_new_tokens"](state, scheduled)
+                        self.assertEqual(
+                            scheduled.sampling_params.max_new_tokens, output_len
                         )
 
     def test_cpu_ratio_integer_and_selector_reference_guard(self):
