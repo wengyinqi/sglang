@@ -305,7 +305,8 @@ def server_command(stage, args, variant, input_len, ratio, *, eager=None):
         "--pp-size": 1,
         "--max-running-requests": max(args.concurrencies),
         "--max-total-tokens": args.max_total_tokens,
-        "--context-length": input_len + args.output_len,
+        # Serving rejects input + max_new_tokens >= context_length.
+        "--context-length": input_len + args.output_len + 1,
         "--chunked-prefill-size": args.chunked_prefill_size,
         "--mem-fraction-static": args.mem_fraction_static,
         stage.get("graph_max_bs_flag", "--cuda-graph-max-bs"): max(args.concurrencies),

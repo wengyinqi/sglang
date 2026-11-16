@@ -1,5 +1,6 @@
 """CPU-only stage planning, TP accounting and post-request capacity checks."""
 
+import ast
 import copy
 import importlib.util
 import json
@@ -217,6 +218,78 @@ class TestStagePlanning(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--max-total-tokens") + 1], "4096")
             self.assertEqual(cmd[cmd.index("--max-running-requests") + 1], "2")
             self.assertIn("--disable-overlap-schedule", cmd)
+
+    def test_longest_request_passes_the_serving_context_guard(self):
+        # Exercise the serving implementation without importing its GPU stack.
+        path = ROOT / "python/sglang/srt/managers/tokenizer_manager.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        manager = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "TokenizerManager"
+        )
+        method = copy.deepcopy(
+            next(
+                n
+                for n in manager.body
+                if isinstance(n, ast.FunctionDef) and n.name == "_validate_one_request"
+            )
+        )
+        method.returns = None
+        for argument in method.args.args:
+            argument.annotation = None
+        generate_type = type("GenerateReqInput", (SimpleNamespace,), {})
+        scope = {
+            "GenerateReqInput": generate_type,
+            "EmbeddingReqInput": type("EmbeddingReqInput", (), {}),
+        }
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+            scope,
+        )
+        validate_request = scope["_validate_one_request"]
+        for correctness, output_len in ((False, 256), (True, 80)):
+            stage, args = self.parse(
+                recipe(),
+                [
+                    "--input-lens",
+                    "8192",
+                    "32768",
+                    "--output-len",
+                    str(output_len),
+                    "--max-total-tokens",
+                    "65536",
+                    "--include-hbm",
+                ],
+                correctness=correctness,
+            )
+            groups = (CORRECT if correctness else RUN).make_plan(stage, args)
+            for group in groups:
+                command = group["server_command"]
+                context_len = int(command[command.index("--context-length") + 1])
+                lengths = (
+                    [max(args.input_lens)] if correctness else [group["input_len"]]
+                )
+                state = SimpleNamespace(
+                    context_len=context_len,
+                    num_reserved_tokens=0,
+                    validate_total_tokens=True,
+                    is_generation=True,
+                    server_args=SimpleNamespace(allow_auto_truncate=False),
+                )
+                request = generate_type(
+                    sampling_params={"max_new_tokens": output_len},
+                    return_hidden_states=False,
+                    custom_logit_processor=None,
+                )
+                for length in lengths:
+                    with self.subTest(
+                        correctness=correctness, group=group["id"], input_len=length
+                    ):
+                        validate_request(state, request, [1] * length)
+                        self.assertEqual(
+                            request.sampling_params["max_new_tokens"], output_len
+                        )
 
     def test_cpu_ratio_integer_and_selector_reference_guard(self):
         with self.assertRaisesRegex(ValueError, "integer"):
