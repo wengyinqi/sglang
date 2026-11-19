@@ -505,6 +505,13 @@ def new_manifest(stage, args, groups, kind):
         "runtime": runtime,
         "groups": groups,
     }
+    if getattr(args, "workload", None) is not None:
+        manifest["workload"] = load("workload").load_manifest(
+            args.workload,
+            lengths=args.input_lens,
+            count=args.num_prompts,
+            expected_sha256=args.workload_sha256,
+        )
     load("capacity_analysis").verify_manifest_scope(
         manifest["analysis_policy"], manifest
     )

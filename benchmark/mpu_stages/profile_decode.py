@@ -45,7 +45,7 @@ def identity(path):
     }
 
 
-def correctness_gate(report, stage, runtime, args, model_report):
+def correctness_gate(report, stage, runtime, args, model_report, variant=None):
     if (
         report.get("evidence_scope", {}).get("target_model_correctness_executed")
         is not True
@@ -81,8 +81,12 @@ def correctness_gate(report, stage, runtime, args, model_report):
         "chunked_prefill_size",
         "disable_cuda_graph",
         "mpu_memory_reserve_bytes",
+        "workload",
+        "workload_sha256",
     ):
-        actual = getattr(args, name)
+        actual = getattr(args, name, None)
+        if isinstance(actual, Path):
+            actual = str(actual)
         if settings.get(name) != actual:
             raise ValueError(
                 f"Profiling configuration differs from correctness acceptance: {name}"
@@ -91,23 +95,36 @@ def correctness_gate(report, stage, runtime, args, model_report):
         raise ValueError(
             "Profile capacity ratio was not covered by correctness acceptance"
         )
+    if variant == "hbm" and not settings.get("include_hbm"):
+        raise ValueError("HBM profiling requires the passed HBM correctness reference")
 
 
-def plan(stage, args, steps):
+def plan(stage, args, steps, variant=None, concurrency=None):
     if type(steps) is not int or not 1 <= steps <= 512:
         raise ValueError("Profile steps must be between 1 and 512")
     # A further scheduler step closes the upstream profile trigger. Keep the
     # request alive past the trigger, rather than relying on an idle flush.
     output_len = max(args.output_len, steps + 4)
+    variant = variant or stage["variant"]
+    concurrency = stage.get("attn_dp_size", 1) if concurrency is None else concurrency
+    if variant not in stage["variants"] or (
+        variant == "hbm" and not stage.get("hbm_preserves_selector")
+    ):
+        raise ValueError("Profile variant must preserve the accepted sparse selector")
+    if type(concurrency) is not int or concurrency <= 0:
+        raise ValueError("Profile concurrency must be positive")
+    if stage.get("attn_dp_size", 1) > 1 and concurrency != 4:
+        raise ValueError("Multi-rank profiling requires four Attention owners")
     root = args.output_dir
     server_args = copy.copy(args)
     server_args.output_len = output_len
+    server_args.concurrencies = [max(max(args.concurrencies), concurrency)]
     server = STAGE.server_command(
         stage,
         server_args,
-        stage["variant"],
+        variant,
         args.input_lens[0],
-        args.capacity_ratios[0],
+        None if variant == "hbm" else args.capacity_ratios[0],
     )
     wrapper = (
         "import os,pathlib,runpy,sys; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
@@ -134,6 +151,7 @@ def plan(stage, args, steps):
         "schema_version": 1,
         "status": "planned",
         "stage": stage,
+        "profile_variant": variant,
         "server_command": command,
         "environment": {"SGLANG_PROFILE_V2": "1"},
         "profile_request": {
@@ -148,8 +166,14 @@ def plan(stage, args, steps):
         "workload": {
             "input_len": args.input_lens[0],
             "output_len": output_len,
-            "concurrency": stage.get("attn_dp_size", 1),
-            "prompt": "synthetic repeated token 42; diagnostic only",
+            "concurrency": concurrency,
+            "prompt": (
+                "frozen real-document input IDs; diagnostic only"
+                if getattr(args, "workload", None)
+                else "synthetic repeated token 42; diagnostic only"
+            ),
+            "manifest": str(args.workload) if getattr(args, "workload", None) else None,
+            "manifest_sha256": getattr(args, "workload_sha256", None),
         },
         "configured_decode_steps": steps,
         "actual_steps_verified": False,
@@ -201,7 +225,14 @@ def execute(report, stage, args, acceptance):
             != "passed"
         ):
             raise ValueError("Correctness artifact no longer passes its gate")
-        correctness_gate(receipt, stage, report["runtime"], args, model_report)
+        correctness_gate(
+            receipt,
+            stage,
+            report["runtime"],
+            args,
+            model_report,
+            report["profile_variant"],
+        )
         report["acceptance"] = identity(acceptance)
         report["correctness_artifact"] = identity(job["report"])
         report["nsys_version"] = COMMON.capture(["nsys", "--version"])
@@ -209,7 +240,13 @@ def execute(report, stage, args, acceptance):
         import torch
 
         mapping = load("hardware_probe").device_mapping(
-            stage, mpu_ids=args.mpu_device_ids
+            stage
+            | {
+                "variant": "cpu"
+                if report["profile_variant"] == "hbm"
+                else report["profile_variant"]
+            },
+            mpu_ids=args.mpu_device_ids,
         )
         report["devices"] = [
             {
@@ -253,15 +290,19 @@ def execute(report, stage, args, acceptance):
             report["profile_ack"] = post_text(
                 args.port, "start_profile", report["profile_request"]
             )
+            count = report["workload"]["concurrency"]
+            prompts = (
+                load("workload").inputs(
+                    args.workload, report["workload"]["input_len"], count
+                )
+                if getattr(args, "workload", None)
+                else [[42] * report["workload"]["input_len"] for _ in range(count)]
+            )
             response = COMMON.request_json(
                 args.port,
                 "generate",
                 {
-                    "input_ids": (
-                        [[42] * report["workload"]["input_len"] for _ in range(4)]
-                        if stage.get("attn_dp_size", 1) > 1
-                        else [42] * report["workload"]["input_len"]
-                    ),
+                    "input_ids": prompts if count > 1 else prompts[0],
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": report["workload"]["output_len"],
@@ -289,8 +330,8 @@ def execute(report, stage, args, acceptance):
                 root / "forward-trace",
                 stage,
                 args,
-                stage["variant"],
-                args.capacity_ratios[0],
+                report["profile_variant"],
+                None if report["profile_variant"] == "hbm" else args.capacity_ratios[0],
                 request_ids=report["profiled_request_ids"],
                 require_idle=True,
             )
@@ -357,11 +398,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--acceptance", type=Path)
     parser.add_argument("--profile-steps", type=int, default=32)
+    parser.add_argument("--profile-variant", choices=("cpu", "mpu", "hbm"))
+    parser.add_argument("--profile-concurrency", type=int)
     control, forwarded = parser.parse_known_args(argv)
     stage, args = STAGE.parse_args(forwarded)
     if Path(args.model).is_dir():
         args.model = str(Path(args.model).resolve())
-    report = plan(stage, args, control.profile_steps)
+    report = plan(
+        stage,
+        args,
+        control.profile_steps,
+        control.profile_variant,
+        control.profile_concurrency,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=False)
     COMMON.write_manifest(args.output_dir / "profile.json", report)
     ok = execute(report, stage, args, control.acceptance) if args.execute else True

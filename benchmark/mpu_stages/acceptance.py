@@ -48,6 +48,7 @@ def portable_targets(stage):
     """Explicit CPU coverage; optional GPU tests are separate mandatory gates."""
     targets = [
         "test/manual/mpu_stages/test_stage_tools.py",
+        "test/manual/mpu_stages/test_real_workload.py",
         "test/manual/mpu_stages/test_acceptance.py",
         "test/manual/mpu_stages/test_environment_packaging.py",
         "test/manual/mpu_stages/test_native_environment.py",

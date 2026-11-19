@@ -130,6 +130,14 @@ def parse_args(argv=None, *, correctness=False):
         help="Benchmark eager only; correctness then checks eager only.",
     )
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument(
+        "--workload",
+        type=Path,
+        help="Manifest for fixed real-document input-ID buckets",
+    )
+    p.add_argument(
+        "--workload-sha256", help="Optional expected manifest SHA256; always recorded"
+    )
     p.add_argument("--port", type=int, default=30000)
     p.add_argument("--startup-timeout", type=int, default=1800)
     p.add_argument("--benchmark-timeout", type=int, default=14400)
@@ -161,6 +169,22 @@ def parse_args(argv=None, *, correctness=False):
     args.output_dir = args.output_dir.resolve()
     if args.analysis_policy is not None:
         args.analysis_policy = args.analysis_policy.resolve()
+    if args.workload is not None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "mpu_stage_workload", Path(__file__).with_name("workload.py")
+        )
+        workload = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(workload)
+        args.workload = args.workload.resolve()
+        workload.load_manifest(
+            args.workload,
+            lengths=args.input_lens,
+            count=args.num_prompts,
+            expected_sha256=args.workload_sha256,
+        )
+        args.workload_sha256 = workload.file_sha256(args.workload)
     validate(stage, args)
     return stage, args
 

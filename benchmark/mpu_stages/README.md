@@ -1,5 +1,8 @@
 # MPU 分阶段实验公共入口
 
+真实长文本快照、CPU DDR／HBM Quest 配对、CPU 容量扫描与独立 decode profiling 的
+共同入口见 [REAL_WORKLOAD.md](REAL_WORKLOAD.md)。默认 random-ids 基线继续保留。
+
 项目正式实验矩阵、容量扫描和验收判据见 [EXPERIMENT_MATRIX.md](EXPERIMENT_MATRIX.md)。
 `experiment_matrix.py` 将这些配置接入现有门禁与运行器；默认仅生成计划，
 Qwen 1+4 使用独立 topology，SLO/报价未填写时不生成经济验收结论。

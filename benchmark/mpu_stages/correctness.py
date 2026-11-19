@@ -97,6 +97,7 @@ def execute(stage, args, manifest, path):
     if not base:
         raise ValueError("Tokenizer produced no prompt tokens")
     reference, physical_reference = None, None
+    workload = RUN.load("workload") if getattr(args, "workload", None) else None
     for group in manifest["groups"]:
         process = None
         try:
@@ -126,7 +127,12 @@ def execute(stage, args, manifest, path):
                 records = []
                 group["round_idle_capacity"] = []
                 for index, lengths in enumerate(group["rounds"]):
-                    inputs = [(base * math.ceil(n / len(base)))[:n] for n in lengths]
+                    inputs = [
+                        workload.inputs(args.workload, n, len(lengths))[position]
+                        if workload is not None and n in args.input_lens
+                        else (base * math.ceil(n / len(base)))[:n]
+                        for position, n in enumerate(lengths)
+                    ]
                     outputs = RUN.COMMON.request_json(
                         args.port,
                         "generate",
