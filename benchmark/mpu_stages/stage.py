@@ -49,7 +49,7 @@ def load_stage(path):
 
 
 def parse_args(argv=None, *, correctness=False):
-    pre = argparse.ArgumentParser(add_help=False)
+    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument(
         "--stage", type=Path, default=Path(__file__).with_name("stage.json")
     )
@@ -58,6 +58,7 @@ def parse_args(argv=None, *, correctness=False):
     defaults = stage.get("defaults", {})
     p = argparse.ArgumentParser(
         parents=[pre],
+        allow_abbrev=False,
         description="Plan by default; --execute runs this checkout's selected HiSparse stage.",
     )
     p.add_argument("--model", default=stage["default_model"])
@@ -102,6 +103,12 @@ def parse_args(argv=None, *, correctness=False):
         default=defaults.get("chunked_prefill_size", 2048),
     )
     p.add_argument(
+        "--prefill-max-requests",
+        type=int,
+        default=defaults.get("prefill_max_requests"),
+        help="Limit requests per prefill batch without limiting decode concurrency",
+    )
+    p.add_argument(
         "--mem-fraction-static",
         type=float,
         default=defaults.get("mem_fraction_static", 0.8),
@@ -130,6 +137,14 @@ def parse_args(argv=None, *, correctness=False):
         help="Benchmark eager only; correctness then checks eager only.",
     )
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument(
+        "--workload",
+        type=Path,
+        help="Manifest for fixed real-document input-ID buckets",
+    )
+    p.add_argument(
+        "--workload-sha256", help="Optional expected manifest SHA256; always recorded"
+    )
     p.add_argument("--port", type=int, default=30000)
     p.add_argument("--startup-timeout", type=int, default=1800)
     p.add_argument("--benchmark-timeout", type=int, default=14400)
@@ -161,6 +176,22 @@ def parse_args(argv=None, *, correctness=False):
     args.output_dir = args.output_dir.resolve()
     if args.analysis_policy is not None:
         args.analysis_policy = args.analysis_policy.resolve()
+    if args.workload is not None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "mpu_stage_workload", Path(__file__).with_name("workload.py")
+        )
+        workload = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(workload)
+        args.workload = args.workload.resolve()
+        workload.load_manifest(
+            args.workload,
+            lengths=args.input_lens,
+            count=args.num_prompts,
+            expected_sha256=args.workload_sha256,
+        )
+        args.workload_sha256 = workload.file_sha256(args.workload)
     validate(stage, args)
     return stage, args
 
@@ -191,7 +222,7 @@ def validate(stage, args):
         not float(r).is_integer() for r in args.capacity_ratios
     ):
         raise ValueError("CPU HiSparse host_to_device_ratio must be an integer")
-    for key in ("top_k", "device_buffer_size"):
+    for key in ("top_k", "device_buffer_size", "prefill_max_requests"):
         if getattr(args, key) is not None and getattr(args, key) <= 0:
             raise ValueError(f"{key} must be positive")
     if args.mpu_device_ids is not None:
@@ -305,12 +336,16 @@ def server_command(stage, args, variant, input_len, ratio, *, eager=None):
         "--pp-size": 1,
         "--max-running-requests": max(args.concurrencies),
         "--max-total-tokens": args.max_total_tokens,
-        "--context-length": input_len + args.output_len,
+        # Worker/scheduler reserve two generation slots; the input limit also
+        # requires prompt length < context_length - 6 for short generations.
+        "--context-length": input_len + max(args.output_len + 2, 7),
         "--chunked-prefill-size": args.chunked_prefill_size,
         "--mem-fraction-static": args.mem_fraction_static,
         stage.get("graph_max_bs_flag", "--cuda-graph-max-bs"): max(args.concurrencies),
         "--random-seed": args.seed,
     }
+    if args.prefill_max_requests is not None:
+        options["--prefill-max-requests"] = args.prefill_max_requests
     if stage.get("attn_dp_size", 1) > 1:
         options.update(
             {

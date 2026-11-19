@@ -3,6 +3,7 @@ from typing import Dict, Type
 from sglang.benchmark.datasets.autobench import AutoBenchmarkDataset
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 from sglang.benchmark.datasets.custom import CustomDataset
+from sglang.benchmark.datasets.frozen_ids import FrozenIDsDataset
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
 )
@@ -23,6 +24,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     # not two separate dataset names sharing the same class.
     "random": RandomDataset,
     "random-ids": RandomDataset,
+    "frozen-ids": FrozenIDsDataset,
     "generated-shared-prefix": GeneratedSharedPrefixDataset,
     "mmmu": MMMUDataset,
     "image": ImageDataset,

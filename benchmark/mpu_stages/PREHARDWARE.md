@@ -97,7 +97,7 @@ Qwen 1+1 使用计算卡加一张存储卡；1+4 加 `--mpu-device-ids 1 2 3 4`�
 4+0 只需要四张计算卡；4+4 默认计算 ordinal `0..3` 配对存储 ordinal `4..7`。
 传入的编号都是 `CUDA_VISIBLE_DEVICES` 重映射后的 CUDA ordinal，可见 UUID 也会保留。
 
-顺序为 `portable → compile → imports → device → kernels → model_identity → correctness`。
+顺序为 `portable → compile → jit → imports → device → kernels → model_identity → correctness`。
 加 `--through performance` 才继续性能测试，不能跳过前面的正确性层。通用输入长度、
 并发、容量和超时参数沿用 `run.py`；例如更改固定索引预算与扫点时，两层都接收
 `--cpu-capacity-ratio 8 --capacity-ratios 1 2 4 8`。这些参数仍需按实际装载容量校准。

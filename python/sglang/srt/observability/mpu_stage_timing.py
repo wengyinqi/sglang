@@ -181,6 +181,7 @@ class MPUStageForwardTimer:
             "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
             "speculative_algorithm": server_args.speculative_algorithm,
             "disable_overlap_schedule": server_args.disable_overlap_schedule,
+            "prefill_max_requests": getattr(server_args, "prefill_max_requests", None),
             "disable_radix_cache": server_args.disable_radix_cache,
         }
         return cls(directory, metadata, capacity_provider=capacity_provider)

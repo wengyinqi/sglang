@@ -1996,6 +1996,7 @@ if __name__ == "__main__":
             "openai",
             "random",
             "random-ids",
+            "frozen-ids",
             "generated-shared-prefix",
             "mmmu",
             "image",
@@ -2006,6 +2007,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
+    parser.add_argument(
+        "--frozen-ids-sha256", type=str,
+        help="Required SHA256 for a frozen-ids input snapshot.",
     )
     parser.add_argument(
         "--model",

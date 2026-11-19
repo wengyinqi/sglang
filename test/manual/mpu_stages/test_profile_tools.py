@@ -1,6 +1,7 @@
 """Synthetic trace fixtures test evidence boundaries, never GPU behavior."""
 
 import importlib.util
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -32,7 +33,7 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(plan["profile_request"]["profile_stages"], ["decode"])
             self.assertEqual(plan["environment"], {"SGLANG_PROFILE_V2": "1"})
             cmd = plan["server_command"]
-            self.assertEqual(int(cmd[cmd.index("--context-length") + 1]), 8192 + 36)
+            self.assertEqual(int(cmd[cmd.index("--context-length") + 1]), 8192 + 36 + 2)
             self.assertFalse(plan["performance_result"])
             self.assertEqual(plan["workload"]["output_len"], 36)
 
@@ -45,6 +46,56 @@ class ProfileTests(unittest.TestCase):
                 None,
                 {},
             )
+
+    def test_mpu_stage_cpu_profile_uses_reference_ratio_not_target_ratio(self):
+        stage, args = PROFILE.STAGE.parse_args(
+            ["--cpu-capacity-ratio", "3", "--capacity-ratios", "1", "2", "4", "8"]
+        )
+        stage["variant"] = "mpu"
+        cpu = PROFILE.plan(stage, args, 32, "cpu", 1)
+        mpu = PROFILE.plan(stage, args, 32, "mpu", 1)
+        cpu_command, mpu_command = cpu["server_command"], mpu["server_command"]
+        cpu_config = json.loads(cpu_command[cpu_command.index("--hisparse-config") + 1])
+        mpu_config = json.loads(mpu_command[mpu_command.index("--hisparse-config") + 1])
+        self.assertEqual(cpu_config["host_to_device_ratio"], 3)
+        self.assertEqual(mpu_config["mpu_capacity_ratio"], 1)
+
+        runtime = {"git_commit": "a" * 40, "git_status": ""}
+        receipt = {
+            "stage": stage,
+            "runtime": runtime,
+            "evidence_scope": {"target_model_correctness_executed": True},
+            "steps": [
+                {
+                    "id": "correctness",
+                    "status": "passed",
+                    "results": [{"status": "passed"}],
+                }
+            ],
+        }
+        settings = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        }
+        model_report = {"stage": stage, "runtime": runtime, "settings": settings}
+        PROFILE.correctness_gate(receipt, stage, runtime, args, model_report, "cpu")
+        args.capacity_ratios = [16]
+        with self.assertRaisesRegex(ValueError, "capacity ratio"):
+            PROFILE.correctness_gate(receipt, stage, runtime, args, model_report, "mpu")
+        settings["cpu_capacity_ratio"] = 4
+        with self.assertRaisesRegex(ValueError, "cpu_capacity_ratio"):
+            PROFILE.correctness_gate(receipt, stage, runtime, args, model_report, "cpu")
+
+    def test_mpu_kv_kernels_are_visible_in_bottleneck_categories(self):
+        bottleneck = load("bottleneck_analyze")
+        self.assertEqual(
+            bottleneck.category("mpu_transfer_kernel<1024>"), "kv_resolve_and_pack"
+        )
+        self.assertEqual(
+            bottleneck.category("load_cache_from_mpu_to_device_buffer"),
+            "kv_resolve_and_pack",
+        )
+        self.assertEqual(bottleneck.category("unknown_kernel"), "unclassified")
 
     def fixture(self, root, kernels):
         path = root / "trace.sqlite"
