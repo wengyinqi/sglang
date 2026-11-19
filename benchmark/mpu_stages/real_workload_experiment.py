@@ -41,6 +41,7 @@ def common_options(args):
         ("--workload-sha256", args.workload_sha256),
         ("--max-total-tokens", args.max_total_tokens),
         ("--chunked-prefill-size", args.chunked_prefill_size),
+        ("--prefill-max-requests", args.prefill_max_requests),
         ("--mem-fraction-static", args.mem_fraction_static),
         ("--top-k", args.top_k),
         ("--device-buffer-size", args.device_buffer_size),

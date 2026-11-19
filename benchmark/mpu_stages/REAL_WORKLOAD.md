@@ -42,6 +42,7 @@ python benchmark/mpu_stages/real_workload_experiment.py \
   --model /models/qwen --model-manifest /results/model-manifest.json \
   --workload /data/frozen-longbench-qwen/workload.json \
   --max-total-tokens 65536 --chunked-prefill-size 8192 \
+  --prefill-max-requests 1 \
   --mem-fraction-static 0.85 --top-k 2048 --device-buffer-size 4096 \
   --seed 1729 --warmup-requests 8 --profiles \
   --output-dir /results/real-campaign-001 --execute
@@ -61,6 +62,14 @@ are checked across both independently executed blocks before combining their
 results. Capacity-dependent GPU metadata is recorded separately. HBM pool sizes
 are retained and can differ from CPU backing capacity; high-concurrency CPU/HBM
 differences must not be attributed entirely to link latency.
+
+Stage 01 defaults to `--prefill-max-requests 1` for every variant. CPU staging can
+otherwise change how a partially filled prefill chunk is shared with the next
+request, producing different BF16 prefill computations before sparse decode even
+starts. This control fixes the per-request prefill chunk partition while allowing
+the requested decode concurrency. It is recorded in the server command, settings
+and timing session, and is checked by the profiling acceptance identity gate.
+These measurements therefore describe this controlled NoPD prefill policy.
 
 The campaign plans 90 formal cases / 2,880 requests and 12 output-length diagnostic
 cases / 96 requests. The smaller request count is explicit; P99 and bootstrap

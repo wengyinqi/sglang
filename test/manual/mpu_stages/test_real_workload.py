@@ -274,12 +274,48 @@ class TestRealWorkload(unittest.TestCase):
             for flag in (
                 "--max-total-tokens",
                 "--chunked-prefill-size",
+                "--prefill-max-requests",
                 "--mem-fraction-static",
                 "--workload-sha256",
             ):
                 self.assertEqual(
                     paired[paired.index(flag) + 1], extra[extra.index(flag) + 1]
                 )
+
+    def test_prefill_control_preserves_decode_concurrency_and_rejects_zero(self):
+        _, args = RUN.STAGE.parse_args(["--concurrencies", "32"])
+        stage = RUN.STAGE.load_stage(args.stage)
+        self.assertEqual(args.prefill_max_requests, 1)
+        for variant, ratio in (("cpu", 2), ("hbm", None)):
+            command = RUN.STAGE.server_command(stage, args, variant, 32768, ratio)
+            self.assertEqual(command[command.index("--prefill-max-requests") + 1], "1")
+            self.assertEqual(command[command.index("--max-running-requests") + 1], "32")
+        with self.assertRaises(ValueError):
+            RUN.STAGE.parse_args(["--prefill-max-requests", "0"])
+
+    def test_profile_rejects_a_different_prefill_batch_control(self):
+        stage, args = RUN.STAGE.parse_args([])
+        runtime = {"git_commit": "a" * 40, "git_status": ""}
+        report = {
+            "stage": stage,
+            "runtime": runtime,
+            "evidence_scope": {"target_model_correctness_executed": True},
+            "steps": [
+                {
+                    "id": "correctness",
+                    "status": "passed",
+                    "results": [{"status": "passed"}],
+                }
+            ],
+        }
+        settings = {
+            k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+        }
+        model_report = {"stage": stage, "runtime": runtime, "settings": settings}
+        PROFILE.correctness_gate(report, stage, runtime, args, model_report, "cpu")
+        settings["prefill_max_requests"] = 2
+        with self.assertRaisesRegex(ValueError, "prefill_max_requests"):
+            PROFILE.correctness_gate(report, stage, runtime, args, model_report, "cpu")
 
     def test_campaign_cli_preserves_model_path_and_manifest_as_separate_options(self):
         with tempfile.TemporaryDirectory() as tmp:

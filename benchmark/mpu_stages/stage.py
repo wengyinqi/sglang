@@ -102,6 +102,12 @@ def parse_args(argv=None, *, correctness=False):
         default=defaults.get("chunked_prefill_size", 2048),
     )
     p.add_argument(
+        "--prefill-max-requests",
+        type=int,
+        default=defaults.get("prefill_max_requests"),
+        help="Limit requests per prefill batch without limiting decode concurrency",
+    )
+    p.add_argument(
         "--mem-fraction-static",
         type=float,
         default=defaults.get("mem_fraction_static", 0.8),
@@ -215,7 +221,7 @@ def validate(stage, args):
         not float(r).is_integer() for r in args.capacity_ratios
     ):
         raise ValueError("CPU HiSparse host_to_device_ratio must be an integer")
-    for key in ("top_k", "device_buffer_size"):
+    for key in ("top_k", "device_buffer_size", "prefill_max_requests"):
         if getattr(args, key) is not None and getattr(args, key) <= 0:
             raise ValueError(f"{key} must be positive")
     if args.mpu_device_ids is not None:
@@ -337,6 +343,8 @@ def server_command(stage, args, variant, input_len, ratio, *, eager=None):
         stage.get("graph_max_bs_flag", "--cuda-graph-max-bs"): max(args.concurrencies),
         "--random-seed": args.seed,
     }
+    if args.prefill_max_requests is not None:
+        options["--prefill-max-requests"] = args.prefill_max_requests
     if stage.get("attn_dp_size", 1) > 1:
         options.update(
             {

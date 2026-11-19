@@ -55,6 +55,7 @@
     "repeats": 3,
     "max_total_tokens": 65536,
     "chunked_prefill_size": 8192,
+    "prefill_max_requests": 1,
     "mem_fraction_static": 0.8,
     "capacity_ratios": [2],
     "cpu_capacity_ratio": 2

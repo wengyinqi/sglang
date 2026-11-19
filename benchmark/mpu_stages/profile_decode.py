@@ -79,6 +79,7 @@ def correctness_gate(report, stage, runtime, args, model_report, variant=None):
         "cpu_capacity_ratio",
         "mem_fraction_static",
         "chunked_prefill_size",
+        "prefill_max_requests",
         "disable_cuda_graph",
         "mpu_memory_reserve_bytes",
         "workload",
