@@ -247,7 +247,7 @@ def combine(root):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--model-manifest", type=Path, required=True)
     parser.add_argument("--profiles", action="store_true")
     control, forwarded = parser.parse_known_args(argv)

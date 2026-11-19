@@ -1,7 +1,9 @@
 """Input provenance, direct-ID loading, and paired request identity contracts."""
 
 import ast
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -278,6 +280,44 @@ class TestRealWorkload(unittest.TestCase):
                 self.assertEqual(
                     paired[paired.index(flag) + 1], extra[extra.index(flag) + 1]
                 )
+
+    def test_campaign_cli_preserves_model_path_and_manifest_as_separate_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, manifest_path = self.prepare(root)
+            output = root / "campaign-plan"
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = CAMPAIGN.main(
+                    [
+                        "--model",
+                        "/fixture/local-qwen",
+                        "--model-manifest",
+                        str(root / "model-manifest.json"),
+                        "--workload",
+                        str(manifest_path),
+                        "--input-lens",
+                        "600",
+                        "1000",
+                        "--num-prompts",
+                        "3",
+                        "--concurrencies",
+                        "1",
+                        "--output-dir",
+                        str(output),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            report = json.loads((output / "campaign.json").read_text())
+            for job in report["jobs"]:
+                command = job["command"]
+                self.assertEqual(
+                    command[command.index("--model") + 1], "/fixture/local-qwen"
+                )
+            first = report["jobs"][0]["command"]
+            self.assertEqual(
+                first[first.index("--model-manifest") + 1],
+                str(root / "model-manifest.json"),
+            )
 
     def test_kernel_union_does_not_double_count_overlapping_intervals(self):
         self.assertEqual(BOTTLENECK.union_ns([(0, 10), (5, 15), (20, 25)]), 20)
