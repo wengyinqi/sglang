@@ -104,6 +104,9 @@ class RequestFuncOutput:
     output_len: int = 0
     start_time: float = 0.0
     request_id: Optional[str] = None
+    start_monotonic_ns: Optional[int] = None
+    completion_monotonic_ns: Optional[int] = None
+    stream_frames: List[Dict[str, Any]] = field(default_factory=list)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -647,6 +650,9 @@ async def async_request_sglang_generate(
         output.start_time = st
         most_recent_timestamp = st
         last_output_len = 0
+        capture_frames = bool(getattr(args, "output_details", False))
+        if capture_frames:
+            output.start_monotonic_ns = time.monotonic_ns()
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
@@ -663,6 +669,9 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = json.loads(chunk)
+                            received_ns = (
+                                time.monotonic_ns() if capture_frames else None
+                            )
                             if "error" in data:
                                 raise RuntimeError(
                                     f"SGLang request failed: {data['error']}"
@@ -705,6 +714,16 @@ async def async_request_sglang_generate(
                             if "text" in data:
                                 generated_text = data["text"]
 
+                            if capture_frames:
+                                output.stream_frames.append(
+                                    {
+                                        "received_monotonic_ns": received_ns,
+                                        "cumulative_completion_tokens": output_len,
+                                        "new_tokens": output_len - last_output_len,
+                                        "finish_reason": meta.get("finish_reason"),
+                                    }
+                                )
+
                             if output_len > last_output_len:
                                 timestamp = time.perf_counter()
 
@@ -739,6 +758,8 @@ async def async_request_sglang_generate(
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    if capture_frames:
+                        output.completion_monotonic_ns = time.monotonic_ns()
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -1677,6 +1698,18 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
         "request_ids": [output.request_id for output in outputs],
+        "request_latencies": [output.latency for output in outputs],
+        "request_start_monotonic_ns": [output.start_monotonic_ns for output in outputs],
+        "request_completion_monotonic_ns": [
+            output.completion_monotonic_ns for output in outputs
+        ],
+        "stream_frames": [output.stream_frames for output in outputs],
+        "stream_timing_contract": {
+            "clock": "time.monotonic_ns on benchmark client host",
+            "units": "nanoseconds; latency and TTFT arrays are seconds",
+            "scope": "HTTP frame receipt with server-reported cumulative token counts",
+            "itl_note": "Native ITL divides multi-token frame gaps; it is not strict per-token timing.",
+        },
     }
 
     # Append results to a JSONL file
@@ -2009,7 +2042,8 @@ if __name__ == "__main__":
         "--dataset-path", type=str, default="", help="Path to the dataset."
     )
     parser.add_argument(
-        "--frozen-ids-sha256", type=str,
+        "--frozen-ids-sha256",
+        type=str,
         help="Required SHA256 for a frozen-ids input snapshot.",
     )
     parser.add_argument(

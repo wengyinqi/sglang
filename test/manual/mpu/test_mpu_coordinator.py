@@ -7,6 +7,7 @@ are spies, so these tests verify integration, not CUDA or peer-memory behavior.
 import ast
 import importlib.util
 import logging
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -106,6 +107,7 @@ def coordinator_type():
     cpu_host = Mock(side_effect=_Backing)
     stream = SimpleNamespace(wait_stream=Mock())
     namespace = dict(
+        os=os,
         torch=torch,
         logger=logging.getLogger(__name__),
         MODE_QUEST="quest",

@@ -14,7 +14,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -197,6 +199,40 @@ def post_text(port, route, payload):
         return response.read().decode()
 
 
+def progress(port):
+    info = COMMON.request_json(port, "get_server_info", timeout=10)
+    states = info.get("internal_states", [])
+    if len(states) != 1:
+        raise ValueError("Stable decode trigger requires one compute scheduler")
+    return states[0].get("mpu_forward_progress")
+
+
+def wait_stable(port, future, min_steps, batch_size, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if future.done():
+            future.result()  # Propagate a failed request instead of accepting stale state.
+            raise ValueError("Requests completed before a live stable decode trigger")
+        observed = progress(port)
+        if (
+            isinstance(observed, dict)
+            and observed.get("success") is True
+            and observed.get("forward_mode") == "decode"
+            and observed.get("consecutive_stable_decode_steps", 0) >= min_steps
+            and (batch_size is None or observed.get("batch_size") == batch_size)
+        ):
+            ids = observed.get("request_ids", [])
+            if (
+                not ids
+                or len(set(ids)) != len(ids)
+                or any(not isinstance(rid, str) or not rid for rid in ids)
+            ):
+                raise ValueError("Stable trigger lacks distinct actual request IDs")
+            return observed
+        time.sleep(0.05)
+    raise ValueError("No live same-request-set decode window before profile deadline")
+
+
 def execute(report, stage, args, acceptance):
     process = None
     root = args.output_dir
@@ -243,9 +279,11 @@ def execute(report, stage, args, acceptance):
         mapping = load("hardware_probe").device_mapping(
             stage
             | {
-                "variant": "cpu"
-                if report["profile_variant"] == "hbm"
-                else report["profile_variant"]
+                "variant": (
+                    "cpu"
+                    if report["profile_variant"] == "hbm"
+                    else report["profile_variant"]
+                )
             },
             mpu_ids=args.mpu_device_ids,
         )
@@ -288,9 +326,6 @@ def execute(report, stage, args, acceptance):
                 timeout=300,
             )
             report["flush_ack"] = post_text(args.port, "flush_cache", {})
-            report["profile_ack"] = post_text(
-                args.port, "start_profile", report["profile_request"]
-            )
             count = report["workload"]["concurrency"]
             prompts = (
                 load("workload").inputs(
@@ -299,19 +334,43 @@ def execute(report, stage, args, acceptance):
                 if getattr(args, "workload", None)
                 else [[42] * report["workload"]["input_len"] for _ in range(count)]
             )
-            response = COMMON.request_json(
-                args.port,
-                "generate",
-                {
-                    "input_ids": prompts if count > 1 else prompts[0],
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": report["workload"]["output_len"],
-                        "ignore_eos": True,
-                    },
+            payload = {
+                "input_ids": prompts if count > 1 else prompts[0],
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": report["workload"]["output_len"],
+                    "ignore_eos": True,
                 },
-                timeout=args.benchmark_timeout,
-            )
+            }
+            stable_steps = getattr(args, "profile_stable_steps", 0)
+            if stable_steps:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        COMMON.request_json,
+                        args.port,
+                        "generate",
+                        payload,
+                        timeout=args.benchmark_timeout,
+                    )
+                    report["trigger_progress_before"] = wait_stable(
+                        args.port,
+                        future,
+                        stable_steps,
+                        getattr(args, "profile_batch_size", None),
+                        args.benchmark_timeout,
+                    )
+                    report["profile_ack"] = post_text(
+                        args.port, "start_profile", report["profile_request"]
+                    )
+                    report["trigger_progress_after_ack"] = progress(args.port)
+                    response = future.result(timeout=args.benchmark_timeout)
+            else:
+                report["profile_ack"] = post_text(
+                    args.port, "start_profile", report["profile_request"]
+                )
+                response = COMMON.request_json(
+                    args.port, "generate", payload, timeout=args.benchmark_timeout
+                )
             responses = response if isinstance(response, list) else [response]
             if len(responses) != report["workload"]["concurrency"] or any(
                 item.get("meta_info", {}).get("completion_tokens")
@@ -327,6 +386,12 @@ def execute(report, stage, args, acceptance):
             report["profiled_request_ids"] = [
                 item["meta_info"].get("id") for item in responses
             ]
+            if stable_steps and not set(
+                report["trigger_progress_before"]["request_ids"]
+            ) <= set(report["profiled_request_ids"]):
+                raise ValueError(
+                    "Stable trigger request IDs are not from the profiled workload"
+                )
             RUN.wait_capacities(
                 root / "forward-trace",
                 stage,
@@ -401,8 +466,22 @@ def main(argv=None):
     parser.add_argument("--profile-steps", type=int, default=32)
     parser.add_argument("--profile-variant", choices=("cpu", "mpu", "hbm"))
     parser.add_argument("--profile-concurrency", type=int)
+    parser.add_argument("--profile-stable-steps", type=int, default=0)
+    parser.add_argument("--profile-batch-size", type=int)
     control, forwarded = parser.parse_known_args(argv)
+    if control.profile_stable_steps < 0 or (
+        control.profile_batch_size is not None and control.profile_batch_size < 1
+    ):
+        raise ValueError(
+            "Stable trigger steps must be nonnegative and batch size positive"
+        )
+    if control.profile_batch_size is not None and not control.profile_stable_steps:
+        raise ValueError(
+            "Profile batch-size constraint requires a stable decode trigger"
+        )
     stage, args = STAGE.parse_args(forwarded)
+    args.profile_stable_steps = control.profile_stable_steps
+    args.profile_batch_size = control.profile_batch_size
     if Path(args.model).is_dir():
         args.model = str(Path(args.model).resolve())
     report = plan(
@@ -412,6 +491,11 @@ def main(argv=None):
         control.profile_variant,
         control.profile_concurrency,
     )
+    report["stable_trigger"] = {
+        "min_consecutive_decode_steps": control.profile_stable_steps,
+        "required_actual_batch_size": control.profile_batch_size,
+        "criterion": "CPU metadata from actual consecutive forwards with the same request-ID set; no sleep-only assumption",
+    }
     args.output_dir.mkdir(parents=True, exist_ok=False)
     COMMON.write_manifest(args.output_dir / "profile.json", report)
     ok = execute(report, stage, args, control.acceptance) if args.execute else True

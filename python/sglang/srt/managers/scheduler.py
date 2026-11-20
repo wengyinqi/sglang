@@ -3318,6 +3318,8 @@ class Scheduler(
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
         # The benchmark needs actual capacity after memory profiling/clamping.
         ret["max_total_num_tokens"] = int(self.max_total_num_tokens)
+        if self.mpu_stage_timer is not None:
+            ret["mpu_forward_progress"] = self.mpu_stage_timer.progress_snapshot()
         if self.hisparse_coordinator is not None:
             capacity = self.hisparse_coordinator.get_mpu_capacity_info()
             if capacity is not None:
