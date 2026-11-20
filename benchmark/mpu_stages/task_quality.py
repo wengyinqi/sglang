@@ -141,6 +141,10 @@ def select(
         and max_total_tokens > max_new_tokens,
         "Invalid complete-input/output budgets",
     )
+    # Qwen tokenizer len() can enumerate its vocabulary metadata. Query it once
+    # for this read-only selection, rather than once for every encoded token.
+    vocabulary_size = len(tokenizer)
+    require(vocabulary_size > 0, "Tokenizer vocabulary must be nonempty")
     candidates, eligible, seen = [], collections.defaultdict(list), set()
     for index, record in enumerate(records):
         require(isinstance(record, dict), "Source records must be objects")
@@ -156,7 +160,7 @@ def select(
         )
         tokens = tokenizer.encode(rendered, add_special_tokens=False, truncation=False)
         require(
-            tokens and all(type(t) is int and 0 <= t < len(tokenizer) for t in tokens),
+            tokens and all(type(t) is int and 0 <= t < vocabulary_size for t in tokens),
             "Tokenizer returned malformed complete input IDs",
         )
         reason = (

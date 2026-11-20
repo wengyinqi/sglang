@@ -1,6 +1,7 @@
 """Complete task-input, normal-EOS scoring and paired-evidence contracts."""
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -148,6 +149,83 @@ def server(variant="cpu"):
 
 
 class TestTaskQuality(unittest.TestCase):
+    def test_selection_vocabulary_queries_are_constant_for_short_and_long_inputs(self):
+        class CountedTokenizer(Tokenizer):
+            len_calls = 0
+
+            def __len__(self):
+                self.len_calls += 1
+                if self.len_calls > 1:
+                    raise AssertionError(
+                        "Repeated vocabulary enumeration inside selection"
+                    )
+                return super().__len__()
+
+        for context_size in (10, 10000):
+            with self.subTest(context_size=context_size):
+                source = records()
+                for record in source:
+                    record["context"] = "Z" * context_size
+                tokenizer = CountedTokenizer()
+                rows, _ = QUALITY.select(
+                    source,
+                    tokenizer,
+                    count=12,
+                    seed=1729,
+                    max_input_tokens=32768,
+                    max_new_tokens=8192,
+                    max_total_tokens=65536,
+                )
+                self.assertEqual(len(rows), 12)
+                self.assertEqual(tokenizer.len_calls, 1)
+
+    def test_cached_vocabulary_preserves_legacy_ids_and_complete_selection(self):
+        # Golden canonical hashes were captured from fa90dd37 before the len()
+        # optimization. They include every selected token ID and candidate row.
+        expected = {
+            "ordinary": "1ba1f5f85a84cd611c5183dbb9d4f3ab15ed0d0f410ac5f043503d444e489c5c",
+            "overlong": "c3ff6f61258ef2da6ab0ddaba178f6e9f956d53d5301ae53d7113054782f1acf",
+        }
+        for scenario, digest in expected.items():
+            with self.subTest(scenario=scenario):
+                source = records()
+                if scenario == "overlong":
+                    source[0]["context"] = "Z" * 40000
+                rows, candidates = QUALITY.select(
+                    source,
+                    Tokenizer(),
+                    count=12,
+                    seed=1729,
+                    max_input_tokens=32768,
+                    max_new_tokens=8192,
+                    max_total_tokens=65536,
+                )
+                canonical = json.dumps(
+                    {"rows": rows, "candidates": candidates},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("ascii")
+                self.assertEqual(hashlib.sha256(canonical).hexdigest(), digest)
+
+    def test_cached_vocabulary_keeps_strict_token_id_validation(self):
+        for token in (-1, 65536, True):
+            with self.subTest(token=token):
+                tokenizer = Tokenizer()
+                with patch.object(tokenizer, "encode", return_value=[token]):
+                    with self.assertRaisesRegex(
+                        ValueError, "malformed complete input IDs"
+                    ):
+                        QUALITY.select(
+                            records(),
+                            tokenizer,
+                            count=1,
+                            seed=1729,
+                            max_input_tokens=32768,
+                            max_new_tokens=8192,
+                            max_total_tokens=65536,
+                        )
+
     def test_selection_is_complete_deterministic_and_domain_balanced(self):
         tok = Tokenizer()
         rows, candidates = QUALITY.select(
