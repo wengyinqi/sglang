@@ -155,3 +155,19 @@ def test_idle_hook_is_idempotent_before_and_after_wave(tmp_path):
     observer.finish_idle()
     assert phases == ["decode", "idle"]
     assert observer.path.read_text().count("memory_wave_complete") == 1
+
+
+def test_history_capacity_is_explicit_and_positive():
+    with patch.dict("os.environ", {}, clear=True):
+        assert MODULE.history_limit_from_environment() == 500000
+    with patch.dict(
+        "os.environ", {"SGLANG_EXPERIMENT_MEMORY_HISTORY_ENTRIES": "2000000"}
+    ):
+        assert MODULE.history_limit_from_environment() == 2000000
+    with patch.dict("os.environ", {"SGLANG_EXPERIMENT_MEMORY_HISTORY_ENTRIES": "0"}):
+        try:
+            MODULE.history_limit_from_environment()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Nonpositive history capacity must be rejected")
