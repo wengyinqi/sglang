@@ -20,6 +20,22 @@ def test_disabled_has_no_runtime_import():
         assert MODULE.ExperimentMemoryObserver.create(object()) is None
 
 
+def test_history_capacity_is_explicit_and_positive():
+    with patch.dict("os.environ", {}, clear=True):
+        assert MODULE.history_limit_from_environment() == 500000
+    with patch.dict(
+        "os.environ", {"SGLANG_EXPERIMENT_MEMORY_HISTORY_ENTRIES": "2000000"}
+    ):
+        assert MODULE.history_limit_from_environment() == 2000000
+    with patch.dict("os.environ", {"SGLANG_EXPERIMENT_MEMORY_HISTORY_ENTRIES": "0"}):
+        try:
+            MODULE.history_limit_from_environment()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Nonpositive history capacity must be rejected")
+
+
 def test_graph_segments_are_device_scoped_and_nonadditive():
     runner = SimpleNamespace(graphs={1: SimpleNamespace(pool=lambda: (1, 2))})
     segments = [

@@ -13,6 +13,13 @@ from collections import defaultdict
 from pathlib import Path
 
 
+def history_limit_from_environment():
+    limit = int(os.environ.get("SGLANG_EXPERIMENT_MEMORY_HISTORY_ENTRIES", "500000"))
+    if limit <= 0:
+        raise ValueError("Allocator history entry limit must be positive")
+    return limit
+
+
 def graph_pool_accounting(snapshot, graph_runner, device=None):
     """Measure recognized graph pool segments; reserved and allocated overlap."""
     graphs = getattr(graph_runner, "graphs", {}) if graph_runner is not None else {}
@@ -168,11 +175,13 @@ class ExperimentMemoryObserver:
                 "SGLANG_EXPERIMENT_MEMORY_DECODE_SAMPLES", "1,8,64,127"
             ).split(",")
         }
+        self.history_limit = history_limit_from_environment()
+        self.context["allocator_history_limit_entries"] = self.history_limit
         torch.cuda.memory._record_memory_history(
             enabled="all",
             context="all",
             stacks="python",
-            max_entries=500000,
+            max_entries=self.history_limit,
             clear_history=True,
         )
         with self.path.open("x", encoding="utf-8") as stream:
@@ -337,7 +346,7 @@ class ExperimentMemoryObserver:
         events = self._events(snapshot)
         record["allocator_history_transients"] = (
             {"status": "unavailable_history_truncation", "peak_live_bytes": None}
-            if len(events) >= 500000
+            if len(events) >= self.history_limit
             else transient_allocation_accounting(events, self._start_index)
         )
         record["type"] = "memory_snapshot"
