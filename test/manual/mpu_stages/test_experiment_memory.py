@@ -109,6 +109,15 @@ def context(**overrides):
         "process_id": 11,
         "device_uuid": "GPU-0",
         "source_revision": "abc123",
+        "model_revision": "model0",
+        "weight_format": "bfloat16",
+        "parallelism": "tp1_dp1_ep1",
+        "context_len": 128,
+        "request_slots": 4,
+        "actual_batch": 1,
+        "request_set_fingerprint": "request0",
+        "output_len": 8,
+        "cuda_graph": False,
         "layers": 2,
         "preallocated_request_slots": 4,
         "max_context_len": 128,
@@ -508,7 +517,7 @@ def test_bad_packed_regions_are_rejected(mutation):
 
 def controls(**overrides):
     result = {
-        name: {"dense": "same", "candidate": "same"}
+        name: {"dense": context()[name], "candidate": context()[name]}
         for name in CONTRACT.COMPARISON_CONTROLS
     }
     result.update(overrides)
