@@ -346,7 +346,9 @@ class ExperimentMemoryObserver:
         phase = (
             "decode"
             if batch.forward_mode.is_decode()
-            else "prefill" if batch.forward_mode.is_extend() else "idle"
+            else "prefill"
+            if batch.forward_mode.is_extend()
+            else "idle"
         )
         lengths = getattr(batch, "seq_lens_cpu", None)
         if lengths is None:
