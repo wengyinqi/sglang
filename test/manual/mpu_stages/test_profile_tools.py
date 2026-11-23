@@ -30,9 +30,12 @@ class ProfileTests(unittest.TestCase):
             plan = PROFILE.plan(stage, args, 32)
             self.assertIn("--capture-range=cudaProfilerApi", plan["server_command"])
             self.assertEqual(plan["profile_request"]["profile_stages"], ["decode"])
-            self.assertEqual(plan["environment"], {"SGLANG_PROFILE_V2": "1"})
+            self.assertEqual(
+                plan["environment"],
+                {**stage.get("server_environment", {}), "SGLANG_PROFILE_V2": "1"},
+            )
             cmd = plan["server_command"]
-            self.assertEqual(int(cmd[cmd.index("--context-length") + 1]), 8192 + 36)
+            self.assertEqual(int(cmd[cmd.index("--context-length") + 1]), 8192 + 38)
             self.assertFalse(plan["performance_result"])
             self.assertEqual(plan["workload"]["output_len"], 36)
 

@@ -117,6 +117,8 @@ class MPUStageForwardTimer:
         self._last_written_sequence = -1
         self._capacity_provider = capacity_provider
         self._last_capacity = None
+        self._progress = None
+        self._selector_runtime = metadata.get("selector_runtime")
         self._parallel_metadata = {
             key: metadata[key]
             for key in (
@@ -170,6 +172,21 @@ class MPUStageForwardTimer:
             parallel["tensor_parallel_audit"] = audit_model_tensor_parallelism(model)
         metadata = {
             **parallel,
+            "selector_runtime": (
+                {
+                    key: getattr(model.config, key, None)
+                    for key in (
+                        "index_topk",
+                        "index_kpool",
+                        "index_head_dim",
+                        "index_n_heads",
+                        "index_topk_freq",
+                        "index_topk_pattern",
+                    )
+                }
+                if model is not None and hasattr(model, "config")
+                else None
+            ),
             "tp_rank": tp_rank,
             "pp_rank": pp_rank,
             "dp_rank": dp_rank,
@@ -181,6 +198,7 @@ class MPUStageForwardTimer:
             "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
             "speculative_algorithm": server_args.speculative_algorithm,
             "disable_overlap_schedule": server_args.disable_overlap_schedule,
+            "prefill_max_requests": getattr(server_args, "prefill_max_requests", None),
             "disable_radix_cache": server_args.disable_radix_cache,
         }
         return cls(directory, metadata, capacity_provider=capacity_provider)
@@ -200,6 +218,12 @@ class MPUStageForwardTimer:
             "extend_lens": (
                 list(batch.extend_lens) if batch.forward_mode.name == "EXTEND" else None
             ),
+            "seq_lens": (
+                [int(value) for value in batch.seq_lens_cpu.tolist()]
+                if getattr(batch, "seq_lens_cpu", None) is not None
+                else None
+            ),
+            "actual_cuda_graph": None,
             "stream_id": stream.cuda_stream,
             "launch_monotonic_ns": time.monotonic_ns(),
             "success": False,
@@ -214,12 +238,54 @@ class MPUStageForwardTimer:
         start, end = self._event_factory(), self._event_factory()
         start.record(stream)
         try:
-            yield
+            yield metadata
             metadata["success"] = True
         finally:
             end.record(stream)
+            ids = tuple(sorted(metadata["request_ids"]))
+            previous = self._progress
+            stable = (
+                metadata["success"]
+                and metadata["forward_mode"] in ("decode", "idle")
+                and (ids or metadata["forward_mode"] == "idle")
+                and previous is not None
+                and previous["success"]
+                and previous["forward_mode"] == metadata["forward_mode"]
+                and tuple(previous["request_ids"]) == ids
+                and previous["stream_id"] == metadata["stream_id"]
+            )
+            self._progress = {
+                **self._parallel_metadata,
+                "tp_rank": self._parallel_metadata.get("attn_dp_rank", 0),
+                "dp_forward_modes": metadata.get("dp_forward_modes"),
+                "dp_num_tokens": metadata.get("dp_num_tokens"),
+                "sequence": metadata["sequence"],
+                "forward_mode": metadata["forward_mode"],
+                "request_ids": list(ids),
+                "batch_size": len(ids),
+                "stream_id": metadata["stream_id"],
+                "launch_monotonic_ns": metadata["launch_monotonic_ns"],
+                "success": metadata["success"],
+                "consecutive_stable_decode_steps": (
+                    previous["consecutive_stable_decode_steps"] + 1
+                    if stable
+                    else int(
+                        metadata["success"]
+                        and metadata["forward_mode"] in ("decode", "idle")
+                        and (bool(ids) or metadata["forward_mode"] == "idle")
+                    )
+                ),
+            }
             self._pending.append((start, end, metadata))
             self._collect(wait=False)
+
+    def progress_snapshot(self):
+        """Control-plane CPU metadata only; no event wait, KV read or file write."""
+        return (
+            None
+            if self._progress is None
+            else {**self._progress, "request_ids": list(self._progress["request_ids"])}
+        )
 
     def _collect(self, *, wait):
         if wait and self._pending:

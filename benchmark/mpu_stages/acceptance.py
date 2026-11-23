@@ -63,6 +63,13 @@ def portable_targets(stage):
         "test/manual/mpu_stages/test_lifecycle_cpu.py",
         "test/manual/mpu_stages/test_lifecycle_tools.py",
         "test/manual/mpu_stages/test_delivery_bundle.py",
+        "test/manual/mpu_stages/test_real_workload.py",
+        "test/manual/mpu_stages/test_steady_decode.py",
+        "test/manual/mpu_stages/test_task_quality.py",
+        "test/manual/mpu_stages/test_mixed_stability.py",
+        "test/manual/mpu_stages/test_multirank_tools.py",
+        "test/manual/mpu_stages/test_memory_observer.py",
+        "test/manual/mpu_stages/test_experiment_memory.py",
     ]
     if sys.platform == "linux":
         targets.append("test/manual/mpu_stages/test_cpu_processes_linux.py")
@@ -337,9 +344,11 @@ def make_steps(stage, args, control, stage_argv):
                         portable_targets(stage), root / "portable.xml"
                     ),
                     "report": str(root / "portable.xml"),
-                    "env": {"MPU_CPU_CONTROL_EVIDENCE": str(root / "cpu-processes")}
-                    if sys.platform == "linux"
-                    else {},
+                    "env": (
+                        {"MPU_CPU_CONTROL_EVIDENCE": str(root / "cpu-processes")}
+                        if sys.platform == "linux"
+                        else {}
+                    ),
                 }
             ],
         }
