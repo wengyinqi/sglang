@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
@@ -240,6 +241,21 @@ class HiSparseCoordinator:
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
 
+        metrics_mode = os.environ.get("SGLANG_HISPARSE_CACHE_METRICS", "0")
+        if metrics_mode not in ("0", "1"):
+            raise ValueError("SGLANG_HISPARSE_CACHE_METRICS must be 0 or 1")
+        if metrics_mode == "1" and (
+            self.mode != MODE_QUEST or self.backing_store != "cpu"
+        ):
+            raise ValueError(
+                "Diagnostic cache metrics currently require CPU-backed Qwen Quest"
+            )
+        self.cache_metrics = (
+            torch.zeros((layer_num, 5), dtype=torch.int64, device=device)
+            if metrics_mode == "1"
+            else None
+        )
+
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
@@ -284,7 +300,7 @@ class HiSparseCoordinator:
     def get_stage_capacity_info(self) -> dict:
         pool = self.mem_pool_host
         slots = self.mem_pool_device.size
-        return {
+        info = {
             "backing_store": self.backing_store,
             "physical_compute_slots": slots,
             "backing_slots": pool.size,
@@ -303,6 +319,21 @@ class HiSparseCoordinator:
             "scope": "all Qwen MHA/GQA K and V layers; excludes Quest selector metadata",
             **self._quest_memory_ledger(),
         }
+        if getattr(self, "cache_metrics", None) is not None:
+            from sglang.srt.observability.hisparse_cache_metrics import (
+                summarize_cache_metrics,
+            )
+
+            # This provider is published at scheduler idle. The optional counter
+            # copy is diagnostic work; the default path allocates no counters.
+            info["cache_metrics"] = summarize_cache_metrics(
+                self.cache_metrics.detach().cpu().tolist(),
+                self.mem_pool_host.token_stride_size,
+            )
+            info["cache_metrics_allocation_bytes"] = (
+                self.cache_metrics.numel() * self.cache_metrics.element_size()
+            )
+        return info
 
     def _quest_memory_ledger(self):
         if self.mode != MODE_QUEST:
@@ -1085,6 +1116,11 @@ class HiSparseCoordinator:
                     host_v_cache=self.mem_pool_host.v_buffer[layer_id],
                     device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
                     device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
+                    cache_metrics=(
+                        self.cache_metrics[layer_id]
+                        if self.cache_metrics is not None
+                        else None
+                    ),
                     **common_kwargs,
                 )
         else:

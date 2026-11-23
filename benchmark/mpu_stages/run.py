@@ -437,6 +437,14 @@ def execute(stage, args, manifest, path):
                         case["analysis"] = ANALYZE.analyze_when_ready(
                             result, group["trace_dir"], args.trace_timeout
                         )
+                        if stage["tp_size"] == 1:
+                            case["steady_decode"] = load("steady_decode").analyze(
+                                result, ANALYZE.load_traces(group["trace_dir"])
+                            )
+                            COMMON.write_manifest(
+                                args.output_dir / f"{case['id']}-steady.json",
+                                case["steady_decode"],
+                            )
                         case["idle_capacity"] = wait_capacities(
                             group["trace_dir"],
                             stage,

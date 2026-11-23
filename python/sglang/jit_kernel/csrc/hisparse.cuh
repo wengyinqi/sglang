@@ -102,7 +102,7 @@ struct SmemLayout {
 // req_pool_indices are int64_t (pool indices can be large), seq_lens can be int32_t or int64_t
 // Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
 // newest_slot is at HOT_BUFFER_SIZE (first position of extra page)
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer, typename SeqLensT>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer, typename SeqLensT, bool CollectMetrics = false>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -132,7 +132,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t peer_rows,
     int64_t local_rows,
     int64_t req_count,
-    int64_t cache_columns) {
+    int64_t cache_columns,
+    int64_t* __restrict__ cache_metrics) {
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
@@ -175,6 +176,15 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (seq_len <= HOT_BUFFER_SIZE) {
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
+    if constexpr (CollectMetrics) {
+      if (tid == 0) {
+        int selected = 0;
+        for (int i = 0; i < count; ++i) selected += req_top_k_tokens[i] >= 0;
+        atomicAdd(reinterpret_cast<unsigned long long*>(cache_metrics), 1ULL);
+        atomicAdd(reinterpret_cast<unsigned long long*>(cache_metrics + 1), static_cast<unsigned long long>(selected));
+        atomicAdd(reinterpret_cast<unsigned long long*>(cache_metrics + 2), static_cast<unsigned long long>(selected));
+      }
+    }
     for (int i = tid; i < count; i += BLOCK_SIZE) {
       int32_t token_pos = req_top_k_tokens[i];
       if constexpr (IsPeer) {
@@ -416,6 +426,15 @@ __global__ void load_cache_to_device_buffer_kernel(
   __syncthreads();
 
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  if constexpr (CollectMetrics) {
+    if (tid == 0) {
+      atomicAdd(reinterpret_cast<unsigned long long*>(cache_metrics), 1ULL);
+      atomicAdd(reinterpret_cast<unsigned long long*>(cache_metrics + 1), static_cast<unsigned long long>(NUM_TOP_K));
+      atomicAdd(reinterpret_cast<unsigned long long*>(cache_metrics + 2), static_cast<unsigned long long>(s_total_hits));
+      atomicAdd(reinterpret_cast<unsigned long long*>(cache_metrics + 3), static_cast<unsigned long long>(s_newest_hit));
+      atomicAdd(reinterpret_cast<unsigned long long*>(cache_metrics + 4), static_cast<unsigned long long>(total_misses));
+    }
+  }
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
@@ -468,7 +487,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer, bool CollectMetrics = false>
 void launch_load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -490,7 +509,8 @@ void launch_load_cache_to_device_buffer(
     int64_t num_shards,
     int64_t num_layers,
     int64_t layer_id,
-    int64_t peer_rows) {
+    int64_t peer_rows,
+    int64_t* cache_metrics = nullptr) {
   using namespace host;
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -538,17 +558,18 @@ void launch_load_cache_to_device_buffer(
         peer_rows,
         device_buffer_k.shape()[0],
         device_buffer_tokens.shape()[0],
-        host_cache_locs.shape()[1]);
+        host_cache_locs.shape()[1],
+        cache_metrics);
   };
 
   const auto dtype = seq_lens.dtype();
   if (dtype.code == kDLInt && dtype.bits == 64) {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int64_t>,
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int64_t, CollectMetrics>,
         static_cast<const int64_t*>(seq_lens.data_ptr()));
   } else {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int32_t>,
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int32_t, CollectMetrics>,
         static_cast<const int32_t*>(seq_lens.data_ptr()));
   }
 }
@@ -593,6 +614,33 @@ void load_cache_to_device_buffer(
       0,
       0,
       0);
+}
+
+// Diagnostic-only entry point. The default entry point compiles out all metrics.
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
+void load_cache_to_device_buffer_with_metrics(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView host_cache_k,
+    tvm::ffi::TensorView host_cache_v,
+    tvm::ffi::TensorView device_buffer_k,
+    tvm::ffi::TensorView device_buffer_v,
+    tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView num_real_reqs,
+    int64_t page_size,
+    int64_t item_size_bytes,
+    tvm::ffi::TensorView cache_metrics) {
+  launch_load_cache_to_device_buffer<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, false, true>(
+      top_k_tokens, device_buffer_tokens, host_cache_locs, device_buffer_locs,
+      host_cache_k.data_ptr(), IsMLA ? nullptr : host_cache_v.data_ptr(),
+      device_buffer_k, device_buffer_v, top_k_device_locs, req_pool_indices,
+      seq_lens, lru_slots, num_real_reqs, page_size, item_size_bytes,
+      nullptr, 0, 0, 0, 0, 0, static_cast<int64_t*>(cache_metrics.data_ptr()));
 }
 
 // Pointer metadata lives on the compute GPU. No storage tensor is dispatched.

@@ -117,6 +117,7 @@ class MPUStageForwardTimer:
         self._last_written_sequence = -1
         self._capacity_provider = capacity_provider
         self._last_capacity = None
+        self._progress = None
         self._parallel_metadata = {
             key: metadata[key]
             for key in (
@@ -219,8 +220,46 @@ class MPUStageForwardTimer:
             metadata["success"] = True
         finally:
             end.record(stream)
+            ids = tuple(sorted(metadata["request_ids"]))
+            previous = self._progress
+            stable = (
+                metadata["success"]
+                and metadata["forward_mode"] == "decode"
+                and ids
+                and previous is not None
+                and previous["success"]
+                and previous["forward_mode"] == "decode"
+                and tuple(previous["request_ids"]) == ids
+                and previous["stream_id"] == metadata["stream_id"]
+            )
+            self._progress = {
+                "sequence": metadata["sequence"],
+                "forward_mode": metadata["forward_mode"],
+                "request_ids": list(ids),
+                "batch_size": len(ids),
+                "stream_id": metadata["stream_id"],
+                "launch_monotonic_ns": metadata["launch_monotonic_ns"],
+                "success": metadata["success"],
+                "consecutive_stable_decode_steps": (
+                    previous["consecutive_stable_decode_steps"] + 1
+                    if stable
+                    else int(
+                        metadata["success"]
+                        and metadata["forward_mode"] == "decode"
+                        and bool(ids)
+                    )
+                ),
+            }
             self._pending.append((start, end, metadata))
             self._collect(wait=False)
+
+    def progress_snapshot(self):
+        """Control-plane CPU metadata only; no event wait, KV read or file write."""
+        return (
+            None
+            if self._progress is None
+            else {**self._progress, "request_ids": list(self._progress["request_ids"])}
+        )
 
     def _collect(self, *, wait):
         if wait and self._pending:

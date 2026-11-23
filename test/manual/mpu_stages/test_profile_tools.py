@@ -5,7 +5,9 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -49,7 +51,20 @@ class ProfileTests(unittest.TestCase):
 
     def test_mpu_stage_cpu_profile_uses_reference_ratio_not_target_ratio(self):
         stage, args = PROFILE.STAGE.parse_args(
-            ["--cpu-capacity-ratio", "3", "--capacity-ratios", "1", "2", "4", "8"]
+            [
+                "--cpu-capacity-ratio",
+                "3",
+                "--capacity-ratios",
+                "1",
+                "2",
+                "4",
+                "8",
+                "--mpu-device-ids",
+                "1",
+                "2",
+                "3",
+                "4",
+            ]
         )
         stage["variant"] = "mpu"
         cpu = PROFILE.plan(stage, args, 32, "cpu", 1)
@@ -85,6 +100,30 @@ class ProfileTests(unittest.TestCase):
         settings["cpu_capacity_ratio"] = 4
         with self.assertRaisesRegex(ValueError, "cpu_capacity_ratio"):
             PROFILE.correctness_gate(receipt, stage, runtime, args, model_report, "cpu")
+        settings["cpu_capacity_ratio"] = 3
+        settings["mpu_device_ids"] = [1]
+        with self.assertRaisesRegex(ValueError, "mpu_device_ids"):
+            PROFILE.correctness_gate(receipt, stage, runtime, args, model_report, "cpu")
+
+    def test_mpu_campaign_reference_profiles_only_map_their_actual_compute_device(self):
+        stage, args = PROFILE.STAGE.parse_args(
+            ["--mpu-device-ids", "1", "2", "3", "4", "--mpu-memory-reserve-bytes", "0"]
+        )
+        for variant in ("cpu", "hbm"):
+            with self.subTest(variant=variant):
+                mapping = PROFILE.profile_device_mapping(stage, args, variant)
+                self.assertEqual(mapping["compute_device_ids"], [0])
+                self.assertEqual(mapping["mpu_device_ids"], [])
+                self.assertEqual(mapping["pairs"], [])
+                self.assertIsNone(mapping["mpu_memory_reserve_bytes"])
+        mapping = PROFILE.profile_device_mapping(stage, args, "mpu")
+        self.assertEqual(mapping["compute_device_ids"], [0])
+        self.assertEqual(mapping["mpu_device_ids"], [1, 2, 3, 4])
+        self.assertEqual(mapping["mpu_memory_reserve_bytes"], 0)
+        self.assertEqual(
+            mapping["pairs"],
+            [{"compute": 0, "storage": device} for device in range(1, 5)],
+        )
 
     def test_mpu_kv_kernels_are_visible_in_bottleneck_categories(self):
         bottleneck = load("bottleneck_analyze")
@@ -96,6 +135,62 @@ class ProfileTests(unittest.TestCase):
             "kv_resolve_and_pack",
         )
         self.assertEqual(bottleneck.category("unknown_kernel"), "unclassified")
+
+    def test_stable_profile_budget_keeps_trigger_and_capture_in_the_same_request(self):
+        stage, args = PROFILE.STAGE.parse_args(
+            [
+                "--input-lens",
+                "8192",
+                "--output-len",
+                "4",
+                "--cpu-capacity-ratio",
+                "3",
+                "--capacity-ratios",
+                "1",
+            ]
+        )
+        args.profile_stable_steps = 16
+        profile = PROFILE.plan(stage, args, 64, "cpu", 8)
+        self.assertEqual(profile["workload"]["output_len"], 84)
+        command = profile["server_command"]
+        config = json.loads(command[command.index("--hisparse-config") + 1])
+        self.assertEqual(config["host_to_device_ratio"], 3)
+        self.assertGreaterEqual(
+            int(command[command.index("--context-length") + 1]), 8192 + 84
+        )
+
+    def test_live_stable_trigger_rejects_wrong_batch_and_propagates_request_failure(
+        self,
+    ):
+        snapshot = {
+            "success": True,
+            "forward_mode": "decode",
+            "consecutive_stable_decode_steps": 16,
+            "batch_size": 2,
+            "request_ids": ["a", "b"],
+        }
+        future = Future()
+        with patch.object(
+            PROFILE, "progress", side_effect=[snapshot | {"batch_size": 1}, snapshot]
+        ), patch.object(PROFILE.time, "sleep"):
+            self.assertEqual(PROFILE.wait_stable(1, future, 16, 2, 1), snapshot)
+        failed = Future()
+        failed.set_exception(RuntimeError("actual request failed"))
+        with self.assertRaisesRegex(RuntimeError, "actual request failed"):
+            PROFILE.wait_stable(1, failed, 16, 2, 1)
+
+    def test_live_stable_trigger_requires_distinct_real_request_ids(self):
+        snapshot = {
+            "success": True,
+            "forward_mode": "decode",
+            "consecutive_stable_decode_steps": 16,
+            "batch_size": 2,
+            "request_ids": ["a", "a"],
+        }
+        with patch.object(
+            PROFILE, "progress", return_value=snapshot
+        ), self.assertRaisesRegex(ValueError, "distinct actual request IDs"):
+            PROFILE.wait_stable(1, Future(), 16, 2, 1)
 
     def fixture(self, root, kernels):
         path = root / "trace.sqlite"

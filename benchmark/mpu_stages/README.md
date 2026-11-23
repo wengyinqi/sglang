@@ -1,5 +1,9 @@
 # MPU 分阶段实验公共入口
 
+本轮接入稳态 decode、完整任务质量、取消/恢复与多卡资源诊断，见
+[STAGE02_TOOL_SYNC.md](STAGE02_TOOL_SYNC.md)。1+0 原始证据保持独立，
+02 的 MPU/P2P 执行仍须有额外存储卡。
+
 真实长文本快照、CPU DDR／MPU／HBM Quest 对照、后备容量扫描与独立 decode profiling 的
 共同入口见 [REAL_WORKLOAD.md](REAL_WORKLOAD.md)。默认 random-ids 基线继续保留。
 

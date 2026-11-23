@@ -517,6 +517,13 @@ class TestStagePlanning(unittest.TestCase):
                 )
             )
             stack.enter_context(
+                patch.object(RUN.ANALYZE, "load_traces", return_value=[])
+            )
+            steady = SimpleNamespace(
+                analyze=lambda *a: events.append("steady") or {"status": "analyzed"}
+            )
+            stack.enter_context(patch.object(RUN, "load", return_value=steady))
+            stack.enter_context(
                 patch.object(
                     RUN.COMMON,
                     "stop_server",
@@ -526,7 +533,7 @@ class TestStagePlanning(unittest.TestCase):
             self.assertTrue(
                 RUN.execute(stage, args, manifest, args.output_dir / "manifest.json")
             )
-        self.assertEqual(events, ["analyze", "stop"])
+        self.assertEqual(events, ["analyze", "steady", "stop"])
 
 
 class TestTPAccounting(unittest.TestCase):

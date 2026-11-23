@@ -18,10 +18,11 @@ def _jit_sparse_module(
     num_top_k: int,
     hot_buffer_size: int,
     is_mla: bool = False,
+    collect_metrics: bool = False,
 ) -> Module:
     template_args = make_cpp_args(block_size, num_top_k, hot_buffer_size, is_mla)
     cache_args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla
+        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, collect_metrics
     )
     return load_jit(
         "sparse_cache",
@@ -29,8 +30,16 @@ def _jit_sparse_module(
         cuda_files=["hisparse.cuh"],
         cuda_wrappers=[
             (
-                "load_cache_to_device_buffer",
-                f"load_cache_to_device_buffer<{template_args}>",
+                (
+                    "load_cache_to_device_buffer_with_metrics"
+                    if collect_metrics
+                    else "load_cache_to_device_buffer"
+                ),
+                (
+                    f"load_cache_to_device_buffer_with_metrics<{template_args}>"
+                    if collect_metrics
+                    else f"load_cache_to_device_buffer<{template_args}>"
+                ),
             )
         ],
     )
@@ -107,6 +116,7 @@ def load_cache_to_device_buffer_mha(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    cache_metrics: torch.Tensor | None = None,
 ) -> None:
     """MHA/GQA variant of :func:`load_cache_to_device_buffer_mla`.
 
@@ -119,8 +129,23 @@ def load_cache_to_device_buffer_mha(
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
 
+    if cache_metrics is not None and (
+        cache_metrics.dtype != torch.int64
+        or cache_metrics.device != top_k_tokens.device
+        or cache_metrics.shape != (5,)
+        or not cache_metrics.is_contiguous()
+    ):
+        raise ValueError(
+            "Cache metrics must be contiguous int64[5] on the compute device"
+        )
+
     module = _jit_sparse_module(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla=False
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla=False,
+        collect_metrics=cache_metrics is not None,
     )
 
     if num_real_reqs is None:
@@ -128,7 +153,13 @@ def load_cache_to_device_buffer_mha(
             [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
         )
 
-    module.load_cache_to_device_buffer(
+    entry = (
+        module.load_cache_to_device_buffer
+        if cache_metrics is None
+        else module.load_cache_to_device_buffer_with_metrics
+    )
+    extra = [] if cache_metrics is None else [cache_metrics]
+    entry(
         top_k_tokens,
         device_buffer_tokens,
         host_cache_locs,
@@ -144,6 +175,7 @@ def load_cache_to_device_buffer_mha(
         num_real_reqs,
         page_size,
         item_size_bytes,
+        *extra,
     )
 
 

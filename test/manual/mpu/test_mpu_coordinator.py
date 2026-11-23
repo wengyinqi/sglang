@@ -7,6 +7,7 @@ are spies, so these tests verify integration, not CUDA or peer-memory behavior.
 import ast
 import importlib.util
 import logging
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -106,6 +107,7 @@ def coordinator_type():
     cpu_host = Mock(side_effect=_Backing)
     stream = SimpleNamespace(wait_stream=Mock())
     namespace = dict(
+        os=os,
         torch=torch,
         logger=logging.getLogger(__name__),
         MODE_QUEST="quest",
@@ -177,6 +179,18 @@ class TestMPUCoordinator(unittest.TestCase):
         self.assertEqual(coord.mpu_budget.capacity, 256)
         coord.close()
         coord.mem_pool_host.close.assert_called_once()
+
+    def test_default_mpu_path_does_not_allocate_cpu_diagnostic_counters(self):
+        with patch.dict(os.environ, {"SGLANG_HISPARSE_CACHE_METRICS": "0"}):
+            coord, ns, _ = self.fixture()
+        self.assertIsNone(coord.cache_metrics)
+        self.assertNotIn("cache_metrics", coord.get_stage_capacity_info())
+        ns["MHATokenToKVPoolHost"].assert_not_called()
+
+    def test_cpu_only_metrics_cannot_be_enabled_for_mpu(self):
+        with patch.dict(os.environ, {"SGLANG_HISPARSE_CACHE_METRICS": "1"}):
+            with self.assertRaisesRegex(ValueError, "CPU-backed Qwen Quest"):
+                self.fixture()
 
     def test_resolve_dispatch_uses_peer_table_and_global_backing_slots(self):
         coord, ns, _ = self.fixture()
