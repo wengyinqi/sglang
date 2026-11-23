@@ -187,3 +187,10 @@ establish mechanism superiority. `4+4` needs real peer-access validation.
 ```bash
 python -m pytest -q test/manual/mpu_stages/test_experiment_memory.py
 ```
+
+## Allocator history capacity
+
+The synchronizing observer accepts `SGLANG_EXPERIMENT_MEMORY_HISTORY_ENTRIES`
+(default500000). Increase it for long eager selector diagnostics when the ring
+truncates; the resolved limit is recorded in context. A truncated transient
+measurement remains null. This instrumentation is excluded from performance runs.
