@@ -464,6 +464,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Get available memory before model loading
         pre_model_load_memory = self.init_torch_distributed()
+        # This observer synchronizes and records allocator history only in an
+        # explicitly requested diagnostic run. Formal performance runs omit it.
+        self.experiment_memory_observer = None
+        if os.environ.get("SGLANG_EXPERIMENT_MEMORY_DIR"):
+            from sglang.srt.observability.experiment_memory_observer import (
+                ExperimentMemoryObserver,
+            )
+
+            self.experiment_memory_observer = ExperimentMemoryObserver.create(self)
 
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
@@ -782,6 +791,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
+            if self.experiment_memory_observer is not None:
+                self.experiment_memory_observer.begin_phase("graph_warmup")
             self.kernel_warmup()
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
@@ -807,6 +818,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+        if self.experiment_memory_observer is not None:
+            self.experiment_memory_observer.checkpoint(final=True)
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -2980,6 +2993,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        if self.experiment_memory_observer is not None:
+            self.experiment_memory_observer.before_forward(forward_batch)
 
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -3047,6 +3062,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
+        if self.experiment_memory_observer is not None:
+            self.experiment_memory_observer.after_forward(output)
         return output
 
     def _forward_raw(

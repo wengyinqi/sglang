@@ -2875,11 +2875,15 @@ class Scheduler(
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
-                    with self.record_forward_metrics(batch):
+                    with self.record_forward_metrics(batch) as mpu_forward_record:
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch
                             # here pp is not compatible with overlap
                         )
+                        if mpu_forward_record is not None:
+                            mpu_forward_record["actual_cuda_graph"] = bool(
+                                batch_result.can_run_cuda_graph
+                            )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -2915,10 +2919,14 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                with self.record_forward_metrics(batch):
+                with self.record_forward_metrics(batch) as mpu_forward_record:
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
                     )
+                    if mpu_forward_record is not None:
+                        mpu_forward_record["actual_cuda_graph"] = bool(
+                            batch_result.can_run_cuda_graph
+                        )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 

@@ -544,6 +544,10 @@ class SchedulerRuntimeCheckerMixin:
             self.hisparse_forward_timer.flush_idle()
         if self.mpu_stage_timer is not None:
             self.mpu_stage_timer.flush_idle()
+        runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+        observer = getattr(runner, "experiment_memory_observer", None)
+        if observer is not None:
+            observer.finish_idle()
 
         if self.hisparse_coordinator is not None:
             capacity = self.hisparse_coordinator.get_stage_capacity_info()

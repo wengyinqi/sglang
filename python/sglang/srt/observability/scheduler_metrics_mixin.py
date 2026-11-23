@@ -969,9 +969,10 @@ class SchedulerMetricsMixin:
                 )
             if timer is not None:
                 stack.enter_context(timer.wrap(batch))
+            stage_record = None
             if stage_timer is not None:
-                stack.enter_context(stage_timer.wrap(batch))
-            yield
+                stage_record = stack.enter_context(stage_timer.wrap(batch))
+            yield stage_record
 
     @contextmanager
     def record_bubble_metrics(self: Scheduler, batch: ScheduleBatch):

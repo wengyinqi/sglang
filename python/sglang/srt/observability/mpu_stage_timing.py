@@ -202,6 +202,12 @@ class MPUStageForwardTimer:
             "extend_lens": (
                 list(batch.extend_lens) if batch.forward_mode.name == "EXTEND" else None
             ),
+            "seq_lens": (
+                [int(value) for value in batch.seq_lens_cpu.tolist()]
+                if getattr(batch, "seq_lens_cpu", None) is not None
+                else None
+            ),
+            "actual_cuda_graph": None,
             "stream_id": stream.cuda_stream,
             "launch_monotonic_ns": time.monotonic_ns(),
             "success": False,
@@ -216,7 +222,7 @@ class MPUStageForwardTimer:
         start, end = self._event_factory(), self._event_factory()
         start.record(stream)
         try:
-            yield
+            yield metadata
             metadata["success"] = True
         finally:
             end.record(stream)
