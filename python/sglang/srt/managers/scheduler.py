@@ -4673,10 +4673,14 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        with self.record_mpu_stage_forward(batch):
+                        with self.record_mpu_stage_forward(batch) as mpu_forward_record:
                             batch_result = self.model_worker.forward_batch_generation(
                                 batch, **fwd_kwargs
                             )
+                            if mpu_forward_record is not None:
+                                mpu_forward_record["actual_cuda_graph"] = bool(
+                                    batch_result.can_run_cuda_graph
+                                )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4840,10 +4844,14 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                with self.record_mpu_stage_forward(batch):
+                with self.record_mpu_stage_forward(batch) as mpu_forward_record:
                     batch_result = self.model_worker.forward_batch_generation(
                         batch, **kwargs
                     )
+                    if mpu_forward_record is not None:
+                        mpu_forward_record["actual_cuda_graph"] = bool(
+                            batch_result.can_run_cuda_graph
+                        )
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
@@ -5236,6 +5244,11 @@ class Scheduler(
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
+        memory_observer = getattr(
+            self.tp_worker.model_runner, "experiment_memory_observer", None
+        )
+        if memory_observer is not None:
+            memory_observer.finish_idle()
 
         if self.mpu_stage_timer is not None:
             self.mpu_stage_timer.flush_idle()
