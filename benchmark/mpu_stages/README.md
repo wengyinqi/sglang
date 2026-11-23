@@ -188,3 +188,5 @@ python -m pytest test/manual/mpu_stages -q
 
 独立 decode profiler、设备角色检查、容量曲线重复区间与 SLO/成本策略，见
 [PROFILING_AND_COST.md](PROFILING_AND_COST.md)。profiler 样本不参与性能统计。
+
+The latest frozen-workload, actual-batch, task-quality and four-rank stability/profiling contracts are documented in [MULTIRANK_TOOLS.md](MULTIRANK_TOOLS.md).
