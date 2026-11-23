@@ -1,6 +1,7 @@
 """Standalone process and native benchmark helpers for all six MPU stages."""
 
 import importlib.metadata
+import importlib.util
 import json
 import os
 import platform
@@ -18,6 +19,22 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 def benchmark_command(args, input_len, concurrency, repeat, output):
+    dataset = ["--dataset-name", "random-ids"]
+    if getattr(args, "workload", None) is not None:
+        spec = importlib.util.spec_from_file_location(
+            "mpu_common_workload", Path(__file__).with_name("workload.py")
+        )
+        workload = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(workload)
+        source, item = workload.bucket(args.workload, input_len)
+        dataset = [
+            "--dataset-name",
+            "frozen-ids",
+            "--dataset-path",
+            str(source),
+            "--frozen-ids-sha256",
+            item["sha256"],
+        ]
     return [
         sys.executable,
         "-m",
@@ -30,8 +47,7 @@ def benchmark_command(args, input_len, concurrency, repeat, output):
         "127.0.0.1",
         "--port",
         str(args.port),
-        "--dataset-name",
-        "random-ids",
+        *dataset,
         "--random-input-len",
         str(input_len),
         "--random-output-len",

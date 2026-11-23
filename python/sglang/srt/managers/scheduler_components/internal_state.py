@@ -59,6 +59,11 @@ class SchedulerInternalStateController:
             contribute(state)
         # A bound signal handler is not msgpack-serializable, and no reader
         # consumes it.
+        timer = getattr(self.scheduler, "mpu_stage_timer", None)
+        if timer is not None:
+            state["mpu_forward_progress"] = timer.progress_snapshot()
+            state["mpu_parallel_metadata"] = dict(timer._parallel_metadata)
+            state["mpu_selector_runtime"] = timer._selector_runtime
         state.pop("custom_sigquit_handler", None)
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(state))
 

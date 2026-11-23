@@ -461,6 +461,15 @@ class ModelRunner:
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
+        self.experiment_memory_observer = None
+        from os import environ as experiment_memory_environment
+
+        if experiment_memory_environment.get("SGLANG_EXPERIMENT_MEMORY_DIR"):
+            from sglang.srt.observability.experiment_memory_observer import (
+                ExperimentMemoryObserver,
+            )
+
+            self.experiment_memory_observer = ExperimentMemoryObserver.create(self)
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -508,9 +517,9 @@ class ModelRunner:
 
         if get_parallel().pp_size > 1:
             if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
-                assert self.support_pp, (
-                    "Pipeline Parallel is not compatible with this model."
-                )
+                assert (
+                    self.support_pp
+                ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
         self.init_weight_updater()
@@ -1166,6 +1175,8 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        if self.experiment_memory_observer is not None:
+            self.experiment_memory_observer.begin_phase("graph_warmup")
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():
@@ -1216,6 +1227,8 @@ class ModelRunner:
             self._finalize_elastic_ep_joiner(target_size)
 
         prebuild_deepep_v2_buffer(model=self.model)
+        if self.experiment_memory_observer is not None:
+            self.experiment_memory_observer.checkpoint(final=True)
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1820,6 +1833,8 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        if self.experiment_memory_observer is not None:
+            self.experiment_memory_observer.before_forward(forward_batch)
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -1908,6 +1923,8 @@ class ModelRunner:
         ):
             self.maybe_join_ep_ranks()
 
+        if self.experiment_memory_observer is not None:
+            self.experiment_memory_observer.after_forward(output)
         return output
 
     def _maybe_execute_deferred_mamba_cow_and_clear(

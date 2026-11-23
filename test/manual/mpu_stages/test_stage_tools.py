@@ -385,6 +385,21 @@ class TestStagePlanning(unittest.TestCase):
                 patch.object(RUN.ANALYZE, "read_jsonl", return_value=[value])
             )
             stack.enter_context(
+                patch.object(RUN.ANALYZE, "load_traces", return_value=[])
+            )
+            original_load = RUN.load
+            stack.enter_context(
+                patch.object(
+                    RUN,
+                    "load",
+                    side_effect=lambda name: (
+                        SimpleNamespace(analyze=lambda *a: {})
+                        if name == "steady_decode"
+                        else original_load(name)
+                    ),
+                )
+            )
+            stack.enter_context(
                 patch.object(
                     RUN.ANALYZE,
                     "analyze_when_ready",

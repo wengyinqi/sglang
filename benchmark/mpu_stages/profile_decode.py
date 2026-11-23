@@ -14,7 +14,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,7 +47,26 @@ def identity(path):
     }
 
 
-def correctness_gate(report, stage, runtime, args, model_report):
+def profile_ratio(stage, args, variant):
+    if variant == "hbm":
+        return None
+    if variant == "cpu" and stage["variant"] == "mpu":
+        return args.cpu_capacity_ratio
+    return args.capacity_ratios[0]
+
+
+def profile_device_mapping(stage, args, variant):
+    """CPU/HBM references use the compute GPU, without target storage roles."""
+    return load("hardware_probe").device_mapping(
+        stage | {"variant": "cpu" if variant == "hbm" else variant},
+        mpu_ids=args.mpu_device_ids if variant == "mpu" else None,
+        memory_reserve_bytes=(
+            args.mpu_memory_reserve_bytes if variant == "mpu" else None
+        ),
+    )
+
+
+def correctness_gate(report, stage, runtime, args, model_report, variant=None):
     if (
         report.get("evidence_scope", {}).get("target_model_correctness_executed")
         is not True
@@ -79,35 +100,62 @@ def correctness_gate(report, stage, runtime, args, model_report):
         "cpu_capacity_ratio",
         "mem_fraction_static",
         "chunked_prefill_size",
+        "prefill_max_requests",
         "disable_cuda_graph",
         "mpu_memory_reserve_bytes",
+        "workload",
+        "workload_sha256",
     ):
-        actual = getattr(args, name)
+        actual = getattr(args, name, None)
+        if isinstance(actual, Path):
+            actual = str(actual)
         if settings.get(name) != actual:
             raise ValueError(
                 f"Profiling configuration differs from correctness acceptance: {name}"
             )
-    if args.capacity_ratios[0] not in settings.get("capacity_ratios", []):
+    variant = variant or stage["variant"]
+    # The MPU stage's CPU reference has its own fixed backing ratio. It is not
+    # one of the target MPU capacity sweep points; its identity is checked above.
+    cpu_reference = variant == "cpu" and stage["variant"] == "mpu"
+    if not cpu_reference and args.capacity_ratios[0] not in settings.get(
+        "capacity_ratios", []
+    ):
         raise ValueError(
             "Profile capacity ratio was not covered by correctness acceptance"
         )
+    if variant == "hbm" and not settings.get("include_hbm"):
+        raise ValueError("HBM profiling requires the passed HBM correctness reference")
 
 
-def plan(stage, args, steps):
+def plan(stage, args, steps, variant=None, concurrency=None):
     if type(steps) is not int or not 1 <= steps <= 512:
         raise ValueError("Profile steps must be between 1 and 512")
     # A further scheduler step closes the upstream profile trigger. Keep the
     # request alive past the trigger, rather than relying on an idle flush.
-    output_len = max(args.output_len, steps + 4)
+    stable_steps = getattr(args, "profile_stable_steps", 0)
+    if type(stable_steps) is not int or stable_steps < 0:
+        raise ValueError("Stable trigger steps must be a nonnegative integer")
+    output_len = max(args.output_len, steps + stable_steps + 4)
+    variant = variant or stage["variant"]
+    concurrency = stage.get("attn_dp_size", 1) if concurrency is None else concurrency
+    if variant not in stage["variants"] or (
+        variant == "hbm" and not stage.get("hbm_preserves_selector")
+    ):
+        raise ValueError("Profile variant must preserve the accepted sparse selector")
+    if type(concurrency) is not int or concurrency <= 0:
+        raise ValueError("Profile concurrency must be positive")
+    if stage.get("attn_dp_size", 1) > 1 and concurrency != 4:
+        raise ValueError("Multi-rank profiling requires four Attention owners")
     root = args.output_dir
     server_args = copy.copy(args)
     server_args.output_len = output_len
+    server_args.concurrencies = [max(max(args.concurrencies), concurrency)]
     server = STAGE.server_command(
         stage,
         server_args,
-        stage["variant"],
+        variant,
         args.input_lens[0],
-        args.capacity_ratios[0],
+        profile_ratio(stage, args, variant),
     )
     wrapper = (
         "import os,pathlib,runpy,sys; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
@@ -134,8 +182,12 @@ def plan(stage, args, steps):
         "schema_version": 1,
         "status": "planned",
         "stage": stage,
+        "profile_variant": variant,
         "server_command": command,
-        "environment": {"SGLANG_PROFILE_V2": "1"},
+        "environment": {
+            **stage.get("server_environment", {}),
+            "SGLANG_PROFILE_V2": "1",
+        },
         "profile_request": {
             "activities": ["CUDA_PROFILER"],
             "profile_by_stage": True,
@@ -148,8 +200,14 @@ def plan(stage, args, steps):
         "workload": {
             "input_len": args.input_lens[0],
             "output_len": output_len,
-            "concurrency": stage.get("attn_dp_size", 1),
-            "prompt": "synthetic repeated token 42; diagnostic only",
+            "concurrency": concurrency,
+            "prompt": (
+                "frozen real-document input IDs; diagnostic only"
+                if getattr(args, "workload", None)
+                else "synthetic repeated token 42; diagnostic only"
+            ),
+            "manifest": str(args.workload) if getattr(args, "workload", None) else None,
+            "manifest_sha256": getattr(args, "workload_sha256", None),
         },
         "configured_decode_steps": steps,
         "actual_steps_verified": False,
@@ -170,6 +228,47 @@ def post_text(port, route, payload):
         if response.status != 200:
             raise RuntimeError(f"Profile control returned HTTP {response.status}")
         return response.read().decode()
+
+
+def progress(port):
+    info = COMMON.request_json(port, "get_server_info", timeout=10)
+    states = info.get("internal_states", [])
+    if len(states) == 4:
+        return load("multirank").live_progress(states)
+    if len(states) != 1:
+        raise ValueError(
+            "Stable decode trigger requires one or four complete compute schedulers"
+        )
+    return states[0].get("mpu_forward_progress")
+
+
+def wait_stable(port, future, min_steps, batch_size, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if future.done():
+            future.result()  # Propagate a failed request instead of accepting stale state.
+            raise ValueError("Requests completed before a live stable decode trigger")
+        try:
+            observed = progress(port)
+        except ValueError:
+            observed = None
+        if (
+            isinstance(observed, dict)
+            and observed.get("success") is True
+            and observed.get("forward_mode") == "decode"
+            and observed.get("consecutive_stable_decode_steps", 0) >= min_steps
+            and (batch_size is None or observed.get("batch_size") == batch_size)
+        ):
+            ids = observed.get("request_ids", [])
+            if (
+                not ids
+                or len(set(ids)) != len(ids)
+                or any(not isinstance(rid, str) or not rid for rid in ids)
+            ):
+                raise ValueError("Stable trigger lacks distinct actual request IDs")
+            return observed
+        time.sleep(0.05)
+    raise ValueError("No live same-request-set decode window before profile deadline")
 
 
 def execute(report, stage, args, acceptance):
@@ -201,16 +300,21 @@ def execute(report, stage, args, acceptance):
             != "passed"
         ):
             raise ValueError("Correctness artifact no longer passes its gate")
-        correctness_gate(receipt, stage, report["runtime"], args, model_report)
+        correctness_gate(
+            receipt,
+            stage,
+            report["runtime"],
+            args,
+            model_report,
+            report["profile_variant"],
+        )
         report["acceptance"] = identity(acceptance)
         report["correctness_artifact"] = identity(job["report"])
         report["nsys_version"] = COMMON.capture(["nsys", "--version"])
         # Record visible ordinal -> UUID without launching any storage kernels.
         import torch
 
-        mapping = load("hardware_probe").device_mapping(
-            stage, mpu_ids=args.mpu_device_ids
-        )
+        mapping = profile_device_mapping(stage, args, report["profile_variant"])
         report["devices"] = [
             {
                 "visible_ordinal": ordinal,
@@ -250,26 +354,51 @@ def execute(report, stage, args, acceptance):
                 timeout=300,
             )
             report["flush_ack"] = post_text(args.port, "flush_cache", {})
-            report["profile_ack"] = post_text(
-                args.port, "start_profile", report["profile_request"]
+            count = report["workload"]["concurrency"]
+            prompts = (
+                load("workload").inputs(
+                    args.workload, report["workload"]["input_len"], count
+                )
+                if getattr(args, "workload", None)
+                else [[42] * report["workload"]["input_len"] for _ in range(count)]
             )
-            response = COMMON.request_json(
-                args.port,
-                "generate",
-                {
-                    "input_ids": (
-                        [[42] * report["workload"]["input_len"] for _ in range(4)]
-                        if stage.get("attn_dp_size", 1) > 1
-                        else [42] * report["workload"]["input_len"]
-                    ),
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": report["workload"]["output_len"],
-                        "ignore_eos": True,
-                    },
+            payload = {
+                "input_ids": prompts if count > 1 else prompts[0],
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": report["workload"]["output_len"],
+                    "ignore_eos": True,
                 },
-                timeout=args.benchmark_timeout,
-            )
+            }
+            stable_steps = getattr(args, "profile_stable_steps", 0)
+            if stable_steps:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        COMMON.request_json,
+                        args.port,
+                        "generate",
+                        payload,
+                        timeout=args.benchmark_timeout,
+                    )
+                    report["trigger_progress_before"] = wait_stable(
+                        args.port,
+                        future,
+                        stable_steps,
+                        getattr(args, "profile_batch_size", None),
+                        args.benchmark_timeout,
+                    )
+                    report["profile_ack"] = post_text(
+                        args.port, "start_profile", report["profile_request"]
+                    )
+                    report["trigger_progress_after_ack"] = progress(args.port)
+                    response = future.result(timeout=args.benchmark_timeout)
+            else:
+                report["profile_ack"] = post_text(
+                    args.port, "start_profile", report["profile_request"]
+                )
+                response = COMMON.request_json(
+                    args.port, "generate", payload, timeout=args.benchmark_timeout
+                )
             responses = response if isinstance(response, list) else [response]
             if len(responses) != report["workload"]["concurrency"] or any(
                 item.get("meta_info", {}).get("completion_tokens")
@@ -285,12 +414,18 @@ def execute(report, stage, args, acceptance):
             report["profiled_request_ids"] = [
                 item["meta_info"].get("id") for item in responses
             ]
+            if stable_steps and not set(
+                report["trigger_progress_before"]["request_ids"]
+            ) <= set(report["profiled_request_ids"]):
+                raise ValueError(
+                    "Stable trigger request IDs are not from the profiled workload"
+                )
             RUN.wait_capacities(
                 root / "forward-trace",
                 stage,
                 args,
-                stage["variant"],
-                args.capacity_ratios[0],
+                report["profile_variant"],
+                profile_ratio(stage, args, report["profile_variant"]),
                 request_ids=report["profiled_request_ids"],
                 require_idle=True,
             )
@@ -357,11 +492,38 @@ def main(argv=None):
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--acceptance", type=Path)
     parser.add_argument("--profile-steps", type=int, default=32)
+    parser.add_argument("--profile-variant", choices=("cpu", "mpu", "hbm"))
+    parser.add_argument("--profile-concurrency", type=int)
+    parser.add_argument("--profile-stable-steps", type=int, default=0)
+    parser.add_argument("--profile-batch-size", type=int)
     control, forwarded = parser.parse_known_args(argv)
+    if control.profile_stable_steps < 0 or (
+        control.profile_batch_size is not None and control.profile_batch_size < 1
+    ):
+        raise ValueError(
+            "Stable trigger steps must be nonnegative and batch size positive"
+        )
+    if control.profile_batch_size is not None and not control.profile_stable_steps:
+        raise ValueError(
+            "Profile batch-size constraint requires a stable decode trigger"
+        )
     stage, args = STAGE.parse_args(forwarded)
+    args.profile_stable_steps = control.profile_stable_steps
+    args.profile_batch_size = control.profile_batch_size
     if Path(args.model).is_dir():
         args.model = str(Path(args.model).resolve())
-    report = plan(stage, args, control.profile_steps)
+    report = plan(
+        stage,
+        args,
+        control.profile_steps,
+        control.profile_variant,
+        control.profile_concurrency,
+    )
+    report["stable_trigger"] = {
+        "min_consecutive_decode_steps": control.profile_stable_steps,
+        "required_actual_batch_size": control.profile_batch_size,
+        "criterion": "CPU metadata from actual consecutive forwards with the same request-ID set; no sleep-only assumption",
+    }
     args.output_dir.mkdir(parents=True, exist_ok=False)
     COMMON.write_manifest(args.output_dir / "profile.json", report)
     ok = execute(report, stage, args, control.acceptance) if args.execute else True
