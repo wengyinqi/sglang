@@ -629,3 +629,35 @@ def test_tampered_physical_accounting_is_rejected(field):
     value[field] = 0 if field == "named_storage_bytes" else {}
     with pytest.raises(ValueError):
         CONTRACT.validate_snapshot(value)
+
+
+def test_tampered_component_owner_and_packed_geometry_are_rejected():
+    value = snapshot()
+    value["inclusive_component_bytes"] = {"invented": 64}
+    with pytest.raises(ValueError, match="Component totals"):
+        CONTRACT.validate_snapshot(value)
+    pool = SimpleNamespace(index_pools={4: indexer_pool()})
+    value = MEMORY.capture_memory_snapshot(
+        context(family="deepseek-v4-flash"),
+        MEMORY.collect_model_tensor_trees("deepseek-v4-flash", kv_pool=pool),
+        regions=MEMORY.collect_model_logical_regions("deepseek-v4-flash", kv_pool=pool),
+    )
+    value["logical_regions"][0]["geometry"]["region_bytes_per_row"] += 1
+    with pytest.raises(ValueError, match="geometry"):
+        CONTRACT.validate_snapshot(value)
+
+
+def test_unknown_or_mismatched_allocator_peak_intervals_suppress_peak_delta():
+    dense = MEMORY.capture_memory_snapshot(
+        context(),
+        {"compute_kv": Tensor(1)},
+        allocator_metrics={"peak_allocated_bytes": 100, "peak_scope": "unmeasured"},
+    )
+    candidate = MEMORY.capture_memory_snapshot(
+        context(snapshot_id="s1"),
+        {"compute_kv": Tensor(1)},
+        allocator_metrics={"peak_allocated_bytes": 200, "peak_scope": "phase_1"},
+    )
+    result = CONTRACT.compare_to_dense(dense, candidate, controls=controls())
+    assert result["allocator_deltas"]["peak_allocated_bytes"] is None
+    assert result["allocator_peak_scopes_matched"] is False

@@ -94,6 +94,10 @@ def run(options):
         4 if variant == "cpu" else None,
         eager=options.eager,
     )
+    # --disable-cuda-graph controls decode only in this source revision.
+    # Keep all prefill eager so Dense auto-enabled piecewise graphs do not
+    # introduce another variable or an unobserved private Graph pool.
+    command.append("--disable-piecewise-cuda-graph")
     if options.variant == "dense":
         index = command.index("--attention-backend")
         if command[index + 1] != "flashinfer_quest":
@@ -115,6 +119,7 @@ def run(options):
         "request_set_fingerprint": input_sha,
         "output_len": options.output_len,
         "cuda_graph": not options.eager,
+        "prefill_piecewise_graph": False,
         "capture_group_id": target.name,
     }
     receipt = {

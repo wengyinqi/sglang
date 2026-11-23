@@ -59,12 +59,23 @@ def validate_snapshot(snapshot):
         raise ValueError("Unknown experiment memory schema")
     json.dumps(snapshot, allow_nan=False)
     context = snapshot.get("context", {})
-    if not context.get("snapshot_id") or not context.get("phase"):
+    if (
+        not isinstance(context.get("snapshot_id"), str)
+        or not context["snapshot_id"]
+        or not isinstance(context.get("phase"), str)
+        or not context["phase"]
+    ):
         raise ValueError("Snapshot identity and phase are required")
     tensors, storages = snapshot.get("tensors"), snapshot.get("storages")
     if not isinstance(tensors, dict) or not isinstance(storages, list):
         raise ValueError("Tensor and storage inventories are required")
-    allocations, amount, by_device = {}, 0, {}
+    allocations, amount, by_device, expected_inclusive, expected_exclusive = (
+        {},
+        0,
+        {},
+        {},
+        {},
+    )
     for storage in storages:
         identity = _integer(storage.get("allocation_group"), "allocation_group")
         if identity in allocations:
@@ -93,6 +104,19 @@ def validate_snapshot(snapshot):
                 or tensor.get("storage_bytes") != size
             ):
                 raise ValueError("Tensor/storage alias accounting differs")
+        owners = sorted({tensors[name].get("component") for name in aliases})
+        if (
+            not owners
+            or any(not isinstance(owner, str) or not owner for owner in owners)
+            or storage.get("components") != owners
+        ):
+            raise ValueError("Storage owner components differ from aliases")
+        category = owners[0] if len(owners) == 1 else "shared_components"
+        if storage.get("exclusive_component") != category:
+            raise ValueError("Storage exclusive/shared category differs")
+        expected_exclusive[category] = expected_exclusive.get(category, 0) + size
+        for owner in owners:
+            expected_inclusive[owner] = expected_inclusive.get(owner, 0) + size
     for name, tensor in tensors.items():
         storage = allocations.get(tensor.get("allocation_group"))
         if storage is None or name not in storage["aliases"]:
@@ -109,12 +133,17 @@ def validate_snapshot(snapshot):
         raise ValueError(
             "Exclusive/shared component partition must sum to unique storage"
         )
+    if (
+        exclusive != expected_exclusive
+        or snapshot.get("inclusive_component_bytes") != expected_inclusive
+    ):
+        raise ValueError("Component totals differ from actual storage owners")
     for name, value in snapshot.get("inclusive_component_bytes", {}).items():
         _integer(value, "inclusive_component_bytes." + name)
     regions = snapshot.get("logical_regions", [])
     if not isinstance(regions, list):
         raise ValueError("Logical regions must be a list")
-    region_ids = set()
+    region_ids, geometry_intervals = set(), {}
     for region in regions:
         identity = region.get("region_id")
         if not identity or identity in region_ids:
@@ -131,6 +160,39 @@ def validate_snapshot(snapshot):
         _integer(region.get("logical_content_bytes"), "logical_content_bytes")
         if region["logical_content_bytes"] > tensor.get("logical_tensor_bytes", -1):
             raise ValueError("Logical region exceeds its tensor")
+        geometry = region.get("geometry", {})
+        if geometry.get("layout") == "whole_tensor":
+            if region["logical_content_bytes"] != tensor["logical_tensor_bytes"]:
+                raise ValueError("Whole-tensor content byte count differs")
+            interval = (0, tensor["logical_tensor_bytes"])
+        elif geometry.get("layout") == "page_keys_then_scales":
+            rows = _integer(geometry.get("rows"), "rows")
+            stride = _integer(
+                geometry.get("row_stride_bytes"), "row_stride_bytes", positive=True
+            )
+            offset = _integer(
+                geometry.get("region_offset_within_row_bytes"), "region_offset"
+            )
+            size = _integer(
+                geometry.get("region_bytes_per_row"), "region_bytes_per_row"
+            )
+            shape = tensor.get("shape", [])
+            if (
+                len(shape) != 2
+                or rows != shape[0]
+                or stride != shape[1] * tensor.get("element_bytes", -1)
+                or tensor.get("stride") != [shape[1], 1]
+                or offset + size > stride
+                or region["logical_content_bytes"] != rows * size
+            ):
+                raise ValueError("Logical packed content geometry differs")
+            interval = (offset, offset + size)
+        else:
+            raise ValueError("Unknown logical content geometry")
+        for previous in geometry_intervals.setdefault(region["tensor_name"], []):
+            if max(interval[0], previous[0]) < min(interval[1], previous[1]):
+                raise ValueError("Logical packed content regions overlap")
+        geometry_intervals[region["tensor_name"]].append(interval)
     return snapshot
 
 
