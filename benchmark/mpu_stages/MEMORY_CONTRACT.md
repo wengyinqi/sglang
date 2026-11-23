@@ -135,8 +135,11 @@ must be known; a deliberate source difference requires
 - `model_revision`, `weight_format`, `parallelism`, `context_len`, `request_slots`
 - `actual_batch`, `request_set_fingerprint`, `output_len`, `cuda_graph`
 
-Each pair must be known and equal. Non-request phases can use an explicit
-`not_applicable` value for request-only controls. Missing category bytes yield
+Each pair must be known, equal and match its actual snapshot context; an equal
+caller-supplied pair cannot override real batch/workload/graph differences.
+Missing actual controls fail closed. Only initialization/Graph warmup can use
+`not_applicable` for actual_batch/request_set_fingerprint/output_len when both
+actual context values are missing. Known values must still match. Missing category bytes yield
 `null` deltas, not a Dense zero invented from absence. The output separately
 reports named storage, inclusive categories, allocator, Graph pool and sampled
 NVML deltas. Allocator peak deltas remain `null` unless both captures define
