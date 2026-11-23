@@ -234,6 +234,7 @@ def compare_to_dense(dense, candidate, *, controls, allow_source_difference=Fals
         )
     if not isinstance(controls, dict):
         raise ValueError("Matched experiment controls are required")
+    not_applicable_controls = []
     for name in COMPARISON_CONTROLS:
         pair = controls.get(name, {})
         if (
@@ -244,6 +245,26 @@ def compare_to_dense(dense, candidate, *, controls, allow_source_difference=Fals
             or pair["dense"] != pair["candidate"]
         ):
             raise ValueError(f"Missing or unequal memory comparison control: {name}")
+        actual_left, actual_right = left.get(name), right.get(name)
+        if actual_left is None or actual_right is None:
+            if (
+                left["phase"]
+                in {"initialization", "initial", "initialized", "graph_warmup"}
+                and name in {"actual_batch", "request_set_fingerprint", "output_len"}
+                and actual_left is None
+                and actual_right is None
+                and pair["dense"] == pair["candidate"] == "not_applicable"
+            ):
+                not_applicable_controls.append(name)
+                continue
+            raise ValueError(f"Missing actual snapshot comparison control: {name}")
+        for side, actual in (("dense", actual_left), ("candidate", actual_right)):
+            if json.dumps(pair[side], sort_keys=True, allow_nan=False) != json.dumps(
+                actual, sort_keys=True, allow_nan=False
+            ):
+                raise ValueError(
+                    f"Comparison control differs from {side} snapshot context: {name}"
+                )
     components = set(dense["inclusive_component_bytes"]) | set(
         candidate["inclusive_component_bytes"]
     )
@@ -297,6 +318,8 @@ def compare_to_dense(dense, candidate, *, controls, allow_source_difference=Fals
         "dense_snapshot_id": left["snapshot_id"],
         "candidate_snapshot_id": right["snapshot_id"],
         "controls": copy.deepcopy(controls),
+        "controls_bound_to_snapshot_context": True,
+        "not_applicable_controls": not_applicable_controls,
         "source_revisions": {
             "dense": left.get("source_revision"),
             "candidate": right.get("source_revision"),
