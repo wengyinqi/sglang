@@ -60,15 +60,14 @@ def collect_quest_memory(coordinator):
     c = coordinator
     pool, backing = c.mem_pool_device, c.mem_pool_host
     selector = cuda_attributes(c.quest_algorithm)
+    tier = getattr(c.quest_algorithm, "bounds_tier", None)
+    required = {"running_k_min", "running_k_max"}
+    if tier is None:
+        required.update(("page_k_bounds", "page_k_min", "page_k_max"))
+    else:
+        selector["bounds_tier"] = cuda_attributes(tier)
     if (
-        not {
-            "page_k_bounds",
-            "page_k_min",
-            "page_k_max",
-            "running_k_min",
-            "running_k_max",
-        }
-        <= selector.keys()
+        not required <= selector.keys()
     ):
         raise ValueError(
             "Quest memory ledger requires initialized CUDA selector storage"
@@ -112,6 +111,9 @@ def collect_quest_memory(coordinator):
         **groups["fixed"],
         "allocated_compute_kv_bytes": groups["kv"]["retained_gpu_pool_bytes"],
         "allocated_backing_kv_bytes": backing_bytes,
+        "allocated_backing_quest_summary_bytes": (
+            allocation_bytes(tier.backing_bounds) if tier is not None else 0
+        ),
         "gpu_memory_ledger": {
             "schema_version": 1,
             "contract": "qwen_quest_v1",

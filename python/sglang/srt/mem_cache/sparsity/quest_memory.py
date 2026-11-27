@@ -10,6 +10,8 @@ def estimate_quest_storage_bytes(
     max_context_len: int,
     kv_heads: int,
     head_dim: int,
+    *,
+    xm_bounds_offload: bool = False,
 ) -> int:
     """Bytes of persistent tensors allocated by QuestAlgorithm.init_storage.
 
@@ -26,6 +28,10 @@ def estimate_quest_storage_bytes(
         raise ValueError("Quest top_k must be divisible by page_size")
     pages = (max_context_len + page_size - 1) // page_size
     bounds = 4 * layers * max_reqs * (pages + 1) * kv_heads * head_dim
+    if xm_bounds_offload:
+        # Historical page summaries belong to pinned DDR. Only two reusable
+        # layer stages and the in-progress page remain on the compute GPU.
+        bounds = 4 * (2 * pages + layers) * max_reqs * kv_heads * head_dim + 116
     step_and_counters = max_reqs * (4 * page_size + 4 * top_k + 21)
     constants = 8 * (2 * page_size + top_k + pages)
     return bounds + step_and_counters + constants
@@ -46,6 +52,8 @@ def estimate_quest_auxiliary_bytes(
     host_to_device_ratio: int = 1,
     kv_page_size: int = 64,
     logical_token_capacity: int | None = None,
+    xm_bounds_offload: bool = False,
+    xm_fused_retrieval_attention: bool = False,
 ) -> int:
     """Reserve Quest tensors and request/address tables outside the KV pool.
 
@@ -63,6 +71,7 @@ def estimate_quest_auxiliary_bytes(
         max_context_len,
         kv_heads,
         head_dim,
+        xm_bounds_offload=xm_bounds_offload,
     )
     # ReqToTokenPool plus the sparse backend's packed indices and lengths.
     total += 4 * max_reqs * max_context_len
@@ -95,4 +104,6 @@ def estimate_quest_auxiliary_bytes(
         total += 8 * (logical_token_capacity + kv_page_size + 1)
     else:
         total += max_reqs  # Quest-only first-decode update mask (bool)
+    if xm_fused_retrieval_attention:
+        total += 12 * max_reqs * top_k  # int32 hot and int64 miss plan tables
     return total

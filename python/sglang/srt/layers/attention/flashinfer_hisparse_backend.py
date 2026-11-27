@@ -85,6 +85,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         q_data_type: torch.dtype,
         device: torch.device,
         workspace_buffer: Optional[torch.Tensor] = None,
+        xm_fused_retrieval_attention: bool = False,
     ):
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
@@ -98,8 +99,27 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         self.q_data_type = q_data_type
         self.device = device
         self.top_k = quest_algorithm.top_k
+        if type(xm_fused_retrieval_attention) is not bool:
+            raise ValueError("xm_fused_retrieval_attention must be a bool")
+        self.xm_fused_retrieval_attention = xm_fused_retrieval_attention
+        self._prefetch_protection_ready: set[int] = set()
+        self._fused_tma = None
+        if xm_fused_retrieval_attention:
+            from sglang.jit_kernel.fused_hisparse_tma import (
+                validate_fused_tma_configuration,
+            )
 
-        if workspace_buffer is None:
+            validate_fused_tma_configuration(
+                device=device,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kv_data_type=kv_data_type,
+                q_data_type=q_data_type,
+                backing_store=coordinator.backing_store,
+            )
+
+        if workspace_buffer is None and not xm_fused_retrieval_attention:
             workspace_buffer = torch.empty(
                 _DEFAULT_WORKSPACE_BYTES, dtype=torch.uint8, device=device
             )
@@ -166,10 +186,49 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         # than caching its contents at begin_forward time.  This is what makes
         # per-layer Quest selection compatible with a single pre-planned
         # wrapper, in both eager and captured-graph contexts.
-        self._wrappers: dict[int, BatchDecodeWithPagedKVCacheWrapper] = {}
+        self._wrappers: dict[int, Optional[BatchDecodeWithPagedKVCacheWrapper]] = {}
 
         self._wrapper: Optional[BatchDecodeWithPagedKVCacheWrapper] = None
         self._current_bs: Optional[int] = None
+        if xm_fused_retrieval_attention:
+            from sglang.jit_kernel.fused_hisparse_tma import FusedHiSparseTMAWorkspace
+
+            pool = coordinator.mem_pool_host
+            self._fused_tma = FusedHiSparseTMAWorkspace(
+                device=device,
+                max_bs=max_bs,
+                top_k=self.top_k,
+                hot_buffer_size=coordinator.device_buffer_size,
+                item_size_bytes=pool.token_stride_size,
+                host_k_layers=tuple(pool.k_buffer),
+                host_v_layers=tuple(pool.v_buffer),
+                collect_metrics=coordinator.cache_metrics is not None,
+            )
+            # Register the persistent plan owners with the coordinator's
+            # existing recursive ledger. Both entries are views/aliases of
+            # the workspace's storage, so this does not allocate more HBM.
+            coordinator.xm_fused_plan = {
+                "miss_host_locs": self._fused_tma.miss_host_locs,
+                "device_locs": self._fused_tma.device_locs,
+            }
+        coordinator.xm_fused_memory_provider = self.xm_fused_memory_inventory
+
+    def xm_fused_memory_inventory(self):
+        """Return named owners for metadata-only, deduplicated accounting."""
+        if self._fused_tma is None:
+            return (
+                {"flashinfer_workspace": self.workspace_buffer}
+                if isinstance(self.workspace_buffer, torch.Tensor)
+                else {}
+            )
+        return {
+            "plan": {
+                "miss_host_locs": self._fused_tma.miss_host_locs,
+                "device_locs": self._fused_tma.device_locs,
+            },
+            "split_partial_workspace": self._fused_tma.partial,
+            "attention_output": self._fused_tma.output,
+        }
 
     # ----------------------------------------------------- production ctor
 
@@ -203,6 +262,11 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         # wrapper construction in _get_or_create_wrapper handles smaller bs
         # values on demand.
         max_bs = runner.req_to_token_pool.req_to_token.shape[0]
+        fused = False
+        if getattr(runner, "server_args", None) is not None:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            fused = parse_hisparse_config(runner.server_args).xm_fused_retrieval_attention
 
         return cls(
             quest_algorithm=quest,
@@ -214,6 +278,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
             kv_data_type=runner.kv_cache_dtype,
             q_data_type=runner.dtype,
             device=torch.device(runner.device),
+            xm_fused_retrieval_attention=fused,
         )
 
     # ------------------------------------------------------ wrapper cache
@@ -231,6 +296,11 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
             )
         if bs in self._wrappers:
             return self._wrappers[bs]
+        if self.xm_fused_retrieval_attention:
+            # Record the captured batch without constructing an unused
+            # FlashInfer decode wrapper or allocating its 384-MiB workspace.
+            self._wrappers[bs] = None
+            return None
 
         kv_indptr_slice = self._kv_indptr_buf[: bs + 1]
         kv_indices_slice = self._kv_indices_buf[: bs * self.top_k]
@@ -305,6 +375,8 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
 
         self._cached_sm_scale = sm_scale
         self._cached_logits_soft_cap = logits_soft_cap
+        if self.xm_fused_retrieval_attention:
+            return
 
         self._fast_decode_plan(
             self._wrapper,
@@ -349,7 +421,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         # after the first decode step for each request.
         self.coord.wait_for_pending_bounds(forward_batch.req_pool_indices)
         # Cache step-level state once (used by every layer's retrieve_topk).
-        self.quest.prepare_step(forward_batch.seq_lens)
+        self.quest.prepare_step(forward_batch.seq_lens, begin_summary_step=False)
         sm_scale = (
             self._cached_sm_scale
             if self._cached_sm_scale is not None
@@ -420,7 +492,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
             self.coord.num_real_reqs[0] = bs_int
 
         # Cache step-level state with placeholder seq_lens for capture.
-        self.quest.prepare_step(seq_lens[:bs_int])
+        self.quest.prepare_step(seq_lens[:bs_int], begin_summary_step=False)
 
         # Plan with WORST-CASE indptr (uniform top_k per request) so the
         # captured plan_info is valid for any actual indptr at replay.
@@ -465,7 +537,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         # be in flight on coord.quest_bounds_stream).  Same as eager path.
         self.coord.wait_for_pending_bounds(req_pool_indices[:bs_int])
         # Cache step-level state once for this replay.
-        self.quest.prepare_step(seq_lens[:bs_int])
+        self.quest.prepare_step(seq_lens[:bs_int], begin_summary_step=False)
         sm_scale = (
             self._cached_sm_scale
             if self._cached_sm_scale is not None
@@ -512,6 +584,23 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
                 "init_forward_metadata must be called before forward_decode"
             )
         bs = self._current_bs
+        protect = getattr(self.quest, "set_prefetch_protected", None)
+        protection_enabled = bool(getattr(self.quest, "xm_prefetch_protect", False))
+        capturing = protection_enabled and torch.cuda.is_current_stream_capturing()
+        ready = bs in self._prefetch_protection_ready
+        if capturing and not ready:
+            raise RuntimeError(
+                "Protected Quest prefetch capture requires one complete eager "
+                f"decode warmup for batch shape {bs} before capture"
+            )
+        if (
+            getattr(self.quest, "bounds_tier", None) is not None
+            and layer.layer_id == self.quest.start_layer
+        ):
+            # Metadata is initialized only once before two warmup forwards
+            # and capture. Put the epoch increment/first copy in the actual
+            # first layer so every warmup and every replay gets a fresh key.
+            self.quest.begin_summary_step()
 
         # 1. Save new K/V to the hot buffer.  HiSparseMHATokenToKVPool's
         #    _resolve_write_loc reroutes loc → reserved hot-buffer slot.
@@ -542,6 +631,60 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
             self._cached_sm_scale = layer.scaling
             self._cached_logits_soft_cap = getattr(layer, "logit_cap", 0.0) or 0.0
 
+        # The first complete eager decode for this shape performs lazy/JIT
+        # module setup with the copy gate open. A synchronous first-time JIT
+        # while a child memcpy waits behind a closed gate would deadlock.
+        use_protection = protection_enabled and ready and protect is not None
+        if use_protection:
+            protect(True)
+        try:
+            if self.xm_fused_retrieval_attention:
+                output = self._run_fused_attention(
+                    q, layer, forward_batch, topk_token_positions
+                )
+            else:
+                output = self._run_separate_attention(
+                    q, layer, forward_batch, topk_token_positions
+                )
+        finally:
+            if use_protection:
+                protect(False)
+        if (
+            protection_enabled
+            and not capturing
+            and layer.layer_id == self.quest.end_layer - 1
+        ):
+            self._prefetch_protection_ready.add(bs)
+        return output
+
+    def _run_fused_attention(self, q, layer, forward_batch, topk_token_positions):
+        for name in ("k_scale_float", "v_scale_float"):
+            scale = getattr(layer, name, None)
+            if scale is not None and (type(scale) not in (int, float) or scale != 1):
+                raise ValueError("The BF16 fused TMA path does not support quantized KV scales")
+        bs = self._current_bs
+        self._fused_tma.resolve(
+            self.coord,
+            top_k_tokens=topk_token_positions,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            layer_id=layer.layer_id,
+        )
+        raw_k, raw_v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        output = self._fused_tma.run(
+            q.contiguous().view(bs, self.num_qo_heads, self.head_dim),
+            hot_k=raw_k,
+            hot_v=raw_v,
+            layer_id=layer.layer_id,
+            actual_lens=self._actual_lens_buf[:bs],
+            num_real_reqs=self.coord.num_real_reqs,
+            scaling=layer.scaling,
+            logits_soft_cap=getattr(layer, "logit_cap", 0.0) or 0.0,
+        )
+        return output.view(bs, self.num_qo_heads * self.head_dim)
+
+    def _run_separate_attention(self, q, layer, forward_batch, topk_token_positions):
+        bs = self._current_bs
         # 3. Materialize host pages into the device buffer; returns
         #    [bs, top_k] device-buffer indices.  Some indices may be
         #    "wasted" beyond actual_lens; we don't read those slots.

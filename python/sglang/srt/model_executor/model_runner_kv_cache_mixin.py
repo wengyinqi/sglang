@@ -799,6 +799,8 @@ class ModelRunnerKVCacheMixin:
             kv_heads=self.model_config.get_num_kv_heads(get_attention_tp_size()),
             head_dim=self.model_config.head_dim,
             device_buffer_size=cfg.device_buffer_size if self.enable_hisparse else 0,
+            xm_bounds_offload=cfg.xm_quest_bounds_offload,
+            xm_fused_retrieval_attention=cfg.xm_fused_retrieval_attention,
             device_token_capacity=token_capacity,
             host_to_device_ratio=cfg.host_to_device_ratio,
             kv_page_size=self.page_size,
@@ -818,6 +820,21 @@ class ModelRunnerKVCacheMixin:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        if getattr(self, "enable_hisparse", False):
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            xm_budget = parse_hisparse_config(
+                self.server_args
+            ).xm_cache_hbm_budget_bytes
+            if xm_budget is not None:
+                if xm_budget > available_bytes:
+                    raise RuntimeError(
+                        "Requested XM cache HBM budget exceeds profiled available memory"
+                    )
+                # Includes KV and named selector/address-management tensors.
+                # Model weights, attention workspace, graph pools and allocator
+                # rounding are inventoried separately, outside this budget.
+                available_bytes = xm_budget
         page_size = self.server_args.page_size
 
         configurator = create_memory_pool_configurator(self)

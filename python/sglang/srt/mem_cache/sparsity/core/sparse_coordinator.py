@@ -71,6 +71,13 @@ class SparseConfig:
     # Distinct from ``page_size`` (which is the KV pool's storage granularity).
     # Must divide ``top_k`` evenly.  Defaults to 64 when algorithm == "quest".
     quest_page_size: Optional[int] = None
+    # Qwen adaptation of the XM-Sparse software mechanisms. Complete KV stays
+    # in the ordinary CPU-backed HiSparse pool in this research branch.
+    xm_fused_retrieval_attention: bool = False
+    xm_quest_bounds_offload: bool = False
+    xm_quest_prefetch_mode: str = "none"
+    xm_prefetch_protect: bool = False
+    xm_cache_hbm_budget_bytes: Optional[int] = None
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm

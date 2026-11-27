@@ -69,7 +69,16 @@ class QuestAlgorithm:
       * running bounds (one in-flight page per req): ``2 × num_layers × max_reqs × kv_heads × head_dim``
     """
 
-    def __init__(self, top_k: int, page_size: int, device: torch.device):
+    def __init__(
+        self,
+        top_k: int,
+        page_size: int,
+        device: torch.device,
+        *,
+        xm_bounds_offload: bool = False,
+        xm_prefetch_mode: str = "none",
+        xm_prefetch_protect: bool = False,
+    ):
         if page_size <= 0:
             raise ValueError(f"quest page_size must be > 0, got {page_size}")
         if top_k <= 0:
@@ -83,6 +92,22 @@ class QuestAlgorithm:
         self.page_size = page_size
         self.top_k_pages = top_k // page_size
         self.device = device
+        if type(xm_bounds_offload) is not bool or type(xm_prefetch_protect) is not bool:
+            raise ValueError("Quest XM offload and protection flags must be booleans")
+        if xm_prefetch_mode not in ("none", "on_demand", "lookahead"):
+            raise ValueError(
+                "Quest XM prefetch mode must be none, on_demand, or lookahead"
+            )
+        if xm_bounds_offload == (xm_prefetch_mode == "none"):
+            raise ValueError(
+                "Quest summary offload needs on_demand/lookahead; disabled offload needs none"
+            )
+        if xm_prefetch_protect and not xm_bounds_offload:
+            raise ValueError("Quest prefetch protection requires summary offload")
+        self.xm_bounds_offload = xm_bounds_offload
+        self.xm_prefetch_mode = xm_prefetch_mode
+        self.xm_prefetch_protect = xm_prefetch_protect
+        self.bounds_tier = None
 
         # Set in init_storage()
         self.start_layer: Optional[int] = None
@@ -151,16 +176,27 @@ class QuestAlgorithm:
         # Sentinel-initialised with reversed min/max for invalid pages.
         # Both scoring paths check validity explicitly before arithmetic.
         bounds_shape = (num_layers, max_reqs, max_pages_per_req, kv_heads, head_dim, 2)
-        self.page_k_bounds = torch.empty(
-            bounds_shape,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        # Initialise: [..., 0] = +inf (min sentinel), [..., 1] = -inf (max sentinel).
-        self.page_k_bounds[..., 0].fill_(_BF16_POS_INF)
-        self.page_k_bounds[..., 1].fill_(_BF16_NEG_INF)
-        # Convenience views (no-op slices, no kernel work).  Read-only by
-        # convention; assignments must go through ``_write_page_bounds``.
+        if self.xm_bounds_offload:
+            from .quest_bounds_tier import QuestBoundsTier
+
+            self.bounds_tier = QuestBoundsTier(
+                bounds_shape,
+                self.device,
+                prefetch_mode=self.xm_prefetch_mode,
+                protect=self.xm_prefetch_protect,
+            )
+            self.page_k_bounds = self.bounds_tier.backing_bounds
+        else:
+            self.page_k_bounds = torch.empty(
+                bounds_shape,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            # Reversed bounds mark invalid pages.
+            self.page_k_bounds[..., 0].fill_(_BF16_POS_INF)
+            self.page_k_bounds[..., 1].fill_(_BF16_NEG_INF)
+        # Convenience views (no-op slices, no kernel work). The offloaded
+        # variant publishes writes through its mapped-host GPU kernels.
         self.page_k_min = self.page_k_bounds[..., 0]
         self.page_k_max = self.page_k_bounds[..., 1]
 
@@ -209,6 +245,16 @@ class QuestAlgorithm:
             bounds_mb,
             running_mb,
         )
+        if self.bounds_tier is not None:
+            logger.info(
+                "Quest summary offload: complete bounds in pinned CPU memory; "
+                "two HBM layer stages %.1f MiB, prefetch=%s, checkpoint protection=%s",
+                self.bounds_tier.stage_bounds.numel()
+                * self.bounds_tier.stage_bounds.element_size()
+                / (1024**2),
+                self.xm_prefetch_mode,
+                self.xm_prefetch_protect,
+            )
 
         # Step-level state buffers (sized for max_reqs as upper bound on bs).
         self._step_last_valid_buf = torch.zeros(
@@ -241,23 +287,17 @@ class QuestAlgorithm:
             self.page_size,
             device=self.device,
             dtype=torch.int64,
-        ).unsqueeze(
-            0
-        )  # [1, page_size]
+        ).unsqueeze(0)  # [1, page_size]
         self._all_positions_const = torch.arange(
             self.top_k,
             device=self.device,
             dtype=torch.int64,
-        ).unsqueeze(
-            0
-        )  # [1, top_k]
+        ).unsqueeze(0)  # [1, top_k]
         self._page_offsets_const = torch.arange(
             self.page_size,
             device=self.device,
             dtype=torch.int64,
-        ).view(
-            1, 1, -1
-        )  # [1, 1, page_size]
+        ).view(1, 1, -1)  # [1, 1, page_size]
         self._page_idx_const = torch.arange(
             self.max_pages_per_req,
             device=self.device,
@@ -294,8 +334,32 @@ class QuestAlgorithm:
         layer_offset = layer_id - self.start_layer
         prefill_len = int(prefill_indices.shape[0])
 
+        if self.bounds_tier is not None and prefill_len:
+            # The layer-wise extend hook must publish mapped-host summaries on
+            # the GPU stream. A Torch assignment to a CPU view would involve a
+            # host copy and would not be safe under CUDA graph capture.
+            from .quest_prefill_bounds_kernel import quest_prefill_bounds
+
+            k_data_ptrs = torch.tensor(
+                [k_buffer.data_ptr()], dtype=torch.int64, device=self.device
+            )
+            quest_prefill_bounds(
+                k_data_ptrs=k_data_ptrs,
+                prefill_indices=prefill_indices,
+                page_k_bounds=self.page_k_bounds,
+                running_k_min=self.running_k_min,
+                running_k_max=self.running_k_max,
+                layer_offset_start=0,
+                req_pool_idx=req_pool_idx,
+                page_size=self.page_size,
+                bounds_pointer_table=self.bounds_tier.backing_uva_ptr,
+                output_layer_offset=layer_offset,
+                num_layers=1,
+            )
+            k_data_ptrs.record_stream(torch.cuda.current_stream(self.device))
+
         num_full_pages = prefill_len // self.page_size
-        if num_full_pages > 0:
+        if num_full_pages > 0 and self.bounds_tier is None:
             full_count = num_full_pages * self.page_size
             full_indices = prefill_indices[:full_count]
             full_k = k_buffer[full_indices]
@@ -310,7 +374,7 @@ class QuestAlgorithm:
             ).to(torch.bfloat16)
 
         partial_count = prefill_len - num_full_pages * self.page_size
-        if partial_count > 0:
+        if partial_count > 0 and self.bounds_tier is None:
             partial_indices = prefill_indices[num_full_pages * self.page_size :]
             partial_k = k_buffer[partial_indices]
             self.running_k_min[layer_offset, req_pool_idx] = partial_k.amin(dim=0).to(
@@ -319,7 +383,7 @@ class QuestAlgorithm:
             self.running_k_max[layer_offset, req_pool_idx] = partial_k.amax(dim=0).to(
                 torch.bfloat16
             )
-        else:
+        elif partial_count == 0:
             # Chunked prefill can previously have left a partial page here.
             # Rebuilding a prefix ending on a page boundary must clear it.
             self.running_k_min[layer_offset, req_pool_idx] = _BF16_POS_INF
@@ -378,6 +442,11 @@ class QuestAlgorithm:
             layer_offset_start=self.start_layer,
             req_pool_idx=req_pool_idx,
             page_size=self.page_size,
+            bounds_pointer_table=(
+                self.bounds_tier.backing_uva_ptr
+                if self.bounds_tier is not None
+                else None
+            ),
         )
 
         prefill_len = int(prefill_indices.shape[0])
@@ -479,6 +548,17 @@ class QuestAlgorithm:
         For all requests in ``req_indices``, ``running_token_count`` is
         incremented (mod ``page_size``).
         """
+        if self.bounds_tier is not None:
+            self.bounds_tier.finalize(
+                req_indices,
+                self.running_k_min,
+                self.running_k_max,
+                self.running_token_count,
+                self.running_page_idx,
+                self.page_size,
+            )
+            return
+
         counts = self.running_token_count[req_indices]
         will_complete = counts == (self.page_size - 1)
 
@@ -507,7 +587,9 @@ class QuestAlgorithm:
 
     # ----------------------------------------------------------- step prep
 
-    def prepare_step(self, seq_lens: torch.Tensor) -> None:
+    def prepare_step(
+        self, seq_lens: torch.Tensor, *, begin_summary_step: bool = True
+    ) -> None:
         """Compute step-level state once and write to pre-allocated buffers.
 
         Backend must call this in ``init_forward_metadata`` (and the cuda-graph
@@ -521,6 +603,8 @@ class QuestAlgorithm:
             raise RuntimeError(
                 f"prepare_step bs={bs} > max_reqs={self._step_last_valid_buf.shape[0]}"
             )
+        if begin_summary_step:
+            self.begin_summary_step()
         # Graph padding may contain zero-length requests. They must emit no
         # attention entries and only safe dummy positions in unused slots.
         seq_lens_i64 = seq_lens.to(torch.int64).clamp(min=0)
@@ -540,9 +624,7 @@ class QuestAlgorithm:
         short_layout = torch.minimum(
             self._all_positions_const,
             last_valid,
-        ).to(
-            torch.int32
-        )  # [bs, top_k]
+        ).to(torch.int32)  # [bs, top_k]
         self._step_short_layout_buf[:bs].copy_(short_layout, non_blocking=True)
 
         is_short = (seq_lens_i64 <= self.top_k).unsqueeze(1)
@@ -553,6 +635,17 @@ class QuestAlgorithm:
             torch.full_like(seq_lens_i64, self.top_k),
         ).to(torch.int32)
         self._step_actual_lens_buf[:bs].copy_(actual_lens, non_blocking=True)
+
+    def begin_summary_step(self) -> None:
+        """Give each complete forward a fresh GPU summary-prefetch epoch.
+
+        Graph setup can initialize metadata once and execute multiple warmup,
+        capture and replay forwards. Its backend starts the epoch at the first
+        layer, independently of metadata preparation. Standalone callers keep
+        the original prepare_step behavior by default.
+        """
+        if self.bounds_tier is not None:
+            self.bounds_tier.begin_step()
 
     @property
     def page_valid(self) -> torch.Tensor:
@@ -581,12 +674,29 @@ class QuestAlgorithm:
         and topk would pick stale pages.
         """
         # Reset to sentinel: min=+inf, max=-inf → score = -inf for the slot.
-        self.page_k_min[:, req_pool_idx, :].fill_(_BF16_POS_INF)
-        self.page_k_max[:, req_pool_idx, :].fill_(_BF16_NEG_INF)
+        if self.bounds_tier is not None:
+            self.bounds_tier.invalidate_request(req_pool_idx)
+        else:
+            self.page_k_min[:, req_pool_idx, :].fill_(_BF16_POS_INF)
+            self.page_k_max[:, req_pool_idx, :].fill_(_BF16_NEG_INF)
         self.running_k_min[:, req_pool_idx] = _BF16_POS_INF
         self.running_k_max[:, req_pool_idx] = _BF16_NEG_INF
         self.running_token_count[req_pool_idx] = 0
         self.running_page_idx[req_pool_idx] = 0
+
+    def set_prefetch_protected(self, protected_operation: bool) -> None:
+        """Approximate bandwidth priority at copy-chunk GPU checkpoints."""
+        if self.bounds_tier is not None:
+            self.bounds_tier.set_protected(protected_operation)
+
+    def summary_offload_statistics(self):
+        if self.bounds_tier is None:
+            return {"mechanism": "gpu_resident_quest_bounds"}
+        return self.bounds_tier.statistics()
+
+    def close(self) -> None:
+        if self.bounds_tier is not None:
+            self.bounds_tier.close()
 
     # ------------------------------------------------------------- retrieval
 
@@ -638,6 +748,11 @@ class QuestAlgorithm:
         """
         layer_offset = layer_id - self.start_layer
         bs = queries.shape[0]
+        score_bounds = self.page_k_bounds
+        score_layer_offset = layer_offset
+        if self.bounds_tier is not None:
+            score_bounds = self.bounds_tier.read_layer(layer_offset)
+            score_layer_offset = 0
 
         # Read step-level cached state (set by prepare_step before this step).
         recent_positions = self._step_recent_positions_buf[:bs]  # [bs, page_size] int32
@@ -682,14 +797,14 @@ class QuestAlgorithm:
             q_f32 = q.contiguous().float()
             scores = quest_score(
                 q_f32,
-                self.page_k_bounds,
+                score_bounds,
                 req_pool_indices,
-                layer_offset,
+                score_layer_offset,
             )  # [bs, max_pages_per_req] float32
         else:
             # Reference PyTorch path (for debug + correctness comparison).
             scores = quest_score_reference(
-                q, self.page_k_bounds, req_pool_indices, layer_offset
+                q, score_bounds, req_pool_indices, score_layer_offset
             )
 
         # Long-sequence layout:

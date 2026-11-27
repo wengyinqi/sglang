@@ -333,6 +333,26 @@ class HiSparseCoordinator:
             info["cache_metrics_allocation_bytes"] = (
                 self.cache_metrics.numel() * self.cache_metrics.element_size()
             )
+        tier = getattr(getattr(self, "quest_algorithm", None), "bounds_tier", None)
+        if tier is not None:
+            # This provider runs at scheduler idle. These cumulative counters
+            # include warmup/capture; experiments compare before/after snapshots.
+            info["xm_quest_summary_offload"] = tier.statistics()
+        provider = getattr(self, "xm_fused_memory_provider", None)
+        if provider is not None:
+            from sglang.srt.observability.mpu_stage_timing import (
+                describe_retained_gpu_pools,
+            )
+
+            info["xm_fused_backend_memory"] = describe_retained_gpu_pools(provider())
+        if tier is not None or provider is not None:
+            info["xm_allocator_snapshot"] = {
+                "allocated_bytes": torch.cuda.memory_allocated(self.device),
+                "reserved_bytes": torch.cuda.memory_reserved(self.device),
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
+                "peak_reserved_bytes": torch.cuda.max_memory_reserved(self.device),
+                "scope": "idle PyTorch caching allocator; excludes non-Torch graph/driver resources",
+            }
         return info
 
     def _quest_memory_ledger(self):

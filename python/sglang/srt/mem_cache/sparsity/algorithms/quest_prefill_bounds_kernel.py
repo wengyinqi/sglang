@@ -28,25 +28,31 @@ import triton.language as tl
 
 @triton.jit
 def _quest_prefill_bounds_kernel(
-    k_data_ptrs,            # [num_total_layers] uint64 (pointer per layer)
-    prefill_indices_ptr,    # [prefill_len] int64
-    page_k_bounds_ptr,      # bf16 contiguous; layout [L, R, P, KV, D, 2]
-    running_k_min_ptr,      # bf16 contiguous; layout [L, R, KV, D]
-    running_k_max_ptr,      # bf16 contiguous; layout [L, R, KV, D]
-    layer_offset_start,     # int (scalar), where Quest's layers start in k_data_ptrs
-    req_pool_idx,           # int (scalar), target req row
-    num_full_pages,         # int (scalar), runtime
-    partial_count,          # int (scalar), runtime; 0 if no partial page
+    k_data_ptrs,  # [num_total_layers] uint64 (pointer per layer)
+    prefill_indices_ptr,  # [prefill_len] int64
+    page_k_bounds_ptr,  # bf16 contiguous; layout [L, R, P, KV, D, 2]
+    running_k_min_ptr,  # bf16 contiguous; layout [L, R, KV, D]
+    running_k_max_ptr,  # bf16 contiguous; layout [L, R, KV, D]
+    layer_offset_start,  # int (scalar), where Quest's layers start in k_data_ptrs
+    req_pool_idx,  # int (scalar), target req row
+    output_layer_offset,  # optional destination offset for per-layer writes
+    num_full_pages,  # int (scalar), runtime
+    partial_count,  # int (scalar), runtime; 0 if no partial page
     MAX_REQS: tl.constexpr,
     MAX_PAGES: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    KVHD: tl.constexpr,        # kv_heads * head_dim, total
+    KVHD: tl.constexpr,  # kv_heads * head_dim, total
     BLOCK_KVHD: tl.constexpr,  # tile size along KVHD per block
+    INDIRECT_BOUNDS: tl.constexpr,
 ):
     """One block per (layer, page, kvhd_tile)."""
     pid_layer = tl.program_id(0)
     pid_page = tl.program_id(1)
     pid_kvhd = tl.program_id(2)
+    output_layer = pid_layer + output_layer_offset
+    if INDIRECT_BOUNDS:
+        address = tl.load(page_k_bounds_ptr)
+        page_k_bounds_ptr = address.to(tl.pointer_type(tl.bfloat16))
 
     # Block-uniform branch: the partial-page slot is at index num_full_pages.
     is_partial = pid_page == num_full_pages
@@ -102,7 +108,7 @@ def _quest_prefill_bounds_kernel(
 
     if is_partial:
         # running_k_min/max[layer, req, :, :] → flat layout [L, R, KVHD]
-        out_base = pid_layer * MAX_REQS * KVHD + req_pool_idx * KVHD + d_off
+        out_base = output_layer * MAX_REQS * KVHD + req_pool_idx * KVHD + d_off
         tl.store(running_k_min_ptr + out_base, k_min)
         tl.store(running_k_max_ptr + out_base, k_max)
     else:
@@ -113,13 +119,22 @@ def _quest_prefill_bounds_kernel(
         # + page  * KVHD * 2
         # + d * 2  (+0 = min, +1 = max)
         out_base_min = (
-            pid_layer * MAX_REQS * MAX_PAGES * KVHD * 2
+            output_layer * MAX_REQS * MAX_PAGES * KVHD * 2
             + req_pool_idx * MAX_PAGES * KVHD * 2
             + pid_page * KVHD * 2
             + d_off * 2
         )
         tl.store(page_k_bounds_ptr + out_base_min, k_min)
         tl.store(page_k_bounds_ptr + out_base_min + 1, k_max)
+        if INDIRECT_BOUNDS:
+            tl.inline_asm_elementwise(
+                "fence.sc.sys; mov.u32 $0, 0;",
+                constraints="=r",
+                args=[],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
 
 
 def quest_prefill_bounds(
@@ -131,6 +146,10 @@ def quest_prefill_bounds(
     layer_offset_start: int,
     req_pool_idx: int,
     page_size: int,
+    *,
+    bounds_pointer_table: torch.Tensor | None = None,
+    output_layer_offset: int = 0,
+    num_layers: int | None = None,
 ) -> None:
     """Compute Quest prefill bounds for one request, all layers, in one kernel.
 
@@ -164,9 +183,7 @@ def quest_prefill_bounds(
     assert running_k_min.dtype == torch.bfloat16
     assert running_k_max.dtype == torch.bfloat16
 
-    num_quest_layers, max_reqs, max_pages, kv_heads, head_dim, two = (
-        page_k_bounds.shape
-    )
+    num_quest_layers, max_reqs, max_pages, kv_heads, head_dim, two = page_k_bounds.shape
     assert two == 2
     kvhd = kv_heads * head_dim
 
@@ -189,7 +206,13 @@ def quest_prefill_bounds(
         block_kvhd = kvhd  # fall back to whole-vector
     kvhd_tiles = kvhd // block_kvhd
 
-    grid = (num_quest_layers, grid_y, kvhd_tiles)
+    layer_count = num_quest_layers if num_layers is None else num_layers
+    if (
+        not 0 < layer_count <= num_quest_layers
+        or not 0 <= output_layer_offset <= num_quest_layers - layer_count
+    ):
+        raise ValueError("Invalid Quest prefill destination layers")
+    grid = (layer_count, grid_y, kvhd_tiles)
 
     # Kernel expects int64 prefill_indices.
     if prefill_indices.dtype != torch.int64:
@@ -198,11 +221,12 @@ def quest_prefill_bounds(
     _quest_prefill_bounds_kernel[grid](
         k_data_ptrs,
         prefill_indices,
-        page_k_bounds,
+        page_k_bounds if bounds_pointer_table is None else bounds_pointer_table,
         running_k_min,
         running_k_max,
         layer_offset_start,
         req_pool_idx,
+        output_layer_offset,
         num_full_pages,
         partial_count,
         MAX_REQS=max_reqs,
@@ -210,5 +234,6 @@ def quest_prefill_bounds(
         PAGE_SIZE=page_size,
         KVHD=kvhd,
         BLOCK_KVHD=block_kvhd,
+        INDIRECT_BOUNDS=bounds_pointer_table is not None,
         num_warps=4,
     )

@@ -136,6 +136,33 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     page_size = extra_config.pop("page_size", None)
     # Quest-specific knob; defaulted below when algorithm == "quest".
     quest_page_size = extra_config.pop("quest_page_size", None)
+    xm_fused = extra_config.pop("xm_fused_retrieval_attention", False)
+    xm_offload = extra_config.pop("xm_quest_bounds_offload", False)
+    xm_mode = extra_config.pop("xm_quest_prefetch_mode", "none")
+    xm_protect = extra_config.pop("xm_prefetch_protect", False)
+    xm_budget = extra_config.pop("xm_cache_hbm_budget_bytes", None)
+    if xm_budget is not None and (type(xm_budget) is not int or xm_budget <= 0):
+        raise ValueError("xm_cache_hbm_budget_bytes must be a positive integer")
+    for name, value in (
+        ("xm_fused_retrieval_attention", xm_fused),
+        ("xm_quest_bounds_offload", xm_offload),
+        ("xm_prefetch_protect", xm_protect),
+    ):
+        if type(value) is not bool:
+            raise ValueError(f"hisparse_config: {name} must be a boolean")
+    if xm_mode not in ("none", "on_demand", "lookahead"):
+        raise ValueError("xm_quest_prefetch_mode must be none, on_demand or lookahead")
+    if xm_offload != (xm_mode != "none"):
+        raise ValueError("Quest bounds offload requires on_demand or lookahead prefetch")
+    if xm_protect and not (xm_offload and xm_mode == "lookahead"):
+        raise ValueError("xm_prefetch_protect requires lookahead bounds offload")
+    if xm_fused or xm_offload or xm_budget is not None:
+        if algorithm != "quest" or backing_store != "cpu":
+            raise ValueError("XM-Sparse Qwen adaptation requires Quest with CPU backing")
+        if not getattr(server_args, "enable_hisparse", False):
+            raise ValueError("XM-Sparse adaptation requires --enable-hisparse")
+        if getattr(server_args, "tp_size", 1) != 1:
+            raise ValueError("XM-Sparse Qwen adaptation currently requires one compute GPU")
 
     if algorithm == "quest":
         if quest_page_size is None:
@@ -159,6 +186,11 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         page_size=page_size,
         min_sparse_prompt_len=min_sparse_prompt_len,
         quest_page_size=quest_page_size,
+        xm_fused_retrieval_attention=xm_fused,
+        xm_quest_bounds_offload=xm_offload,
+        xm_quest_prefetch_mode=xm_mode,
+        xm_prefetch_protect=xm_protect,
+        xm_cache_hbm_budget_bytes=xm_budget,
         sparse_extra_config=extra_config,
     )
 

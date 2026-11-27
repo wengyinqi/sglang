@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import functools
+import hashlib
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import load_jit, make_cpp_args
+from sglang.jit_kernel.utils import get_jit_cuda_arch, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -176,6 +179,180 @@ def load_cache_to_device_buffer_mha(
         page_size,
         item_size_bytes,
         *extra,
+    )
+
+
+@functools.cache
+def _jit_plan_mha_module(
+    item_size_bytes: int,
+    block_size: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    collect_metrics: bool,
+) -> Module:
+    args = make_cpp_args(block_size, num_top_k, hot_buffer_size, collect_metrics)
+    return load_jit(
+        "hisparse_mha_plan_only",
+        *make_cpp_args(
+            item_size_bytes, block_size, num_top_k, hot_buffer_size, collect_metrics
+        ),
+        cuda_files=["hisparse.cuh"],
+        cuda_wrappers=[
+            ("plan_cache_to_device_buffer_mha", f"plan_cache_to_device_buffer_mha<{args}>")
+        ],
+        build_directory=_xm_build_directory(
+            "hisparse_mha_plan_only", "hisparse.cuh", *args
+        ),
+    )
+
+
+def _xm_build_directory(name: str, source_name: str, *args) -> str | None:
+    """Persist only the experimental JITs when an explicit cache is set."""
+    cache_root = os.environ.get("SGLANG_JIT_CACHE_DIR")
+    if not cache_root:
+        return None
+    source = Path(__file__).parent / "csrc" / source_name
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    architecture = get_jit_cuda_arch().target_name
+    directory = Path(cache_root) / (
+        f"{name}_{'_'.join(str(arg) for arg in args)}_{architecture}_{source_hash}"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    return str(directory)
+
+
+@functools.cache
+def _empty_plan_metrics() -> torch.Tensor:
+    return torch.empty(0, dtype=torch.int64)
+
+
+def prepare_plan_cache_to_device_buffer_mha(
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    block_size: int = 1024,
+    collect_metrics: bool = False,
+) -> None:
+    """Compile before capture; the default cache-copy ABI remains untouched."""
+    _jit_plan_mha_module(
+        item_size_bytes, block_size, num_top_k, hot_buffer_size, collect_metrics
+    )
+    _empty_plan_metrics()
+
+
+def plan_cache_to_device_buffer_mha(
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    device_k_buffer: torch.Tensor,
+    device_v_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    miss_host_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    num_real_reqs: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    block_size: int = 1024,
+    cache_metrics: torch.Tensor | None = None,
+) -> None:
+    """Resolve without payload I/O, for the following fused attention kernel.
+
+    ``miss_host_locs`` uses original selection order: -1 means hot/newest,
+    otherwise it is the backing row. ``top_k_device_locs`` names the hot hit
+    or refill destination. The caller must complete refill on the same stream
+    before another resolver or cache consumer can observe the updated mapping.
+    """
+    if not 0 < num_top_k <= hot_buffer_size <= 32767:
+        raise ValueError("Plan-only resolve requires 0 < top_k <= hot <= 32767")
+    if block_size % 32 or not 0 < block_size <= 1024:
+        raise ValueError("Plan-only resolve requires a warp-aligned CUDA block")
+    if top_k_tokens.ndim != 2 or top_k_tokens.shape[1] != num_top_k:
+        raise ValueError("Plan-only selection must be [batch, top_k]")
+    if top_k_tokens.device.type != "cuda":
+        raise ValueError("Plan-only resolve requires the CUDA compute device")
+    batch_size = top_k_tokens.shape[0]
+    if (
+        device_buffer_tokens.ndim != 2
+        or device_buffer_locs.shape != device_buffer_tokens.shape
+        or device_buffer_tokens.shape[1] < hot_buffer_size + 1
+        or host_cache_locs.ndim != 2
+        or host_cache_locs.shape[0] != device_buffer_tokens.shape[0]
+        or lru_slots.shape != (device_buffer_tokens.shape[0], hot_buffer_size)
+        or req_pool_indices.shape != (batch_size,)
+        or seq_lens.shape != (batch_size,)
+        or num_real_reqs.shape != (1,)
+    ):
+        raise ValueError("Plan-only request, cache, LRU or length shapes disagree")
+    tensors = (
+        (top_k_tokens, torch.int32),
+        (top_k_device_locs, torch.int32),
+        (miss_host_locs, torch.int64),
+        (device_buffer_tokens, torch.int32),
+        (device_buffer_locs, torch.int32),
+        (host_cache_locs, torch.int64),
+        (lru_slots, torch.int16),
+        (req_pool_indices, torch.int64),
+        (num_real_reqs, torch.int32),
+    )
+    for tensor, dtype in tensors:
+        if tensor.dtype != dtype or tensor.device != top_k_tokens.device:
+            raise ValueError("Plan-only tensors require their declared dtype/device")
+        if not tensor.is_contiguous():
+            raise ValueError("Plan-only tensors must be contiguous")
+    if top_k_device_locs.shape != top_k_tokens.shape or miss_host_locs.shape != top_k_tokens.shape:
+        raise ValueError("Plan outputs must match the complete selection shape")
+    if seq_lens.dtype not in (torch.int32, torch.int64) or seq_lens.device != top_k_tokens.device:
+        raise ValueError("Plan-only sequence lengths must be CUDA int32/int64")
+    if not seq_lens.is_contiguous():
+        raise ValueError("Plan-only sequence lengths must be contiguous")
+    for tensor in (device_k_buffer, device_v_buffer):
+        if (
+            tensor.device != top_k_tokens.device
+            or tensor.dtype != torch.bfloat16
+            or tensor.ndim != 3
+            or tensor.shape[0] <= 0
+            or not tensor.is_contiguous()
+            or tensor.shape[1] * tensor.shape[2] * tensor.element_size()
+            != item_size_bytes
+        ):
+            raise ValueError("Plan-only KV buffers require matching CUDA BF16 rows")
+    if device_k_buffer.shape != device_v_buffer.shape:
+        raise ValueError("Plan-only K/V hot-buffer shapes disagree")
+    if cache_metrics is not None and (
+        cache_metrics.dtype != torch.int64
+        or cache_metrics.shape != (5,)
+        or cache_metrics.device != top_k_tokens.device
+        or not cache_metrics.is_contiguous()
+    ):
+        raise ValueError("Plan metrics must be contiguous CUDA int64[5]")
+    top_k_device_locs.fill_(-1)
+    miss_host_locs.fill_(-1)
+    _jit_plan_mha_module(
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        cache_metrics is not None,
+    ).plan_cache_to_device_buffer_mha(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        device_k_buffer,
+        device_v_buffer,
+        top_k_device_locs,
+        miss_host_locs,
+        req_pool_indices,
+        seq_lens,
+        lru_slots,
+        num_real_reqs,
+        1,
+        item_size_bytes,
+        cache_metrics if cache_metrics is not None else _empty_plan_metrics(),
     )
 
 

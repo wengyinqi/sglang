@@ -102,7 +102,7 @@ struct SmemLayout {
 // req_pool_indices are int64_t (pool indices can be large), seq_lens can be int32_t or int64_t
 // Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
 // newest_slot is at HOT_BUFFER_SIZE (first position of extra page)
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer, typename SeqLensT, bool CollectMetrics = false>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer, typename SeqLensT, bool CollectMetrics = false, bool PlanOnly = false>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -133,14 +133,15 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t local_rows,
     int64_t req_count,
     int64_t cache_columns,
-    int64_t* __restrict__ cache_metrics) {
+    int64_t* __restrict__ cache_metrics,
+    int64_t* __restrict__ miss_host_locs) {
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
   constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
 
   const int bid = blockIdx.x;
-  if constexpr (IsPeer) {
+  if constexpr (IsPeer || PlanOnly) {
     if (num_real_reqs[0] < 0 || num_real_reqs[0] > gridDim.x) {
       asm volatile("trap;");
       return;
@@ -156,7 +157,7 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   const int64_t rid = req_pool_indices[bid];
   const int64_t seq_len = seq_lens[bid];
-  if constexpr (IsPeer) {
+  if constexpr (IsPeer || PlanOnly) {
     if (rid < 0 || rid >= req_count || seq_len < 0 || seq_len > cache_columns) {
       asm volatile("trap;");
       return;
@@ -187,7 +188,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     }
     for (int i = tid; i < count; i += BLOCK_SIZE) {
       int32_t token_pos = req_top_k_tokens[i];
-      if constexpr (IsPeer) {
+      if constexpr (IsPeer || PlanOnly) {
         if (token_pos >= seq_len) {
           asm volatile("trap;");
           return;
@@ -195,7 +196,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       }
       if (token_pos >= 0) {
         const int32_t device_loc = req_device_buffer_locs[token_pos];
-        if constexpr (IsPeer) {
+        if constexpr (IsPeer || PlanOnly) {
           if (device_loc < 0 || device_loc >= local_rows) {
             asm volatile("trap;");
             return;
@@ -251,7 +252,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if constexpr (IsPeer) {
+    if constexpr (IsPeer || PlanOnly) {
       if (token_idx < 0 || token_idx >= seq_len) {
         asm volatile("trap;");
         return;
@@ -262,7 +263,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
       const int32_t device_loc = req_device_buffer_locs[newest_slot];
-      if constexpr (IsPeer) {
+      if constexpr (IsPeer || PlanOnly) {
         if (device_loc < 0 || device_loc >= local_rows) {
           asm volatile("trap;");
           return;
@@ -295,7 +296,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
     const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
     const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
-    if constexpr (IsPeer) {
+    if constexpr (IsPeer || PlanOnly) {
       if (has_valid_slot && (buf_slot < 0 || buf_slot >= HOT_BUFFER_SIZE)) {
         asm volatile("trap;");
         return;
@@ -322,7 +323,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (is_hit) {
       s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
       const int32_t device_loc = req_device_buffer_locs[buf_slot];
-      if constexpr (IsPeer) {
+      if constexpr (IsPeer || PlanOnly) {
         if (device_loc < 0 || device_loc >= local_rows) {
           asm volatile("trap;");
           return;
@@ -421,6 +422,21 @@ __global__ void load_cache_to_device_buffer_kernel(
       s_top_k_tokens[miss_offset] = my_token;
       req_top_k_device_locs[my_token_idx] = req_device_buffer_locs[evict_slot];
       req_device_buffer_tokens[evict_slot] = my_token;
+      if constexpr (PlanOnly) {
+        // Keep this output in original selection order. A negative source is
+        // a hot hit; a nonnegative source is a host row whose destination is
+        // req_top_k_device_locs[my_token_idx]. The following fused kernel must
+        // finish refill before any later cache access consumes this mapping.
+        const int64_t source = req_host_cache_locs[my_token];
+        const int32_t destination = req_device_buffer_locs[evict_slot];
+        // -1 encodes a hit in the fused plan. A missing backing row must
+        // fail explicitly instead of being mistaken for resident KV.
+        if (source < 0 || destination < 0 || destination >= local_rows) {
+          asm volatile("trap;");
+          return;
+        }
+        miss_host_locs[bid * top_k_device_locs_stride + my_token_idx] = source;
+      }
     }
   }
   __syncthreads();
@@ -452,6 +468,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     }
   }
 
+  if constexpr (!PlanOnly) {
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
@@ -485,9 +502,10 @@ __global__ void load_cache_to_device_buffer_kernel(
       transfer_item_warp<IsPeer>(lane_id, src_v, dst_v, item_size_bytes);
     }
   }
+  }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer, bool CollectMetrics = false>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsPeer, bool CollectMetrics = false, bool PlanOnly = false>
 void launch_load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -510,7 +528,8 @@ void launch_load_cache_to_device_buffer(
     int64_t num_layers,
     int64_t layer_id,
     int64_t peer_rows,
-    int64_t* cache_metrics = nullptr) {
+    int64_t* cache_metrics = nullptr,
+    int64_t* miss_host_locs = nullptr) {
   using namespace host;
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -559,19 +578,48 @@ void launch_load_cache_to_device_buffer(
         device_buffer_k.shape()[0],
         device_buffer_tokens.shape()[0],
         host_cache_locs.shape()[1],
-        cache_metrics);
+        cache_metrics,
+        miss_host_locs);
   };
 
   const auto dtype = seq_lens.dtype();
   if (dtype.code == kDLInt && dtype.bits == 64) {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int64_t, CollectMetrics>,
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int64_t, CollectMetrics, PlanOnly>,
         static_cast<const int64_t*>(seq_lens.data_ptr()));
   } else {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int32_t, CollectMetrics>,
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IsPeer, int32_t, CollectMetrics, PlanOnly>,
         static_cast<const int32_t*>(seq_lens.data_ptr()));
   }
+}
+
+// Independent ABI for retrieval-attention fusion. It shares the ordinary
+// resolver's exact hit/newest/LRU/eviction logic and never moves KV payload.
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool CollectMetrics = false>
+void plan_cache_to_device_buffer_mha(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView device_k_buffer,
+    tvm::ffi::TensorView device_v_buffer,
+    tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView miss_host_locs,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView num_real_reqs,
+    int64_t page_size,
+    int64_t item_size_bytes,
+    tvm::ffi::TensorView cache_metrics) {
+  launch_load_cache_to_device_buffer<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, false, false, CollectMetrics, true>(
+      top_k_tokens, device_buffer_tokens, host_cache_locs, device_buffer_locs,
+      nullptr, nullptr, device_k_buffer, device_v_buffer, top_k_device_locs,
+      req_pool_indices, seq_lens, lru_slots, num_real_reqs, page_size,
+      item_size_bytes, nullptr, 0, 0, 0, 0, 0,
+      CollectMetrics ? static_cast<int64_t*>(cache_metrics.data_ptr()) : nullptr,
+      static_cast<int64_t*>(miss_host_locs.data_ptr()));
 }
 
 // Preserve the pinned-host public ABI and its original cache/load behavior.

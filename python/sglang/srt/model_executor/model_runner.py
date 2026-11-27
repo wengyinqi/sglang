@@ -733,6 +733,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     top_k=hisparse_cfg.top_k,
                     page_size=hisparse_cfg.quest_page_size,
                     device=torch.device(self.device),
+                    xm_bounds_offload=hisparse_cfg.xm_quest_bounds_offload,
+                    xm_prefetch_mode=hisparse_cfg.xm_quest_prefetch_mode,
+                    xm_prefetch_protect=hisparse_cfg.xm_prefetch_protect,
                 )
                 quest.init_storage(
                     start_layer=self.start_layer,
