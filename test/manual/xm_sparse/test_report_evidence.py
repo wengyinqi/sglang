@@ -1604,7 +1604,9 @@ def test_rendered_metric_numa_and_parent_graph_scope_preserve_evidence_boundarie
     text = "\n".join(paragraphs)
     assert "TPOT=(请求时延-TTFT)/(输出 tokens-1)" in text
     assert "已扣自身 TTFT" in text and "交错 prefill" in text
-    assert "NUMA node 0" in text and "CPU backing ratio 8" in text
+    assert "pinned-memory 分配域以实际 NUMA receipt 为准" in text
+    assert "CPU ratio4／8" in text and "大 CPU 控制、性能与容量仍使用 ratio8" in text
+    assert "ratio4只改变CPU backing与逻辑映射容量，不定义 Quest P" in text
     assert "不能计作软件机制收益" in text
     assert "计划 backing 上界与各容量点的实测 allocation 分开记录" in text
     assert "NUMA receipt 和原始 capacity 证据" in text

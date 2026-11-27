@@ -79,6 +79,10 @@ The paper's Table 3 and Appendix A.2 guide attribution and plot layout;
 their numeric results are author measurements on different hardware/models.
 Negative or statistically unresolved gains are reported as such.
 
+Source017 explicit ratio4/ratio8 proof binding, exact capacity-point controls
+and complete HTTP paired effects are described in [REPORT_CONTROLS.md](REPORT_CONTROLS.md).
+Report-tool CPU acceptance is separate from the frozen model execution source.
+
 ## Entry points
 
 `campaign.py` only plans unless `--execute` is present. It writes explicit

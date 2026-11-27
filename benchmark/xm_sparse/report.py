@@ -343,6 +343,15 @@ def report_tool(name):
     return module
 
 
+def control_binding_api():
+    return SimpleNamespace(
+        identity=identity,
+        report_tool=report_tool,
+        _native_correctness=_native_correctness,
+        measurement_graph=measurement_graph,
+    )
+
+
 def _native_correctness(proof_path, case, evidence):
     declared = Path(case.get("stage_path", "")).parent / "evidence/manifest.json"
     if declared.is_file():
@@ -1353,9 +1362,33 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                 receipts = verify_model_receipt(
                     proof_path, proof, evidence, data, benchmark_models
                 )
-                controls = audit_large_capacity_controls(
-                    data, proof_path, proof, receipts, evidence
-                )
+                source017_binding = report_tool("report_control_binding")
+                explicit_precursor, point_gate, http_effects = None, None, None
+                if source017_binding.source017(data):
+                    explicit_precursor = source017_binding.verify_precursor(
+                        proof_path, proof, evidence, control_binding_api()
+                    )
+                    if data["phase"] == "capacity":
+                        point_gate = source017_binding.capacity_point_gate(
+                            data,
+                            proof_path,
+                            proof,
+                            receipts,
+                            evidence,
+                            control_binding_api(),
+                        )
+                        controls = []
+                    else:
+                        controls = audit_large_capacity_controls(
+                            data, proof_path, proof, receipts, evidence
+                        )
+                        http_effects = source017_binding.verify_http_effects(
+                            path, data, evidence, control_binding_api()
+                        )
+                else:
+                    controls = audit_large_capacity_controls(
+                        data, proof_path, proof, receipts, evidence
+                    )
                 accepted.extend(dict(item, analysis=str(path)) for item in receipts)
                 bindings.append(
                     {
@@ -1378,6 +1411,9 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                         ),
                         "model_receipts": receipts,
                         "large_batch_summary_controls": controls,
+                        "explicit_precursor": explicit_precursor,
+                        "capacity_point_gate": point_gate,
+                        "client_paired_effects": http_effects,
                     }
                 )
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
@@ -1391,12 +1427,22 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                     }
                 )
     passed = any(binding["status"] == "passed" for binding in bindings)
+    pending_capacity = [
+        point
+        for binding in bindings
+        for point in (binding.get("capacity_point_gate") or {}).get("pending", [])
+    ]
     return {
-        "status": ("partial" if failures else "passed") if passed else "blocked",
+        "status": (
+            ("partial" if failures or pending_capacity else "passed")
+            if passed
+            else "blocked"
+        ),
         "model_result_claims_allowed": passed and not diagnostic_only,
         "failures": failures,
         "accepted_model_receipts": accepted,
         "analysis_model_proof_bindings": bindings,
+        "pending_capacity_points": pending_capacity,
         "scope": "Each analysis is independently admitted or suppressed. Its raw campaign proof path/hash, archived source/workload, CPU/HBM, modes, tokens/logprobs, reuse and lifecycle are rechecked. Capacity summary-offload batches beyond the small HBM context/batch coverage require an exact actual-batch CPU resident/offloaded summary control. That control is not a large full-HBM reference.",
     }
 
@@ -1409,13 +1455,20 @@ def display_analyses(analyses, audit):
             str(binding["analysis"].get("path"))
             if isinstance(binding.get("analysis"), dict)
             else str(binding.get("analysis"))
-        ): binding["status"]
+        ): binding
         for binding in audit.get("analysis_model_proof_bindings", [])
     }
     result = []
     for path, original in analyses:
-        if audit["model_result_claims_allowed"] and verdicts.get(str(path)) == "passed":
-            result.append((path, original))
+        binding = verdicts.get(str(path), {})
+        if audit["model_result_claims_allowed"] and binding.get("status") == "passed":
+            gate = binding.get("capacity_point_gate")
+            shown = (
+                report_tool("report_control_binding").filter_capacity(original, gate)
+                if gate
+                else original
+            )
+            result.append((path, shown))
             continue
         data = copy.deepcopy(original)
         data["suppressed_model_samples"] = len(data.get("samples", []))
@@ -1686,7 +1739,91 @@ def paired_decode_conclusion(row, label):
     )
 
 
-def draw_plots(analyses, profiles, directory):
+def validate_client_effect_bindings(bindings):
+    """Do not overwrite or mix complete HTTP cohorts across analyses."""
+    seen_metrics, seen_effects = set(), set()
+    source = None
+    for binding in bindings:
+        current = (
+            binding.get("source_fingerprint"),
+            binding.get("native_source_commits"),
+            binding.get("workload_identity"),
+        )
+        require(
+            all(value for value in current),
+            "Complete HTTP plots need explicit source/revision/workload identity",
+        )
+        require(
+            source is None or current == source,
+            "Complete HTTP effects belong to different sources or workloads",
+        )
+        source = current
+        for row in binding["metrics"]:
+            key = tuple(
+                row[name]
+                for name in (
+                    "arm",
+                    "input_len",
+                    "client_concurrency",
+                    "graph_enabled",
+                )
+            )
+            require(
+                key not in seen_metrics,
+                "Duplicate complete HTTP arm/input/C/Graph across admitted analyses; do not merge repeat cohorts",
+            )
+            seen_metrics.add(key)
+        for row in binding["effects"]:
+            key = tuple(
+                row[name]
+                for name in (
+                    "baseline",
+                    "changed",
+                    "metric",
+                    "input_len",
+                    "client_concurrency",
+                    "graph_enabled",
+                )
+            )
+            require(
+                key not in seen_effects,
+                "Duplicate complete HTTP paired effect across admitted analyses",
+            )
+            seen_effects.add(key)
+    return bindings
+
+
+def client_effect_bindings(audit):
+    if not audit.get("model_result_claims_allowed"):
+        return []
+    return validate_client_effect_bindings(
+        [
+            binding["client_paired_effects"]
+            for binding in audit.get("analysis_model_proof_bindings", [])
+            if binding.get("status") == "passed"
+            and (binding.get("client_paired_effects") or {}).get("status") == "passed"
+        ]
+    )
+
+
+def client_effect_conclusion(row):
+    value = row["paired_repeat_reduction_percent"]
+    interval = row["confidence_interval_95_percent"]
+    metric = (
+        "完整 HTTP mean TBT" if row["metric"] == "http_mean_tbt_ms" else "请求 TPOT"
+    )
+    uncertainty = (
+        "区间跨0，本轮无法确认收益或代价。" if interval[0] <= 0 <= interval[1] else ""
+    )
+    return (
+        f"{row['baseline']}→{row['changed']}：输入 {row['input_len']:,} tokens、客户端 C={row['client_concurrency']}、"
+        f"Graph={row['graph_enabled']}，{metric} 的配对重复下降率 {value:.2f}%，"
+        f"95% t 区间 [{interval[0]:.2f}, {interval[1]:.2f}]%，n={row['repeats']}，df={row['df']}。{uncertainty}"
+    )
+
+
+def draw_plots(analyses, profiles, directory, *, client_effects=()):
+    validate_client_effect_bindings(client_effects)
     import matplotlib
 
     matplotlib.use("Agg")
@@ -1697,6 +1834,53 @@ def draw_plots(analyses, profiles, directory):
     colors = dict(
         zip(ARMS, ("#59636e", "#2875a2", "#c19b51", "#47867c", "#855f9b", "#b05c58"))
     )
+    client_rows = [row for binding in client_effects for row in binding["metrics"]]
+    client_contexts = sorted(
+        {(row["client_concurrency"], row["graph_enabled"]) for row in client_rows}
+    )
+    for concurrency, graph in client_contexts:
+        selected = [
+            row
+            for row in client_rows
+            if row["client_concurrency"] == concurrency
+            and row["graph_enabled"] == graph
+        ]
+        lengths = sorted({row["input_len"] for row in selected})
+        for metric, label in (
+            ("http_mean_tbt_ms", "Complete HTTP mean TBT (ms)"),
+            ("request_tpot_ms", "Request TPOT (ms)"),
+        ):
+            figure, axis = plt.subplots(figsize=(8, 4.4))
+            bar_width = 0.8 / max(1, len(lengths))
+            for offset, length in enumerate(lengths):
+                values = {
+                    row["arm"]: row[metric]
+                    for row in selected
+                    if row["input_len"] == length
+                }
+                arms = [arm for arm in ARMS if arm in values]
+                axis.bar(
+                    [
+                        ARMS.index(arm) - 0.4 + bar_width * (offset + 0.5)
+                        for arm in arms
+                    ],
+                    [values[arm] for arm in arms],
+                    width=bar_width,
+                    label=f"{length // 1024}K input",
+                )
+            axis.set_xticks(range(len(ARMS)), ARMS, rotation=20, ha="right", fontsize=8)
+            axis.set_ylabel(label)
+            axis.set_title(
+                f"Three-repeat complete request means, C={concurrency}, Graph={graph}"
+            )
+            axis.legend()
+            axis.grid(axis="y", alpha=0.2)
+            figure.tight_layout()
+            base = directory / f"http-c{concurrency}-graph{int(graph)}-{metric}"
+            for extension in ("png", "svg"):
+                figure.savefig(base.with_suffix("." + extension), dpi=180)
+            plt.close(figure)
+            images[("http", concurrency, graph, metric)] = base.with_suffix(".png")
     for index, (_, analysis) in enumerate(analyses):
         comparisons = analysis.get("same_actual_batch_comparisons", [])
         if comparisons:
@@ -1984,6 +2168,24 @@ def render_report(
         if data["phase"] == "performance"
         for row in data.get("same_actual_batch_comparisons", [])
     ]
+    http_bindings = client_effect_bindings(report_audit)
+    http_effects = [row for binding in http_bindings for row in binding["effects"]]
+    for row in http_effects:
+        if row["metric"] == "http_mean_tbt_ms" and (
+            row["baseline"],
+            row["changed"],
+        ) in (
+            ("baseline", "fused"),
+            ("bounds-on-demand", "bounds-prefetch"),
+            ("combined", "combined-protected"),
+            ("baseline", "combined-protected"),
+        ):
+            add(client_effect_conclusion(row))
+    if not http_bindings:
+        add(
+            "Table 3 主指标的完整 HTTP mean TBT／TPOT 配对重放尚未准入；稳定 scheduler 间隔仅作为补充诊断，不代替该主指标。",
+            "small",
+        )
     for baseline, changed, label in (
         ("baseline", "fused", "融合 TMA"),
         ("bounds-on-demand", "bounds-prefetch", "跨层 Quest 摘要预取"),
@@ -1996,7 +2198,7 @@ def render_report(
         ]
         if selected:
             for row in selected:
-                add(paired_decode_conclusion(row, label))
+                add(paired_decode_conclusion(row, "稳定窗口补充／" + label))
         else:
             add(
                 f"尚无满足稳定窗口与请求匹配要求的 {baseline}→{changed} 数据；"
@@ -2010,8 +2212,9 @@ def render_report(
     ]
     if capacity:
         add(
-            "容量扫描已经取得稳定实际 batch 的观测点。表 2 将 fused→combined-protected 作为主对照，"
-            "两者使用同一融合 Attention workspace；观测上界不等于硬件最大容量或最优性价比。"
+            "容量扫描已经取得稳定实际 batch 的观测点。表 2 保留原 baseline、fused 和 combined-protected 三条路径，"
+            "fused 与 combined-protected 使用同一融合 Attention workspace；baseline 的原 FlashInfer 384 MiB workspace 单独列出。"
+            "观测上界不等于硬件最大容量或最优性价比。"
         )
     else:
         add("尚未取得同 cache HBM 预算的容量扫描；摘要卸载的并发与吞吐收益保留待验证。")
@@ -2022,6 +2225,10 @@ def render_report(
         "带宽、重叠程度是不同证据。缺失 child memcpy 活动、受限 GPU counters 都不能被写成 CE 性能结论。"
     )
     add("Attention 机制身份：" + attention_identity["status"], "small")
+    add(
+        "native-only 机制 receipt 保留其采集时的 model pending／false 范围；它不等于模型失败，也不单独授权模型收益。实际模型范围由同源的独立 proof/raw 审核决定，原 native receipt 不改写。",
+        "small",
+    )
     add(
         "SASS 中 UBLKCP／HMMA 等计数是静态指令条目，不能解释为每 decode step 的动态执行次数、搬运流量或有效带宽。",
         "small",
@@ -2151,7 +2358,91 @@ def render_report(
         "small",
     )
 
-    section("2　表 1：同实际 batch 的软件机制效果（Table 3 式归因）")
+    section("2　表 1A：完整 HTTP 指标（Table 3 主口径的 Qwen 适配）")
+    if http_bindings:
+        metrics = [row for binding in http_bindings for row in binding["metrics"]]
+        table(
+            [
+                "臂／输入",
+                "C／Graph",
+                "重复",
+                "TTFT ms",
+                "mean TBT ms",
+                "TPOT ms",
+                "完整 tokens/s",
+            ],
+            [
+                [
+                    f"{row['arm']}\n{row['input_len']:,}",
+                    f"{row['client_concurrency']} / {row['graph_enabled']}",
+                    row["repeats"],
+                    fmt(row["client_ttft_ms"]),
+                    fmt(row["http_mean_tbt_ms"]),
+                    fmt(row["request_tpot_ms"]),
+                    fmt(row["complete_output_tokens_per_s"], 1),
+                ]
+                for row in metrics
+            ],
+            [1.7, 0.7, 0.45, 0.8, 0.8, 0.8, 0.95],
+        )
+        selected = [
+            row
+            for row in http_effects
+            if (row["baseline"], row["changed"])
+            in (
+                ("baseline", "fused"),
+                ("bounds-on-demand", "bounds-prefetch"),
+                ("combined", "combined-protected"),
+                ("baseline", "combined-protected"),
+            )
+        ]
+        table(
+            ["对照／输入／C", "指标", "下降率 %", "95% t 区间 %", "n／df"],
+            [
+                [
+                    f"{row['baseline']}→{row['changed']}\n{row['input_len']:,} / C={row['client_concurrency']}",
+                    (
+                        "HTTP mean TBT"
+                        if row["metric"] == "http_mean_tbt_ms"
+                        else "请求 TPOT"
+                    ),
+                    fmt(row["paired_repeat_reduction_percent"]),
+                    ranges(row["confidence_interval_95_percent"]),
+                    f"{row['repeats']} / {row['df']}",
+                ]
+                for row in selected
+            ],
+            [2.1, 1.1, 0.8, 1.2, 0.5],
+        )
+        for binding in http_bindings:
+            add(binding["metric_scope"], "small")
+            add(binding["ci_scope"], "small")
+            outputs = sorted(
+                {sample["output_tokens_per_request"] for sample in binding["samples"]}
+            )
+            add(
+                "真实 HTTP 输出长度："
+                + ", ".join(map(str, outputs))
+                + " tokens。128-token 数值前置证明、512-token 正式 timing 与256-token 独立 profile 的作用和数据分开；不同 context columns／Quest P 不视为同预算 allocation。",
+                "small",
+            )
+        for key, image_path in images.items():
+            if key[0] == "http":
+                metric = (
+                    "完整 HTTP mean TBT"
+                    if key[3] == "http_mean_tbt_ms"
+                    else "请求 TPOT"
+                )
+                figure(
+                    image_path,
+                    f"图 1A　{metric}，客户端 C={key[1]}、Graph={key[2]}；三重复完整请求均值，配对下降率与区间见表。",
+                )
+    else:
+        add(
+            "待真实同源模型门、完整 HTTP 单 token 帧重放与三次配对重复准入；本表保持待测。"
+        )
+
+    section("2B　表 1B：同实际 batch 的稳定调度间隔补充")
     add(
         "下降率=(原路径间隔-新路径间隔)／原路径间隔；负值表示回退。"
         "只纳入 analysis 中满足稳定步数、恒定请求集合与 decode 序号配对的样本。"
@@ -2199,13 +2490,16 @@ def render_report(
 
     section("3　表 2：同 cache HBM 预算的容量与吞吐")
     add(
-        "主比较为 fused→combined-protected：以此分离历史摘要卸载的容量效果与移除 FlashInfer workspace 的效果。"
+        "保留原 baseline→fused、fused→combined-protected 和 baseline→combined-protected：分别观察融合、摘要卸载及双机制的总效果。"
+        "cache-only 预算内不包含原 FlashInfer 384 MiB workspace 或融合临时 workspace，不能把该预算下的差异解释为已回收 workspace 的同总显存容量收益。"
         "配置的 cache HBM budget 不是模型、activation、Graph、驱动的总显存预算。"
         "cold NoPD 准入同时需要完整 prefill KV 与已准入/短暂共存的 hot；chunked prefill 不会逐 chunk 释放历史 KV。"
         "max-total-tokens、请求槽位、CPU backing 和准入策略也可能成为上限。已分配 GPU KV 池含 prefill/free reserve，不能全部解释为 live decode hot。"
     )
     add(
-        "本轮 pinned-memory 分配域固定为 NUMA node 0，未执行阶段采用 CPU backing ratio 8 是配置可行性调整，不能计作软件机制收益；"
+        "pinned-memory 分配域以实际 NUMA receipt 为准。full32K B4 正确性前置的 CPU ratio4／8 保留原 phase/seal/argv；大 CPU 控制、性能与容量仍使用 ratio8。"
+        "这些配置可行性调整不能计作软件机制收益。"
+        "ratio4只改变CPU backing与逻辑映射容量，不定义 Quest P；Quest R/P 来自实际 request-map 行数/context columns，不能从客户端C或ratio猜测。"
         "计划 backing 上界与各容量点的实测 allocation 分开记录，实际允许的 NUMA 节点、启动前检查与分配结果以提供的 NUMA receipt 和原始 capacity 证据为准。"
     )
     if capacity:
@@ -2227,6 +2521,7 @@ def render_report(
                     "臂",
                     "输入 tokens",
                     "客户端 C",
+                    "准入限／Quest R",
                     "实际 B",
                     "Graph",
                     "重复",
@@ -2238,6 +2533,7 @@ def render_report(
                         r["arm"],
                         f"{r['input_len']:,}",
                         r["client_concurrency"],
+                        f"{r.get('request_capacity_R', '未观测')} / {r.get('quest_rows_R', '未观测')}",
                         r["actual_batch_size"],
                         str(r.get("graph_enabled", "未记录")),
                         r["observed_repeats"],
@@ -2246,7 +2542,7 @@ def render_report(
                     ]
                     for r in rows
                 ],
-                [1.55, 0.95, 0.6, 0.6, 0.65, 0.55, 0.95, 1],
+                [1.4, 0.8, 0.45, 0.95, 0.45, 0.55, 0.4, 0.8, 0.95],
             )
             for (length, concurrency, graph), points in capacity_groups(data).items():
                 maxima = {}
@@ -2287,6 +2583,29 @@ def render_report(
     else:
         add(
             "尚无容量扫描结果。保留待验证，不从单 batch 的内存节省外推出最大并发或吞吐。"
+        )
+    unqualified = [
+        point
+        for binding in report_audit.get("analysis_model_proof_bindings", [])
+        for point in (binding.get("capacity_point_gate") or {}).get("pending", [])
+    ]
+    if unqualified:
+        add("保留的原始容量窗口诊断／尚未取得匹配模型控制", "heading")
+        table(
+            ["臂／输入", "C／准入限／Quest R／实际 B", "未准入原因"],
+            [
+                [
+                    f"{point['arm']} / {point['input_len']:,}",
+                    f"{point['client_concurrency']} / {point.get('request_capacity_R', '未观测')} / {point.get('quest_rows_R', '未观测')} / {point['actual_batch_size']}",
+                    point["reason"],
+                ]
+                for point in unqualified
+            ],
+            [1.5, 1.2, 3.0],
+        )
+        add(
+            "这些窗口保留原始 C、实际准入上限、Quest tensor R/P 和 B；没有模型门的窗口不进入容量收益曲线。缺 C12/B12 或匹配的 B11/R 控制不等于已测最大 B8；边界细化需新实测，不能用理论11或C11/R11替代C12/R12的运行。",
+            "small",
         )
     add("失败或不合格样本", "heading")
     excluded = []
@@ -2817,6 +3136,74 @@ def render_report(
             ],
             [1.1, 0.55, 2.5, 2.35],
         )
+    precursors = [
+        binding["explicit_precursor"]
+        for binding in bindings
+        if binding.get("explicit_precursor")
+    ]
+    if precursors:
+        table(
+            ["原始前置证明", "CPU ratio", "实际完整上下文范围", "作用"],
+            [
+                [
+                    Path(item["original_campaign"]["path"]).parent.name,
+                    item["precursor_capacity_ratio"],
+                    "32K／B4；physical132608；full4context131584；CPU/HBM eager＋Graph",
+                    "原phase/seal/argv与raw重放；不作为ratio8同预算证据",
+                ]
+                for item in precursors
+            ],
+            [1.5, 0.55, 2.1, 1.85],
+        )
+    baseline_controls = [
+        item
+        for binding in bindings
+        for item in (binding.get("capacity_point_gate") or {}).get(
+            "external_baseline_controls", []
+        )
+    ]
+    if baseline_controls:
+        table(
+            [
+                "原始 CPU baseline 控制",
+                "B／准入限／Quest R",
+                "前置／大控制 ratio",
+                "证明范围",
+            ],
+            [
+                [
+                    Path(item["control"]["path"]).name,
+                    f"{item['batch']} / {item['request_capacity_R']} / {item['quest_rows_R']}",
+                    f"{item['precursor_capacity_ratio']} / {item['large_control_capacity_ratio']}",
+                    "FI baseline→fused／combined-protected；同输入/greedy/LP；eager/Graph/reuse/lifecycle；无大HBM/容量证明",
+                ]
+                for item in baseline_controls
+            ],
+            [1.4, 1.1, 0.7, 2.8],
+        )
+        for item in baseline_controls:
+            custody = item["execution_custody"]
+            add(
+                "外部控制源码："
+                + custody["controller"]["path"]
+                + "；SHA256="
+                + custody["controller"]["sha256"],
+                "small",
+            )
+            add(
+                "执行 runner："
+                + custody["runner"]["path"]
+                + "；SHA256="
+                + custody["runner"]["sha256"],
+                "small",
+            )
+            add(
+                "独立执行 custody："
+                + custody["custody"]["path"]
+                + "；SHA256="
+                + custody["custody"]["sha256"],
+                "small",
+            )
     for path, record in evidence:
         arm = (
             record.get("stage", {}).get("xm_adaptation", {}).get("arm")
@@ -3185,7 +3572,10 @@ def main(argv=None):
         {}
         if args.skip_plots
         else draw_plots(
-            shown, profiles, args.output.parent / (args.output.stem + "-figures")
+            shown,
+            profiles,
+            args.output.parent / (args.output.stem + "-figures"),
+            client_effects=client_effect_bindings(audit),
         )
     )
     render_report(
