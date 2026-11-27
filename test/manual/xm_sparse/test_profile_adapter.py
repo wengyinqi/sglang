@@ -27,7 +27,7 @@ TELEMETRY = load("telemetry")
 def actual_proof(tmp_path, monkeypatch):
     workload = tmp_path / "workload.json"
     workload.write_text("{}")
-    stage = PROFILE.CAMPAIGN.recipe("fused")
+    stage = PROFILE.CAMPAIGN.recipe("fused", cohort_barrier=True)
     stage_path = tmp_path / "fused/stage.json"
     PROFILE.CAMPAIGN.write(stage_path, stage)
     native_path = stage_path.parent / "evidence/manifest.json"
@@ -37,6 +37,12 @@ def actual_proof(tmp_path, monkeypatch):
             "variant": variant,
             "eager": mode == "eager",
             "status": "success",
+            "server_command": [
+                "fixture-server",
+                "--xm-correctness-cohort-barrier",
+                "--xm-correctness-cohort-timeout-seconds",
+                str(PROFILE.CAMPAIGN.COHORT_TIMEOUT_SECONDS),
+            ],
             "lifecycle_required": True,
             "lifecycle_results": [
                 {"case": case, "status": "passed"}
@@ -60,6 +66,16 @@ def actual_proof(tmp_path, monkeypatch):
         },
     }
     PROFILE.CAMPAIGN.write(native_path, native)
+    for group in groups:
+        PROFILE.CAMPAIGN.write(
+            native_path.parent / (group["id"] + "-server-info.json"),
+            {
+                "xm_correctness_cohort_barrier": True,
+                "xm_correctness_cohort_timeout_seconds": (
+                    PROFILE.CAMPAIGN.COHORT_TIMEOUT_SECONDS
+                ),
+            },
+        )
     fingerprint = {"files": 1, "sha256": "source-test-fixture"}
     monkeypatch.setattr(PROFILE.CAMPAIGN, "source_fingerprint", lambda: fingerprint)
     proof = tmp_path / "campaign.json"
@@ -71,6 +87,7 @@ def actual_proof(tmp_path, monkeypatch):
             "model": "/models/qwen",
             "input_lens": [16384],
             "disable_cuda_graph": False,
+            "xm_correctness_cohort_barrier": True,
         },
         "source_fingerprint": fingerprint,
         "workload_identity": PROFILE.CAMPAIGN.identity(workload),
@@ -78,6 +95,7 @@ def actual_proof(tmp_path, monkeypatch):
             {
                 "arm": "fused",
                 "status": "success",
+                "stage": stage,
                 "returncode": 0,
                 "stage_path": str(stage_path),
                 "command": ["fixture"],
@@ -98,7 +116,17 @@ def test_receipt_asserts_only_actually_executed_correctness(actual_proof):
 
 
 @pytest.mark.parametrize(
-    "mutation", ["unfinished", "source", "missing_hbm", "missing_lifecycle", "exit"]
+    "mutation",
+    [
+        "unfinished",
+        "source",
+        "missing_hbm",
+        "missing_lifecycle",
+        "exit",
+        "cohort",
+        "timeout",
+        "observed_cohort",
+    ],
 )
 def test_rejects_missing_or_changed_real_evidence(actual_proof, mutation):
     proof, native_path, accepted, native = actual_proof
@@ -113,6 +141,20 @@ def test_rejects_missing_or_changed_real_evidence(actual_proof, mutation):
         native["groups"][0]["lifecycle_results"].pop()
     elif mutation == "exit":
         accepted["cases"][0]["returncode"] = 2
+    elif mutation == "cohort":
+        accepted["settings"]["xm_correctness_cohort_barrier"] = False
+    elif mutation == "timeout":
+        native["groups"][0]["server_command"][-1] = "1.0"
+    elif mutation == "observed_cohort":
+        PROFILE.CAMPAIGN.write(
+            native_path.parent / (native["groups"][0]["id"] + "-server-info.json"),
+            {
+                "xm_correctness_cohort_barrier": False,
+                "xm_correctness_cohort_timeout_seconds": (
+                    PROFILE.CAMPAIGN.COHORT_TIMEOUT_SECONDS
+                ),
+            },
+        )
     PROFILE.CAMPAIGN.write(proof, accepted)
     PROFILE.CAMPAIGN.write(native_path, native)
     with pytest.raises(ValueError):
