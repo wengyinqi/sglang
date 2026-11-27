@@ -1496,6 +1496,14 @@ def audit_profile_identities(profiles, source):
                     == data.get("observed_decode_steps"),
                     "Independent profile batch/step coverage differs from scope",
                 )
+                inventory = data.get("main_graph_kernel_inventory")
+                if inventory:
+                    require(
+                        inventory.get("graph_id") == scope.get("graph_id")
+                        and inventory.get("device_id")
+                        == scope.get("device_role", {}).get("trace_device_id"),
+                        "Parent kernel inventory graph/device differs from scope",
+                    )
                 data["report_scope_receipt"] = identity(scope_path)
             except (OSError, ValueError, KeyError, TypeError) as error:
                 data.update(status="unverified_report_scope", reason=str(error))
@@ -1525,7 +1533,41 @@ def validate_profile(spec):
                     "internal_idle_gap_us",
                 ):
                     number(stage.get(key))
+        main_graph_profile_summary(data)
     return arm, path, data
+
+
+def main_graph_profile_summary(profile):
+    """Summarize observed parent kernels, keeping child copies out of the scope."""
+    inventory = profile.get("main_graph_kernel_inventory")
+    if not inventory:
+        return None
+    steps = inventory.get("per_step", [])
+    count = profile.get("observed_decode_steps")
+    require(
+        inventory.get("observed_decode_steps") == count and len(steps) == count,
+        "Parent kernel inventory decode-step coverage differs from profile",
+    )
+    means = {
+        key: statistics.mean(number(step.get(key)) for step in steps)
+        for key in (
+            "parent_kernel_envelope_us",
+            "parent_kernel_active_union_us",
+            "parent_kernel_internal_idle_us",
+        )
+    }
+    kernels = inventory.get("kernels", {})
+    for stats in kernels.values():
+        for key in (
+            "duration_per_invocation_us",
+            "invocations_per_decode_step",
+            "duration_sum_per_decode_step_us",
+        ):
+            number(stats.get(key, {}).get("mean"))
+    means["parent_kernel_duration_sum_us"] = sum(
+        stats["duration_sum_per_decode_step_us"]["mean"] for stats in kernels.values()
+    )
+    return means
 
 
 def draw_plots(analyses, profiles, directory):
@@ -2439,6 +2481,38 @@ def render_report(
         (arm, data) for arm, _, data in profiles if data.get("status") == "analyzed"
     ]
     if passed:
+        add(
+            "完整父 CUDA Graph 归因：下表覆盖已核验主图内的所有可见 kernel，包含首个 Quest score 前的等待。"
+            "envelope 是父图首个 kernel 开始到末个 kernel 结束的区间，active union 是活跃区间并集，"
+            "idle 为 envelope 减 active union。kernel duration sum 是各 kernel 耗时之和，"
+            "不是关键路径或 CE 耗时；child 图、memcpy、图外 CPU／采样／HTTP 均未覆盖。"
+        )
+        parent_rows = []
+        for arm, profile in passed:
+            means = main_graph_profile_summary(profile)
+            if means is None:
+                parent_rows.append([arm, "未提供完整父图 inventory", "-", "-", "-"])
+            else:
+                parent_rows.append(
+                    [
+                        arm,
+                        fmt(means["parent_kernel_envelope_us"]),
+                        fmt(means["parent_kernel_active_union_us"]),
+                        fmt(means["parent_kernel_internal_idle_us"]),
+                        fmt(means["parent_kernel_duration_sum_us"]),
+                    ]
+                )
+        table(
+            [
+                "实验臂",
+                "父图 envelope μs",
+                "active union μs",
+                "内部 idle μs",
+                "kernel sum μs",
+            ],
+            parent_rows,
+            [1.7, 1.1, 1.1, 1.05, 1.05],
+        )
         stages = (
             "selection",
             "cache_plan_or_swap",
@@ -2503,6 +2577,56 @@ def render_report(
                 ],
                 [3.8, 0.5, 0.7, 1],
             )
+            inventory = profile.get("main_graph_kernel_inventory")
+            if inventory:
+                all_kernels = sorted(
+                    inventory["kernels"].items(),
+                    key=lambda item: -item[1]["duration_sum_per_decode_step_us"][
+                        "mean"
+                    ],
+                )
+
+                def graph_kernel_row(name, stats):
+                    return [
+                        name,
+                        fmt(stats["duration_per_invocation_us"]["mean"]),
+                        fmt(stats["invocations_per_decode_step"]["mean"]),
+                        fmt(stats["duration_sum_per_decode_step_us"]["mean"]),
+                    ]
+
+                mechanism = [
+                    (name, stats)
+                    for name, stats in all_kernels
+                    if re.search(
+                        r"(?:^|::)(?:launch_kernel|wait_kernel|checkpoint_kernel|gate_kernel)\b",
+                        name,
+                    )
+                ]
+                add(arm + "：父图中的摘要传输控制 kernel", "heading")
+                if mechanism:
+                    table(
+                        ["Kernel", "每次均值 μs", "每 decode 次数", "每 decode sum μs"],
+                        [graph_kernel_row(name, stats) for name, stats in mechanism],
+                        [3.7, 0.75, 0.8, 0.95],
+                    )
+                else:
+                    add(
+                        "本父图未观测到上述 launch／wait／checkpoint／gate kernel；"
+                        "这不是 child 图控制或 memcpy 耗时为零的证明。",
+                        "small",
+                    )
+                add(arm + "：完整父图具名 kernel 清单", "heading")
+                add(
+                    "按每 decode duration sum 降序；每次均值来自实际 kernel 活动，"
+                    "每 decode 次数来自本次独立 capture 的父图调用。"
+                    "这些次数不是 SASS 静态指令计数；完整机器可读清单另存 main-graph-kernels.csv。",
+                    "small",
+                )
+                table(
+                    ["Kernel", "每次均值 μs", "每 decode 次数", "每 decode sum μs"],
+                    [graph_kernel_row(name, stats) for name, stats in all_kernels],
+                    [3.7, 0.75, 0.8, 0.95],
+                )
             add("SQLite SHA256：" + profile["sqlite"]["sha256"], "small")
         if "profile" in images:
             figure(

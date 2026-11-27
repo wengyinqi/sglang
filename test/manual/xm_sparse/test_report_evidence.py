@@ -754,7 +754,9 @@ def test_unbound_original_campaign_cannot_borrow_another_passed_proof(contracts)
     assert audit["status"] == "blocked" and "not bound" in audit["failures"][0]
 
 
-@pytest.mark.parametrize("mutation", [None, "failed", "source", "sqlite", "batch"])
+@pytest.mark.parametrize(
+    "mutation", [None, "failed", "source", "sqlite", "batch", "graph", "device"]
+)
 def test_independent_profile_requires_its_bound_decode_scope(
     tmp_path, contracts, mutation
 ):
@@ -765,6 +767,7 @@ def test_independent_profile_requires_its_bound_decode_scope(
         "actual_batch_size": 4,
         "observed_decode_steps": 16,
         "per_step": [{}] * 16,
+        "main_graph_kernel_inventory": {"graph_id": 2, "device_id": 0},
     }
     scope = {
         "status": "passed",
@@ -773,6 +776,8 @@ def test_independent_profile_requires_its_bound_decode_scope(
         "sqlite_sha256": "f" * 64,
         "actual_batch_size": 4,
         "actual_decode_graph_launches": 16,
+        "graph_id": 2,
+        "device_role": {"trace_device_id": 0},
         "provenance": {
             "source_fingerprint": contracts.source["source_fingerprint"],
             "source_commit": "c" * 40,
@@ -786,6 +791,10 @@ def test_independent_profile_requires_its_bound_decode_scope(
         scope["sqlite_sha256"] = "e" * 64
     elif mutation == "batch":
         scope["actual_batch_size"] = 8
+    elif mutation == "graph":
+        data["main_graph_kernel_inventory"]["graph_id"] = 7
+    elif mutation == "device":
+        data["main_graph_kernel_inventory"]["device_id"] = 1
     write(tmp_path / "decode-scope.json", scope)
     checked = REPORT.audit_profile_identities(
         [("fused", path, data)], contracts.source
@@ -1315,7 +1324,78 @@ def test_completed_batch_in_failed_later_control_remains_scoped(large_contracts)
     assert control["batch"] == 4 and control["summary_campaign_status"] == "failed"
 
 
-def test_rendered_metric_and_numa_scope_preserve_evidence_boundaries(
+def parent_graph_profile_fixture():
+    """Synthetic capture: the pre-score wait is absent from the layer-only list."""
+    return {
+        "schema_version": 1,
+        "status": "analyzed",
+        "actual_batch_size": 1,
+        "layer_index": 23,
+        "observed_decode_steps": 2,
+        "total_path_span_us": {"mean": 10},
+        "stage_span_us": {"selection": {"mean": 10}},
+        "per_step": [
+            {
+                "stages": {
+                    "selection": {
+                        "kernel_active_union_us": 8,
+                        "internal_idle_gap_us": 2,
+                    }
+                }
+            },
+            {
+                "stages": {
+                    "selection": {
+                        "kernel_active_union_us": 8,
+                        "internal_idle_gap_us": 2,
+                    }
+                }
+            },
+        ],
+        "kernel_mean_duration_us": {
+            "_quest_score_kernel": {"samples": 2, "mean": 8, "min": 8, "max": 8}
+        },
+        "sqlite": {"sha256": "0" * 64},
+        "main_graph_kernel_inventory": {
+            "graph_id": 2,
+            "device_id": 0,
+            "observed_decode_steps": 2,
+            "per_step": [
+                {
+                    "parent_kernel_envelope_us": 40,
+                    "parent_kernel_active_union_us": 31,
+                    "parent_kernel_internal_idle_us": 9,
+                },
+                {
+                    "parent_kernel_envelope_us": 44,
+                    "parent_kernel_active_union_us": 33,
+                    "parent_kernel_internal_idle_us": 11,
+                },
+            ],
+            "kernels": {
+                "<unnamed>::wait_kernel(const unsigned long long *)": {
+                    "duration_per_invocation_us": {"mean": 24},
+                    "invocations_per_decode_step": {"mean": 1},
+                    "duration_sum_per_decode_step_us": {"mean": 24},
+                },
+                "_quest_score_kernel": {
+                    "duration_per_invocation_us": {"mean": 8},
+                    "invocations_per_decode_step": {"mean": 1},
+                    "duration_sum_per_decode_step_us": {"mean": 8},
+                },
+            },
+        },
+    }
+
+
+def test_parent_inventory_rejects_decode_coverage_mismatch():
+    profile = parent_graph_profile_fixture()
+    profile["main_graph_kernel_inventory"]["per_step"].pop()
+    with pytest.raises(ValueError, match="decode-step coverage"):
+        REPORT.main_graph_profile_summary(profile)
+
+
+def test_rendered_metric_numa_and_parent_graph_scope_preserve_evidence_boundaries(
     tmp_path, monkeypatch
 ):
     """Capture actual paragraph inputs; no PDF library or GPU is needed."""
@@ -1374,9 +1454,16 @@ def test_rendered_metric_and_numa_scope_preserve_evidence_boundaries(
         (write(tmp_path / f"numa-{index}.json", record), record)
         for index, record in enumerate(records)
     ]
+    profile = parent_graph_profile_fixture()
     REPORT.render_report(
         [],
-        [],
+        [
+            (
+                "bounds-on-demand",
+                write(tmp_path / "profile.json", profile),
+                profile,
+            )
+        ],
         evidence,
         tmp_path / "unused.pdf",
         font_path=tmp_path / "unused.ttf",
@@ -1395,3 +1482,10 @@ def test_rendered_metric_and_numa_scope_preserve_evidence_boundaries(
     assert "NUMA receipt 和原始 capacity 证据" in text
     assert "unexecuted_cli_numa_capacity_adjustment；状态：planned" in text
     assert "numa_placement_preflight；状态：passed" in text
+    assert "完整父 CUDA Graph 归因" in text
+    assert "42.00" in text and "32.00" in text and "10.00" in text
+    assert "&lt;unnamed&gt;::wait_kernel" in text and "24.00" in text
+    assert "每 decode 次数" in text and "每 decode sum μs" in text
+    assert "child 图、memcpy、图外 CPU／采样／HTTP 均未覆盖" in text
+    assert "不是关键路径或 CE 耗时" in text
+    assert "这些次数不是 SASS 静态指令计数" in text
