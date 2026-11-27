@@ -415,7 +415,21 @@ def control_arguments(tmp_path):
 
 def test_cli_default_retains_complete_cold_prefill_capacity(tmp_path):
     control = TOOL.parse(control_arguments(tmp_path))
-    assert control.max_total_tokens == 98304 and control.capacity_ratio == 16
+    assert control.max_total_tokens == 98304 and control.capacity_ratio == 8
+    args = settings(tmp_path)
+    args.max_total_tokens = control.max_total_tokens
+    args.capacity_ratios = [control.capacity_ratio]
+    args.cpu_capacity_ratio = control.capacity_ratio
+    args.output_len = 512
+    need = TOOL.allocation_requirements(TOOL.CAMPAIGN.recipe("fused"), args, 12)
+    assert need["historical_backing_slots_required"] == 399360
+    assert need["gpu_cold_nopd_admission_slots_required"] == 83200
+    assert args.max_total_tokens >= need["gpu_cold_nopd_admission_slots_required"]
+    assert (
+        args.max_total_tokens * args.cpu_capacity_ratio
+        >= need["historical_backing_slots_required"]
+    )
+    assert need["planned_cpu_backing_allocation_bytes"] == (72 << 30) + 64 * 98304
 
 
 @pytest.mark.parametrize("available_delta", [-1, 0, 1])

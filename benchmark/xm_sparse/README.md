@@ -109,7 +109,7 @@ bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/campaign.py \
 bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/campaign.py \
   --phase capacity --cache-budget-bytes 8589934592 \
   --model /models/qwen --workload /data/frozen-xm-qwen-20261127/workload.json \
-  --input-lens 32768 --concurrencies 4 8 12 --capacity-ratio 16 \
+  --input-lens 32768 --concurrencies 4 8 12 --capacity-ratio 8 \
   --max-total-tokens 98304 --output-len 512 --repeats 3 \
   --arms fused combined-protected --output-dir /results/results/capacity \
   --correctness-campaign /results/results/correctness/campaign.json \
@@ -127,8 +127,12 @@ campaign covers batch two, not batch four. Four 16K/32K requests with 80
 output tokens need at least 66048/131584 page-aligned token slots. The HBM
 reference must fit on the actual device; do not waive its output comparison.
 
-The capacity scan uses a higher CPU backing ratio to prevent DDR allocation
-from becoming the first constraint. Verify the runtime's actual backing
+The capacity scan uses CPU backing ratio eight to retain complete contexts
+without exceeding the H800 server's pinned-memory NUMA allocation domain.
+The launcher binds memory to node zero (about 125 GiB); a nine-GiB physical
+KV pool with ratio sixteen would request 144 GiB and cannot fit there, even
+though the host has about 251 GiB in total. Check allowed NUMA nodes as well
+as host/cgroup memory. Verify the runtime's actual backing
 slots can hold all requested contexts and output tokens before attributing
 a plateau to HBM. An observed scan maximum is not an exhaustive maximum or
 a cost/SLO optimum.

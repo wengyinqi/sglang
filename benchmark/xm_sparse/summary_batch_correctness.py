@@ -602,7 +602,7 @@ def parse(argv=None):
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[4, 8, 12])
     parser.add_argument("--output-len", type=int, default=80)
     parser.add_argument("--max-total-tokens", type=int, default=98304)
-    parser.add_argument("--capacity-ratio", type=int, default=16)
+    parser.add_argument("--capacity-ratio", type=int, default=8)
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--logprob-atol", type=float, default=0.02)
     parser.add_argument("--output-dir", type=Path, required=True)
