@@ -16,6 +16,15 @@ policy. A payload-free cache plan precedes a BF16 SM90 kernel that fetches
 selected K/V into double-buffered shared memory with TMA, computes online
 softmax, and refills the hot slots. Split partials have a separate reduction.
 The output must pass numerical, refill, repeated-step and CUDA Graph tests.
+The current Qwen kernel uses scalar FP32 dot products and state with BF16
+softmax weights/partial outputs aligned to the FlashInfer reference, not
+the paper's Tensor Core FlashMLA implementation. The measured
+effect therefore belongs to this explicit implementation and hardware pair.
+The numerical-compatibility candidate preserves the selected-token order;
+it does not retain the initial resident-first mathematical traversal. TMA
+still retrieves K/V directly into double-buffered shared memory and the
+kernel refills hot slots. Fixed-partition probes are diagnostic evidence;
+model and larger-batch partition acceptance are separate requirements.
 
 `xm_quest_bounds_offload` moves complete historical min/max summaries to a
 CPU pinned owner. Running bounds remain on the GPU. Two fixed HBM layer
@@ -30,6 +39,12 @@ configuration alone.
 checkpoints are a public-CUDA adaptation, not native copy-engine semaphore
 commands. Traffic already in flight may finish after a pause. This branch
 has no cross-rank MoE collective traffic to protect.
+
+Summary offload currently covers the full preallocated historical summary
+tensor. Each immutable child graph copies every allocated request/page row,
+not only live pages. This branch does not yet implement the paper's partial
+budget-driven page eviction/restoration, measured transfer-budget admission,
+or prefetching early layers at the end of the preceding decode step.
 
 All mechanisms default off. Unsupported settings are rejected. Plain
 load/store or a full pre-copy to HBM is not a TMA fallback for this ablation.
@@ -80,14 +95,16 @@ bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/campaign.py \
 bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/campaign.py \
   --phase performance --model /models/qwen \
   --workload /data/frozen-xm-qwen-20261127/workload.json \
-  --input-lens 16384 32768 --concurrencies 1 4 --repeats 3 \
+  --input-lens 16384 --concurrencies 1 --num-prompts 1 \
+  --output-len 128 --repeats 3 \
   --correctness-campaign /results/results/correctness/campaign.json \
   --output-dir /results/results/performance --execute
 
 bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/campaign.py \
-  --phase capacity --cache-budget-bytes 8589934592 \
+  --phase capacity --cache-budget-bytes 4294967296 \
   --model /models/qwen --workload /data/frozen-xm-qwen-20261127/workload.json \
-  --input-lens 32768 --concurrencies 1 4 8 12 \
+  --input-lens 32768 --concurrencies 4 8 12 --capacity-ratio 16 \
+  --output-len 512 --repeats 3 \
   --arms fused combined-protected --output-dir /results/results/capacity \
   --correctness-campaign /results/results/correctness/campaign.json \
   --execute
@@ -96,3 +113,50 @@ bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/campaign.py \
 Performance entry points are run only after the same source and mechanism
 configuration pass correctness. A planned command, compilation, or CPU test
 is not a real model/performance result.
+
+For a four-request performance point, first run additional real model
+correctness with four equal input lengths. `correctness.py` sets the batch
+from the number of lengths in each round, so a `16384 32768` correctness
+campaign covers batch two, not batch four. Four 16K/32K requests with 80
+output tokens need at least 66048/131584 page-aligned token slots. The HBM
+reference must fit on the actual device; do not waive its output comparison.
+
+The capacity scan uses a higher CPU backing ratio to prevent DDR allocation
+from becoming the first constraint. Verify the runtime's actual backing
+slots can hold all requested contexts and output tokens before attributing
+a plateau to HBM. An observed scan maximum is not an exhaustive maximum or
+a cost/SLO optimum.
+Choose a cache budget that actually creates pressure within the scanned
+concurrencies. At 32K and at most twelve clients, an 8-GiB budget plus the
+65536-token physical cap can leave both paths below the admission limit;
+that point alone cannot establish a summary-offload capacity gain. The
+4-GiB example is a pressure experiment; runtime allocations and stable
+batch traces determine whether it reaches the expected boundary.
+
+`analyze.py campaign` replays raw results and scheduler traces and emits
+JSON, CSV and optional PNG/SVG. `profile.py` adapts only an actually passed
+model correctness receipt to an independent Nsight decode capture.
+`report.py` renders the analyses and can append new pages to an existing
+PDF without replacing it. `telemetry.py` records low-rate host NVML totals
+and observed last-forward progress; it does not measure CE utilization or
+assign a stale progress record to a currently active model phase.
+
+For an independent decode diagnostic, explicitly mount the installed
+Nsight tools. The ordinary correctness/performance launcher does not enable
+the additional profiling container options:
+
+```bash
+XM_NSIGHT_ROOT=/home/user/Workspace/mpu/tools/nsight-2026.6.1 \
+  bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/profile.py \
+  --correctness-campaign /results/results/correctness-001/campaign.json \
+  --arm fused --input-len 16384 --batch-size 1 --output-len 256 \
+  --profile-steps 32 --stable-steps 16 \
+  --output-dir /results/results/profile-16k-b1-fused-001 --execute
+```
+
+The replay also preserves raw HTTP frame timing. A strict client mean/P99
+TBT is reported only when every token-positive frame contains one token.
+Multi-token frames retain their observed frame gaps and leave strict TBT
+unavailable. This full-request client statistic is separate from matched
+stable scheduler decode intervals and cannot be assigned to a constant
+batch window without additional matching.

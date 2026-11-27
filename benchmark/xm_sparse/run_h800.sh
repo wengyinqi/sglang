@@ -8,7 +8,20 @@ IMAGE_ID=sha256:2e5dc318b02a18a16579bb6a9a25119db101108603bbe9a4074ac6e0b6090425
 TASK_PYTHON=/opt/mpu/ci-stage01/runtime/bin/python
 mkdir -p "$TASK_ROOT/results" "$TASK_ROOT/cache/torch_extensions" "$TASK_ROOT/cache/triton" "$TASK_ROOT/cache/jit"
 test -d "$SOURCE_ROOT/python/sglang"
+PROFILE_DOCKER_ARGS=()
+if [[ -n "${XM_NSIGHT_ROOT:-}" ]]; then
+  # Explicitly opt in only for independent, bounded profiling commands.
+  test -f "$XM_NSIGHT_ROOT/nsys-bin-relative.txt"
+  NSYS_RELATIVE_DIR=$(< "$XM_NSIGHT_ROOT/nsys-bin-relative.txt")
+  test -x "$XM_NSIGHT_ROOT/$NSYS_RELATIVE_DIR/nsys"
+  PROFILE_DOCKER_ARGS=(
+    --cap-add SYS_PTRACE --security-opt seccomp=unconfined
+    --mount "type=bind,src=$XM_NSIGHT_ROOT,dst=/nsight,readonly"
+    -e "PATH=/nsight/$NSYS_RELATIVE_DIR:/opt/mpu/ci-stage01/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  )
+fi
 docker run --rm --pull never --gpus all --network host --ipc=host \
+  "${PROFILE_DOCKER_ARGS[@]}" \
   --cpuset-cpus 0-31,64-95 --cpuset-mems 0 \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \

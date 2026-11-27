@@ -21,8 +21,8 @@ from sglang.jit_kernel.hisparse import (
 )
 from sglang.jit_kernel.utils import load_jit, make_cpp_args
 
-NUM_SPLITS = 8
-TILE_ROWS = 8
+NUM_SPLITS = 16
+TILE_ROWS = 32
 NUM_Q_HEADS = 32
 NUM_KV_HEADS = 4
 HEAD_DIM = 128

@@ -2,8 +2,8 @@
 
 import importlib.util
 import json
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -48,9 +48,15 @@ def capacity():
     }
 
 
-def campaign_fixture(tmp_path):
+def campaign_fixture(tmp_path, *, chunked=False):
     base = tmp_path / "baseline-r0" / "evidence"
     raw_result = FIXTURES.result()
+    if chunked:
+        # The first two tokens arrive in one HTTP frame. No timestamp for
+        # the internal token boundary exists even though total counts match.
+        for frames in raw_result["stream_frames"]:
+            frames.pop(0)
+            frames[0]["new_tokens"] = 2
     trace = FIXTURES.trace()
     raw_analysis, raw_steady = (
         NATIVE.analyze(raw_result, [trace]),
@@ -154,6 +160,31 @@ def test_saved_derived_timing_cannot_override_raw_evidence(tmp_path):
         A.analyze_campaign(campaign)
 
 
+def test_strict_client_tbt_reuses_verified_raw_frame_evidence(tmp_path):
+    campaign, _, _ = campaign_fixture(tmp_path)
+    report = A.analyze_campaign(campaign)
+    row = report["rows"][0]
+    assert row["client_all_frames_single_token"] is True
+    assert row["strict_client_mean_tbt_ms"] == pytest.approx(10)
+    assert row["strict_client_p99_tbt_ms"] == pytest.approx(10)
+    assert row["strict_client_tbt_samples"] == 80
+    assert report["samples"][0]["client_timing"]["timing_scope"].startswith(
+        "Client HTTP frame arrival intervals"
+    )
+    assert "complete measured requests" in row["client_tbt_metric_scope"]
+
+
+def test_multi_token_frame_has_no_strict_client_tbt(tmp_path):
+    campaign, _, _ = campaign_fixture(tmp_path, chunked=True)
+    report = A.analyze_campaign(campaign)
+    row = report["rows"][0]
+    assert row["client_all_frames_single_token"] is False
+    assert row["strict_client_mean_tbt_ms"] is None
+    assert row["strict_client_p99_tbt_ms"] is None
+    assert row["strict_client_tbt_samples"] == 0
+    assert row["raw_client_mean_frame_gap_ms"] == pytest.approx(10)
+
+
 def test_missing_raw_forward_is_rejected(tmp_path):
     campaign, base, _ = campaign_fixture(tmp_path)
     path = base / "cpu-in4-ratio2-trace" / "forward-0.jsonl"
@@ -228,6 +259,92 @@ def test_alias_and_workspace_storage_are_not_double_counted():
     assert (
         result["backend_components"]["separate_attention_workspace_bytes"] == 384 << 20
     )
+
+
+def test_cache_management_groups_retain_verifiable_names_and_aliases():
+    owners = {
+        "fixed.coordinator._lru_init": "hisparse_lru_bytes",
+        "fixed.coordinator.lru_slots": "hisparse_lru_bytes",
+        "fixed.coordinator.req_to_host_pool": "hisparse_host_mapping_bytes",
+        "fixed.request_map": "request_token_mapping_bytes",
+        "capacity_dependent.logical_to_physical": "hisparse_logical_to_physical_bytes",
+        "fixed.coordinator.req_to_device_buffer": "hisparse_hot_request_slots_bytes",
+        "fixed.coordinator.req_device_buffer_tokens": "hisparse_hot_token_ids_bytes",
+        "fixed.coordinator.req_device_buffer_token_locs": "hisparse_hot_token_locs_bytes",
+        "fixed.coordinator.top_k_device_locs_buffer": "hisparse_selection_output_bytes",
+        "fixed.quest._step_short_layout_buf": "quest_selection_state_bytes",
+        "fixed.quest._page_idx_const": "quest_selection_state_bytes",
+        "fixed.quest.running_page_idx": "quest_running_metadata_bytes",
+        "fixed.quest.bounds_tier.ready_keys": "quest_prefetch_control_bytes",
+        "fixed.quest.bounds_tier.backing_uva_ptr": "quest_prefetch_control_bytes",
+        "fixed.coordinator.num_real_reqs": "hisparse_batch_state_bytes",
+        "fixed.coordinator.cache_metrics": "hisparse_diagnostic_counter_bytes",
+        "fixed.kv_descriptors.k_data_ptrs": "compute_kv_descriptors_bytes",
+        "backend_specific.v_data_ptrs": "backing_kv_descriptors_bytes",
+        "allocator_dynamic.physical.free_pages": "allocator_physical_worklists_bytes",
+        "allocator_dynamic.logical.free_pages": "allocator_logical_worklists_bytes",
+        "allocator_dynamic.outer.free_group.0": "allocator_outer_worklists_bytes",
+        "fixed.coordinator.unknown_owner": "other_named_gpu_bytes",
+    }
+    shapes = {
+        name: {"allocation_group": group, "storage_bytes": group + 1}
+        for group, name in enumerate(owners)
+    }
+    alias = "capacity_dependent.allocator_mapping_alias"
+    canonical = "capacity_dependent.logical_to_physical"
+    shapes[alias] = dict(shapes[canonical])
+    inventory = {
+        "retained_gpu_pool_bytes": sum(range(1, len(owners) + 1)),
+        "retained_gpu_pool_shapes": shapes,
+    }
+    records = A.allocation_records(inventory)
+    components = A.allocation_components(inventory)
+    assert len(records) == len(owners)
+    assert sum(components.values()) == inventory["retained_gpu_pool_bytes"]
+    for record in records:
+        assert {owners[name] for name in record["alias_names"] if name in owners} == {
+            record["category"]
+        }
+    logical_map = next(r for r in records if canonical in r["alias_names"])
+    assert logical_map["alias_names"] == sorted([canonical, alias])
+    assert (
+        components["hisparse_logical_to_physical_bytes"]
+        == shapes[canonical]["storage_bytes"]
+    )
+
+
+def test_backend_plan_evidence_is_excluded_from_combined_count():
+    cap = capacity()
+    cap["gpu_memory_ledger"]["named_compute_shapes"][
+        "fixed.coordinator.xm_fused_plan.device_locs"
+    ] = {"allocation_group": 2, "storage_bytes": 16}
+    cap["gpu_memory_ledger"]["named_compute_bytes"] += 16
+    cap["xm_fused_backend_memory"] = {
+        "retained_gpu_pool_bytes": 80,
+        "retained_gpu_pool_shapes": {
+            "plan.device_locs": {"allocation_group": 0, "storage_bytes": 16},
+            "provider.plan_alias": {"allocation_group": 0, "storage_bytes": 16},
+            "split_partial_workspace": {"allocation_group": 1, "storage_bytes": 64},
+        },
+    }
+    result = A.memory_snapshot(cap)
+    assert result["allocation_accounting_schema"] == "xm_qwen_named_allocations_v2"
+    assert result["torch_named_total_including_observed_backend_bytes"] == 192 + 16 + 64
+    assert result["cache_components"]["fused_plan_bytes"] == 16
+    assert len(result["backend_allocation_groups"]) == 1
+    excluded = result["backend_plan_aliases_already_in_cache"]
+    assert len(excluded) == 1
+    assert excluded[0]["alias_names"] == ["plan.device_locs", "provider.plan_alias"]
+    assert excluded[0]["storage_bytes"] == 16
+
+
+def test_alias_storage_disagreement_is_rejected_before_classification():
+    cap = capacity()
+    cap["gpu_memory_ledger"]["named_compute_shapes"]["fixed.quest.page_k_min"][
+        "storage_bytes"
+    ] += 1
+    with pytest.raises(ValueError, match="Alias storage sizes disagree"):
+        A.memory_snapshot(cap)
 
 
 def test_counter_deltas_are_diagnostic_and_never_hardware_payload():

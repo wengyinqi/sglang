@@ -20,6 +20,20 @@ constexpr int kGroup = kQHeads / kKVHeads;
 constexpr int kDim = 128;
 constexpr int kThreads = (kGroup + 1) * 32;
 constexpr int kPartialWidth = kDim + 2;
+constexpr int kMergeGroups = 8;
+constexpr float kLog2E = 1.4426950408889634074f;
+
+__device__ __forceinline__ float exp2_approx(float x) {
+  float result;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));
+  return result;
+}
+
+__device__ __forceinline__ float log2_approx(float x) {
+  float result;
+  asm("lg2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));
+  return result;
+}
 
 __device__ __forceinline__ uint32_t smem_address(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -133,19 +147,17 @@ __global__ void attention_kernel(
     s.count = 0;
     const int first = split * Shared<TopK, Splits, TileRows>::kSpan;
     const int last = min(min(actual_lens[request], TopK), first + Shared<TopK, Splits, TileRows>::kSpan);
-    // Resident-first within each split. Only traversal order changes; the
-    // original Quest selection and every valid selected row are preserved.
-    for (int misses = 0; misses < 2; ++misses) {
-      for (int i = first; i < last; ++i) {
-        const int d = device_locs[request * TopK + i];
-        const int64_t h = host_locs[request * TopK + i];
-        if (d < 0) continue;  // padding during capture/short sequences
-        if (d >= hot_rows || h < -1 || h >= host_rows) {
-          asm volatile("trap;");
-          return;
-        }
-        if (static_cast<int>(h >= 0) == misses) s.ordered[s.count++] = i;
+    // Preserve the selected order: BF16 probability rounding depends on the
+    // 32-row local maximum, so hot/miss reordering is not numerically neutral.
+    for (int i = first; i < last; ++i) {
+      const int d = device_locs[request * TopK + i];
+      const int64_t h = host_locs[request * TopK + i];
+      if (d < 0) continue;
+      if (d >= hot_rows || h < -1 || h >= host_rows) {
+        asm volatile("trap;");
+        return;
       }
+      s.ordered[s.count++] = i;
     }
     if (s.count) issue_tile<TopK, Splits, TileRows>(
         s, 0, request, kv_head, host_locs, device_locs, host_k, host_v, hot_k, hot_v);
@@ -154,9 +166,12 @@ __global__ void attention_kernel(
 
   const int query_head = kv_head * kGroup + warp - 1;
   float q_values[4] = {};
-  float numerator[4] = {};
-  float maximum = -INFINITY;
-  float denominator = 0.0f;
+  constexpr int kMaxTiles = (Shared<TopK, Splits, TileRows>::kSpan + TileRows - 1) / TileRows;
+  float tile_numerator[kMaxTiles][4] = {};
+  float tile_maximum[kMaxTiles];
+  float tile_denominator[kMaxTiles] = {};
+  for (int i = 0; i < kMaxTiles; ++i) tile_maximum[i] = -INFINITY;
+  const float score_scale_log2 = (logits_soft_cap > 0 ? 1.0f : scaling) * kLog2E;
   if (warp > 0) {
     for (int j = 0; j < 4; ++j) q_values[j] = __bfloat162float(q[(request * kQHeads + query_head) * kDim + lane + j * 32]);
   }
@@ -172,17 +187,25 @@ __global__ void attention_kernel(
         s, tile + 1, request, kv_head, host_locs, device_locs, host_k, host_v, hot_k, hot_v);
     const int rows = min(TileRows, s.count - tile * TileRows);
     if (warp > 0) {
+      float scores[TileRows];
+      float maximum = -INFINITY;
       for (int r = 0; r < rows; ++r) {
         float dot = 0.0f;
         for (int j = 0; j < 4; ++j) dot = fmaf(q_values[j], __bfloat162float(s.k[buffer][r][lane + j * 32]), dot);
-        float score = warp_sum(dot) * scaling;
-        if (logits_soft_cap > 0) score = logits_soft_cap * tanhf(score / logits_soft_cap);
-        const float next_max = fmaxf(maximum, score);
-        const float alpha = expf(maximum - next_max);
-        const float beta = expf(score - next_max);
-        denominator = denominator * alpha + beta;
-        for (int j = 0; j < 4; ++j) numerator[j] = numerator[j] * alpha + beta * __bfloat162float(s.v[buffer][r][lane + j * 32]);
-        maximum = next_max;
+        float score = warp_sum(dot);
+        if (logits_soft_cap > 0) score = logits_soft_cap * tanhf(score * scaling / logits_soft_cap);
+        scores[r] = score;
+        maximum = fmaxf(maximum, score);
+      }
+      tile_maximum[tile] = maximum;
+      // FlashInfer's BF16 tensor-core path rounds the unnormalized tile P
+      // once and uses those same BF16 values for both rowsum and PV.
+      for (int r = 0; r < rows; ++r) {
+        const float probability = __bfloat162float(__float2bfloat16(
+            exp2_approx(scores[r] * score_scale_log2 - maximum * score_scale_log2)));
+        tile_denominator[tile] += probability;
+        for (int j = 0; j < 4; ++j) tile_numerator[tile][j] = fmaf(
+            probability, __bfloat162float(s.v[buffer][r][lane + j * 32]), tile_numerator[tile][j]);
       }
       // One warp per KV head refills raw BF16; the other seven query heads
       // must not duplicate this store. Reads finish before buffer reuse.
@@ -203,11 +226,22 @@ __global__ void attention_kernel(
     __syncthreads();
   }
   if (warp > 0) {
+    float maximum = -INFINITY;
+    for (int tile = 0; tile < tiles; ++tile) maximum = fmaxf(maximum, tile_maximum[tile]);
+    float denominator = 0.0f;
+    float numerator[4] = {};
+    for (int tile = 0; tile < tiles; ++tile) {
+      const float weight = exp2_approx(tile_maximum[tile] * score_scale_log2 - maximum * score_scale_log2);
+      denominator += weight * tile_denominator[tile];
+      for (int j = 0; j < 4; ++j) numerator[j] += weight * tile_numerator[tile][j];
+    }
     const int64_t base = ((static_cast<int64_t>(request) * kQHeads + query_head) * Splits + split) * kPartialWidth;
-    for (int j = 0; j < 4; ++j) partial[base + lane + j * 32] = numerator[j];
+    // The FA2 split output is BF16 before VariableLengthMergeStates reads it.
+    for (int j = 0; j < 4; ++j) partial[base + lane + j * 32] = __bfloat162float(
+        __float2bfloat16(denominator > 0 ? numerator[j] / denominator : 0.0f));
     if (lane == 0) {
-      partial[base + kDim] = maximum;
-      partial[base + kDim + 1] = denominator;
+      partial[base + kDim] = denominator > 0 ? maximum * score_scale_log2 + log2_approx(denominator) : -INFINITY;
+      partial[base + kDim + 1] = denominator > 0 ? 1.0f : 0.0f;
     }
   }
 }
@@ -222,20 +256,38 @@ __global__ void merge_kernel(const float* partial, bf16_t* output, const int32_t
     output[(request * kQHeads + query_head) * kDim + d] = __float2bfloat16(0.0f);
     return;
   }
-  float maximum = -INFINITY;
-  for (int split = 0; split < Splits; ++split) {
-    const int64_t base = ((static_cast<int64_t>(request) * kQHeads + query_head) * Splits + split) * kPartialWidth;
-    if (partial[base + kDim + 1] > 0) maximum = fmaxf(maximum, partial[base + kDim]);
+  float group_output[kMergeGroups] = {};
+  float group_lse[kMergeGroups];
+  for (int group = 0; group < kMergeGroups; ++group) {
+    float maximum = -INFINITY;
+    for (int split = group; split < Splits; split += kMergeGroups) {
+      const int64_t base = ((static_cast<int64_t>(request) * kQHeads + query_head) * Splits + split) * kPartialWidth;
+      if (partial[base + kDim + 1] > 0) maximum = fmaxf(maximum, partial[base + kDim]);
+    }
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    for (int split = group; split < Splits; split += kMergeGroups) {
+      const int64_t base = ((static_cast<int64_t>(request) * kQHeads + query_head) * Splits + split) * kPartialWidth;
+      if (partial[base + kDim + 1] > 0) {
+        const float weight = exp2_approx(partial[base + kDim] - maximum);
+        numerator += weight * partial[base + d];
+        denominator += weight;
+      }
+    }
+    // Cascade uses 128 threads, vec_size=8 => bdy=8. Each lane group
+    // normalizes then writes BF16 shared memory before the final reduction.
+    group_output[group] = __bfloat162float(__float2bfloat16(denominator > 0 ? numerator / denominator : 0.0f));
+    group_lse[group] = denominator > 0 ? maximum + log2_approx(denominator) : -INFINITY;
   }
+  float maximum = -INFINITY;
+  for (int group = 0; group < kMergeGroups; ++group) maximum = fmaxf(maximum, group_lse[group]);
   float numerator = 0.0f;
   float denominator = 0.0f;
-  for (int split = 0; split < Splits; ++split) {
-    const int64_t base = ((static_cast<int64_t>(request) * kQHeads + query_head) * Splits + split) * kPartialWidth;
-    const float sum = partial[base + kDim + 1];
-    if (sum > 0) {
-      const float weight = expf(partial[base + kDim] - maximum);
-      numerator += weight * partial[base + d];
-      denominator += weight * sum;
+  for (int group = 0; group < kMergeGroups; ++group) {
+    if (group_lse[group] > -INFINITY) {
+      const float weight = exp2_approx(group_lse[group] - maximum);
+      numerator += weight * group_output[group];
+      denominator += weight;
     }
   }
   output[(request * kQHeads + query_head) * kDim + d] = __float2bfloat16(denominator > 0 ? numerator / denominator : 0.0f);

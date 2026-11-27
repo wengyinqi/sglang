@@ -6,16 +6,16 @@ at analysis time; they do not replace an earlier evidence-custody receipt.
 """
 
 import argparse
-from collections import defaultdict
 import csv
 import hashlib
 import importlib.util
 import json
 import math
-from pathlib import Path
 import re
 import sqlite3
 import statistics
+from collections import defaultdict
+from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parents[1] / "mpu_stages"
 
@@ -185,8 +185,94 @@ def stable_intervals(result, trace, steady):
     return intervals
 
 
-def allocation_components(inventory):
-    """Deduplicate named aliases and assign every storage to exactly one group."""
+def allocation_category(alias_names):
+    """Classify actual retained owner names, with aliases sharing one category.
+
+    These are persistent named allocations, not estimates of temporary selection
+    workspace. The first matching owner determines the category for a storage;
+    e.g. a fused-plan provider alias must not become a second hot-slot map.
+    """
+    names = [name.lower() for name in alias_names]
+    leaves = {name.rsplit(".", 1)[-1] for name in names}
+    if any("xm_fused_plan" in name or name.startswith("plan.") for name in names):
+        return "fused_plan_bytes"
+    if "stage_bounds" in leaves:
+        return "quest_layer_staging_bytes"
+    if leaves & {"page_k_bounds", "page_k_min", "page_k_max"}:
+        return "quest_resident_summary_bytes"
+    if leaves & {"running_k_min", "running_k_max"}:
+        return "quest_running_bounds_bytes"
+    if leaves & {"running_token_count", "running_page_idx"}:
+        return "quest_running_metadata_bytes"
+    if any("bounds_tier." in name for name in names) and leaves & {
+        "backing_uva_ptr",
+        "ready_keys",
+        "issued_keys",
+        "step_epoch",
+        "prefetch_gate",
+        "counters",
+    }:
+        return "quest_prefetch_control_bytes"
+    if leaves & {"lru_slots", "_lru_init"}:
+        return "hisparse_lru_bytes"
+    if "req_to_host_pool" in leaves:
+        return "hisparse_host_mapping_bytes"
+    if "fixed.request_map" in names:
+        return "request_token_mapping_bytes"
+    if leaves & {
+        "logical_to_physical",
+        "allocator_mapping_alias",
+        "full_to_hisparse_device_index_mapping",
+    }:
+        return "hisparse_logical_to_physical_bytes"
+    if "req_to_device_buffer" in leaves:
+        return "hisparse_hot_request_slots_bytes"
+    if "req_device_buffer_tokens" in leaves:
+        return "hisparse_hot_token_ids_bytes"
+    if "req_device_buffer_token_locs" in leaves:
+        return "hisparse_hot_token_locs_bytes"
+    if "top_k_device_locs_buffer" in leaves:
+        return "hisparse_selection_output_bytes"
+    if leaves & {
+        "_step_last_valid_buf",
+        "_step_recent_positions_buf",
+        "_step_short_layout_buf",
+        "_step_is_short_buf",
+        "_step_actual_lens_buf",
+        "_recent_offsets_const",
+        "_all_positions_const",
+        "_page_offsets_const",
+        "_page_idx_const",
+    }:
+        return "quest_selection_state_bytes"
+    if "num_real_reqs" in leaves:
+        return "hisparse_batch_state_bytes"
+    if "cache_metrics" in leaves:
+        return "hisparse_diagnostic_counter_bytes"
+    if any(name.startswith("fixed.kv_descriptors.") for name in names):
+        return "compute_kv_descriptors_bytes"
+    if any(name.startswith("backend_specific.") for name in names) and leaves & {
+        "k_data_ptrs",
+        "v_data_ptrs",
+        "data_ptrs",
+    }:
+        return "backing_kv_descriptors_bytes"
+    for owner in ("physical", "logical", "outer"):
+        if any(name.startswith(f"allocator_dynamic.{owner}.") for name in names):
+            return f"allocator_{owner}_worklists_bytes"
+    if "split_partial_workspace" in leaves:
+        return "fused_split_workspace_bytes"
+    if "attention_output" in leaves:
+        return "fused_output_bytes"
+    if leaves & {"workspace_buffer", "flashinfer_workspace"}:
+        return "separate_attention_workspace_bytes"
+    if any(name.startswith("kv.k") or name.startswith("kv.v") for name in names):
+        return "physical_compute_kv_bytes"
+    return "other_named_gpu_bytes"
+
+
+def allocation_records(inventory):
+    """Deduplicate aliases and retain the names supporting each classification."""
     groups = defaultdict(list)
     for name, entry in inventory.get("retained_gpu_pool_shapes", {}).items():
         group = entry.get("allocation_group")
@@ -195,60 +281,68 @@ def allocation_components(inventory):
             "Invalid named allocation",
         )
         groups[group].append((name, entry))
-    result = defaultdict(int)
-    for items in groups.values():
+    result = []
+    for group, items in sorted(groups.items()):
         sizes = {entry["storage_bytes"] for _, entry in items}
         require(len(sizes) == 1, "Alias storage sizes disagree")
-        names = " ".join(name.lower() for name, _ in items)
-        if "stage_bounds" in names:
-            category = "quest_layer_staging_bytes"
-        elif any(key in names for key in ("page_k_bounds", "page_k_min", "page_k_max")):
-            category = "quest_resident_summary_bytes"
-        elif "running_k_min" in names or "running_k_max" in names:
-            category = "quest_running_bounds_bytes"
-        elif "xm_fused_plan" in names or names.startswith("plan."):
-            category = "fused_plan_bytes"
-        elif "split_partial_workspace" in names:
-            category = "fused_split_workspace_bytes"
-        elif "attention_output" in names:
-            category = "fused_output_bytes"
-        elif "workspace_buffer" in names or "flashinfer_workspace" in names:
-            category = "separate_attention_workspace_bytes"
-        elif any(
-            name.startswith("kv.k") or name.startswith("kv.v") for name, _ in items
-        ):
-            category = "physical_compute_kv_bytes"
-        else:
-            category = "other_named_gpu_bytes"
-        result[category] += next(iter(sizes))
-    total = sum(result.values())
+        aliases = sorted(name for name, _ in items)
+        result.append(
+            {
+                "allocation_group": group,
+                "alias_names": aliases,
+                "storage_bytes": next(iter(sizes)),
+                "category": allocation_category(aliases),
+            }
+        )
+    total = sum(record["storage_bytes"] for record in result)
     require(
         total == inventory.get("retained_gpu_pool_bytes", total),
         "Named allocation total disagrees",
     )
+    return result
+
+
+def allocation_components(inventory):
+    """Assign every named storage to exactly one persistent allocation group."""
+    result = defaultdict(int)
+    for record in allocation_records(inventory):
+        result[record["category"]] += record["storage_bytes"]
     return dict(result)
 
 
 def memory_snapshot(capacity):
     ledger = capacity.get("gpu_memory_ledger", {})
     require(ledger.get("contract") == "qwen_quest_v1", "Missing Qwen memory ledger")
-    named = allocation_components(
-        {
-            "retained_gpu_pool_bytes": ledger["named_compute_bytes"],
-            "retained_gpu_pool_shapes": ledger["named_compute_shapes"],
-        }
-    )
+    cache_inventory = {
+        "retained_gpu_pool_bytes": ledger["named_compute_bytes"],
+        "retained_gpu_pool_shapes": ledger["named_compute_shapes"],
+    }
+    named = allocation_components(cache_inventory)
+    cache_records = allocation_records(cache_inventory)
     backend = capacity.get(
         "xm_fused_backend_memory", capacity.get("xm_attention_backend_memory", {})
     )
     workspace = allocation_components(backend) if backend else {}
+    backend_records = allocation_records(backend) if backend else []
     # The plan is already included in the cache ledger. The backend inventory
     # has separate local allocation-group IDs, so never add its plan twice.
     workspace.pop("fused_plan_bytes", None)
     return {
+        "allocation_accounting_schema": "xm_qwen_named_allocations_v2",
         "cache_named_gpu_bytes": ledger["named_compute_bytes"],
         "cache_components": named,
+        "cache_allocation_groups": cache_records,
         "backend_components": workspace,
+        "backend_allocation_groups": [
+            record
+            for record in backend_records
+            if record["category"] != "fused_plan_bytes"
+        ],
+        "backend_plan_aliases_already_in_cache": [
+            record
+            for record in backend_records
+            if record["category"] == "fused_plan_bytes"
+        ],
         "backend_inventory_observed": bool(backend),
         "cpu_full_kv_backing_bytes": capacity.get("allocated_backing_kv_bytes"),
         "cpu_quest_summary_backing_bytes": capacity.get(
@@ -454,6 +548,7 @@ def collect_campaign(path, *, evidence_root=None, min_steps=16, trim=4):
                         "graph_enabled": group["decode_cuda_graph_enabled"],
                         "request_average_tpot_ms": result["mean_tpot_ms"],
                         "client_ttft_ms": result["mean_ttft_ms"],
+                        "client_timing": selected["client"],
                         "complete_request_output_tokens_per_second": result[
                             "output_throughput"
                         ],
@@ -486,6 +581,11 @@ def flat_rows(samples, *, min_intervals=16):
             {value["actual_batch_size"] for value in sample["_intervals"].values()}
         ) or [None]
         memory = sample["memory_after"]
+        client = sample.get("client_timing", {})
+        strict_arrival = client.get("single_token_arrival_gap_ms")
+        strict_arrival = (
+            strict_arrival if client.get("all_frames_single_token") is True else None
+        )
         workspace = (
             sum(memory["backend_components"].values())
             if memory["backend_inventory_observed"]
@@ -511,11 +611,30 @@ def flat_rows(samples, *, min_intervals=16):
                     "stable_tokens_per_s": batch * 1000 / gap if gap else None,
                     "mean_tpot_ms": sample["request_average_tpot_ms"],
                     "ttft_ms": sample["client_ttft_ms"],
-                    "native_cuda_ms": statistics.mean(
-                        v["cuda_forward_ms"] for v in intervals
-                    )
-                    if intervals
-                    else None,
+                    "strict_client_mean_tbt_ms": (
+                        strict_arrival["mean"] if strict_arrival else None
+                    ),
+                    "strict_client_p99_tbt_ms": (
+                        strict_arrival["p99"] if strict_arrival else None
+                    ),
+                    "strict_client_tbt_samples": (
+                        strict_arrival["samples"] if strict_arrival else 0
+                    ),
+                    "client_all_frames_single_token": client.get(
+                        "all_frames_single_token"
+                    ),
+                    "raw_client_mean_frame_gap_ms": client.get(
+                        "raw_token_positive_frame_gap_ms", {}
+                    ).get("mean"),
+                    "client_tbt_metric_scope": (
+                        "HTTP single-token arrival gaps across complete measured requests, excluding first token; "
+                        "not restricted to matched stable-batch windows. Null when any positive frame carries multiple tokens."
+                    ),
+                    "native_cuda_ms": (
+                        statistics.mean(v["cuda_forward_ms"] for v in intervals)
+                        if intervals
+                        else None
+                    ),
                     "named_cache_hbm_bytes": memory["cache_named_gpu_bytes"],
                     "workspace_excluding_plan_bytes": workspace,
                     "summary_backing_bytes": memory["cpu_quest_summary_backing_bytes"],
@@ -882,9 +1001,11 @@ def analyze_campaign(path, **kwargs):
     flattened = flat_rows(samples)
     return {
         "schema_version": 1,
-        "status": "analyzed"
-        if any(r["eligible"] for r in flattened)
-        else "no_eligible_samples",
+        "status": (
+            "analyzed"
+            if any(r["eligible"] for r in flattened)
+            else "no_eligible_samples"
+        ),
         "phase": campaign["phase"],
         "source_fingerprint": campaign.get("source_fingerprint"),
         "native_source_commits": commits,
