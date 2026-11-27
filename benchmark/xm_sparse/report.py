@@ -1570,6 +1570,27 @@ def main_graph_profile_summary(profile):
     return means
 
 
+def paired_decode_conclusion(row, label):
+    """Describe one actual-batch cohort; a cross-zero CI stays inconclusive."""
+    effect = row["launch_gap_reduction_percent"]
+    mean, interval = effect["mean"], effect.get("confidence_interval_95")
+    direction = "下降" if mean >= 0 else "增加"
+    if interval is None:
+        uncertainty = "95%区间未估计；只描述观测均值。"
+    else:
+        uncertainty = f"95%区间 [{interval[0]:.2f}, {interval[1]:.2f}]%。"
+        if interval[0] <= 0 <= interval[1]:
+            uncertainty += "区间跨0，本轮未能确认延迟收益或代价。"
+    return (
+        f"{label}：同请求与 decode 序号、客户端 C={row['client_concurrency']}、"
+        f"实际 batch={row['actual_batch_size']}、输入 {row['input_len']:,} tokens，"
+        f"稳定 decode 调度间隔 {direction} {abs(mean):.2f}%"
+        f"（{row['baseline_gap_ms']['mean']:.2f} → {row['changed_gap_ms']['mean']:.2f} ms；"
+        f"配对重复 n={row['paired_repeats']}）。{uncertainty}"
+        "该间隔不是 HTTP token 到达 TBT。"
+    )
+
+
 def draw_plots(analyses, profiles, directory):
     import matplotlib
 
@@ -1745,6 +1766,7 @@ def render_report(
             leading=20,
             textColor=colors.HexColor("#16374c"),
             spaceAfter=10,
+            keepWithNext=True,
         ),
         "body": ParagraphStyle(
             "body",
@@ -1866,22 +1888,25 @@ def render_report(
         for _, data in analyses
         if data["phase"] == "performance"
         for row in data.get("same_actual_batch_comparisons", [])
-        if row["baseline"] == "baseline" and row["changed"] == "fused"
     ]
-    if comparisons:
-        for row in comparisons[:8]:
-            effect = row["launch_gap_reduction_percent"]
-            word = "下降" if effect["mean"] >= 0 else "增加"
+    for baseline, changed, label in (
+        ("baseline", "fused", "融合 TMA"),
+        ("bounds-on-demand", "bounds-prefetch", "跨层 Quest 摘要预取"),
+        ("combined", "combined-protected", "预取保护"),
+    ):
+        selected = [
+            row
+            for row in comparisons
+            if row["baseline"] == baseline and row["changed"] == changed
+        ]
+        if selected:
+            for row in selected:
+                add(paired_decode_conclusion(row, label))
+        else:
             add(
-                f"同请求、同 decode 序号、实际 batch={row['actual_batch_size']}、输入 {row['input_len']:,} tokens："
-                f"融合后稳定 decode 调度间隔 {word} {abs(effect['mean']):.2f}%"
-                f"（{row['baseline_gap_ms']['mean']:.2f} → {row['changed_gap_ms']['mean']:.2f} ms；"
-                f"配对重复 n={row['paired_repeats']}）。该间隔不是 HTTP token 到达 TBT。"
+                f"尚无满足稳定窗口与请求匹配要求的 {baseline}→{changed} 数据；"
+                f"{label}的端到端结论保留待测。"
             )
-    else:
-        add(
-            "尚无满足稳定窗口与请求匹配要求的 baseline→fused 数据；不能形成融合的端到端收益结论。"
-        )
     capacity = [
         (data, row)
         for _, data in analyses
@@ -2025,6 +2050,8 @@ def render_report(
     add(
         "下降率=(原路径间隔-新路径间隔)／原路径间隔；负值表示回退。"
         "只纳入 analysis 中满足稳定步数、恒定请求集合与 decode 序号配对的样本。"
+        "当前三次随机顺序重复未做位置平衡，六组配对 CI 未作多重比较校正；"
+        "CI 将配对重复均值视为独立样本，不把 token 间隔视为独立重复。"
     )
     all_pairs = []
     for index, (_, data) in enumerate(analyses):

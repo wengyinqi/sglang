@@ -1395,6 +1395,37 @@ def test_parent_inventory_rejects_decode_coverage_mismatch():
         REPORT.main_graph_profile_summary(profile)
 
 
+@pytest.mark.parametrize(
+    "effect,interval,expected",
+    [
+        (4.5, [3.6, 5.4], "下降 4.50%"),
+        (-24.5, [-26, -23], "增加 24.50%"),
+        (-0.9, [-1.9, 0.1], "区间跨0，本轮未能确认延迟收益或代价"),
+        (1.2, None, "95%区间未估计"),
+    ],
+)
+def test_front_page_conclusion_preserves_actual_batch_and_uncertainty(
+    effect, interval, expected
+):
+    row = {
+        "launch_gap_reduction_percent": {
+            "mean": effect,
+            "confidence_interval_95": interval,
+        },
+        "client_concurrency": 8,
+        "actual_batch_size": 4,
+        "input_len": 32768,
+        "paired_repeats": 3,
+        "baseline_gap_ms": {"mean": 10},
+        "changed_gap_ms": {"mean": 10 * (1 - effect / 100)},
+    }
+    text = REPORT.paired_decode_conclusion(row, "Quest 摘要预取")
+    assert expected in text
+    assert "客户端 C=8" in text and "实际 batch=4" in text
+    assert "32,768 tokens" in text and "配对重复 n=3" in text
+    assert "不是 HTTP token 到达 TBT" in text
+
+
 def test_rendered_metric_numa_and_parent_graph_scope_preserve_evidence_boundaries(
     tmp_path, monkeypatch
 ):
