@@ -59,6 +59,7 @@ def contracts(tmp_path, monkeypatch):
         "artifacts": [REPORT.identity(campaign), REPORT.identity(benchmark)],
     }
     replay = copy.deepcopy(data)
+    real_tool = REPORT.report_tool
     monkeypatch.setattr(
         REPORT,
         "report_tool",
@@ -68,7 +69,7 @@ def contracts(tmp_path, monkeypatch):
                 equal=lambda a, b: a == b,
             )
             if name == "analyze"
-            else campaign_tool
+            else real_tool(name)
         ),
     )
     comparison = {
@@ -488,3 +489,481 @@ def test_formal_failure_review_can_be_generated_without_performance_numbers(
     assert captured["report_audit"]["status"] == "blocked"
     assert receipt["model_evidence_audit"]["model_result_claims_allowed"] is False
     assert "claims suppressed" in receipt["scope"]
+
+
+@pytest.fixture
+def large_contracts(contracts, tmp_path):
+    """Complete synthetic raw CPU contract; no GPU/model validation is claimed."""
+    tool = REPORT.report_tool("summary_batch_correctness")
+    batch, length, output_len = 4, 5000, 80
+    workload_path = write(tmp_path / "workload.json", {"frozen": "contract-fixture"})
+    workload = {key: REPORT.identity(workload_path)[key] for key in ("sha256", "bytes")}
+    data, proof = contracts.data, contracts.proof
+    proof["workload_identity"] = data["workload_identity"] = workload
+    proof["settings"]["input_lens"] = [length]
+    small_natives = {}
+    proof["cases"] = []
+    evidence = []
+    for arm in tool.ARMS:
+        small = copy.deepcopy(contracts.native)
+        small["stage"] = tool.CAMPAIGN.recipe(arm)
+        small["settings"].update(
+            input_lens=[length], workload_sha256=workload["sha256"]
+        )
+        for group in small["groups"]:
+            group["rounds"] = [[length, length]]
+        path = write(tmp_path / ("small-" + arm + ".json"), small)
+        small_natives[arm] = (path, small)
+        evidence.append((path, small))
+        proof["cases"].append(
+            {
+                "arm": arm,
+                "stage": small["stage"],
+                "stage_path": str(tmp_path / "unavailable" / arm / "stage.json"),
+                "status": "success",
+                "returncode": 0,
+            }
+        )
+    proof_path = write(tmp_path / "small-proof.json", proof)
+    evidence.append((proof_path, proof))
+    budget = 8 << 30
+    data.update(phase="capacity", cache_hbm_budget_bytes=budget)
+    data["rows"] = [
+        dict(data["rows"][0], arm=arm, input_len=length, actual_batch=batch)
+        for arm in tool.ARMS
+    ]
+    campaign = write(
+        tmp_path / "capacity-campaign.json",
+        {"phase": "capacity", "correctness_gate": REPORT.identity(proof_path)},
+    )
+    benchmark = write(
+        contracts.benchmark,
+        {
+            "kind": "benchmark",
+            "stage": tool.CAMPAIGN.recipe("fused", budget=budget),
+            "settings": {"model": "/models/qwen"},
+        },
+    )
+    data["artifacts"] = [REPORT.identity(campaign), REPORT.identity(benchmark)]
+    contracts.replay.clear()
+    contracts.replay.update(copy.deepcopy(data))
+    control = {
+        "schema_version": 1,
+        "phase": "large_batch_summary_equivalence",
+        "status": "success",
+        "source_fingerprint": data["source_fingerprint"],
+        "settings": {
+            "execute": True,
+            "model": "/models/qwen",
+            "workload": str(workload_path),
+            "input_len": length,
+            "batch_sizes": [batch],
+            "output_len": output_len,
+        },
+        "small_hbm_gate": {
+            "status": "passed",
+            **REPORT.identity(proof_path),
+            "native_reports": [
+                {"arm": arm, **REPORT.identity(path)}
+                for arm, (path, _) in small_natives.items()
+            ],
+        },
+        "cases": [],
+        "comparisons": [],
+    }
+    natives, arguments = {}, {}
+    for arm in tool.ARMS:
+        stage = tool.CAMPAIGN.recipe(arm)
+        output_dir = tmp_path / ("large-" + arm) / "evidence"
+        args = SimpleNamespace(
+            input_lens=[length],
+            output_len=output_len,
+            max_total_tokens=98304,
+            capacity_ratios=[16],
+            cpu_capacity_ratio=16,
+            chunked_prefill_size=4096,
+            prefill_max_requests=1,
+            top_k=None,
+            device_buffer_size=None,
+            output_dir=output_dir,
+            logprob_atol=0.02,
+            concurrencies=[batch],
+            num_prompts=batch,
+            execute=False,
+            model="/models/qwen",
+            workload=str(workload_path),
+            workload_sha256=workload["sha256"],
+        )
+        settings = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        }
+        need = tool.allocation_requirements(stage, args, batch)
+        capacity = {
+            "backing_store": "cpu",
+            "storage_device_ids": [],
+            "physical_compute_slots": 98304,
+            "backing_slots": 1572928,
+            "padding_slots": 64,
+            "compute_kv_bytes": 98304 * 98304,
+            "backing_kv_bytes": 1572928 * 98304,
+        }
+        native = {
+            "kind": "correctness",
+            "status": "success",
+            "stage": stage,
+            "settings": settings,
+            "runtime": copy.deepcopy(contracts.native["runtime"]),
+            "cpu_ram_preflight": [{"status": "passed"}],
+            "groups": [],
+        }
+        reference = None
+        for eager in (True, False):
+            gid = "cpu-" + ("eager" if eager else "graph") + "-ratio16"
+            group = {
+                "id": gid,
+                "variant": "cpu",
+                "eager": eager,
+                "status": "success",
+                "ratio": 16,
+                "rounds": need["rounds"],
+                "trace_dir": str(output_dir / (gid + "-trace")),
+                "capacity": [capacity],
+                "lifecycle_required": True,
+                "lifecycle_results": [],
+            }
+            rows = [
+                {
+                    "type": "session",
+                    "tp_size": 1,
+                    "tp_rank": 0,
+                    "pp_size": 1,
+                    "dp_size": 1,
+                    "disable_overlap_schedule": True,
+                    "disaggregation_mode": "null",
+                    "disable_radix_cache": True,
+                    "speculative_algorithm": None,
+                    "enable_mixed_chunk": False,
+                }
+            ]
+
+            def extend(rid, count):
+                while count:
+                    chunk = min(count, 4096)
+                    rows.append(
+                        {
+                            "type": "forward",
+                            "sequence": len(rows) - 1,
+                            "forward_mode": "extend",
+                            "request_ids": [rid],
+                            "extend_lens": [chunk],
+                            "success": True,
+                        }
+                    )
+                    count -= chunk
+
+            def decode(ids, count):
+                for _ in range(count):
+                    rows.append(
+                        {
+                            "type": "forward",
+                            "sequence": len(rows) - 1,
+                            "forward_mode": "decode",
+                            "request_ids": ids,
+                            "extend_lens": None,
+                            "success": True,
+                        }
+                    )
+
+            def response(rid, n=length, count=output_len):
+                return {
+                    "meta_info": {
+                        "id": rid,
+                        "prompt_tokens": n,
+                        "completion_tokens": count,
+                        "output_token_logprobs": [[-0.1, 1, None]] * count,
+                    }
+                }
+
+            for index, lengths in enumerate(group["rounds"]):
+                ids = [f"round{index}-r{i}" for i in range(batch)]
+                write(
+                    output_dir / f"{gid}-round{index}.json",
+                    {
+                        "input_ids": [[1] * n for n in lengths],
+                        "responses": [response(rid, n) for rid, n in zip(ids, lengths)],
+                    },
+                )
+                for rid, n in zip(ids, lengths):
+                    extend(rid, n)
+                decode(ids, output_len - 1)
+            baseline = response("baseline")
+            extend("baseline", length)
+            decode(["baseline"], output_len - 1)
+            prefix = output_dir / (gid + "-lifecycle")
+            write(prefix.with_name(prefix.name + "-baseline.json"), baseline)
+            for case in ("abort_prefill", "abort_decode", "retract_decode"):
+                rid, recovery_id = "fault-" + case, "recovery-" + case
+                fault = response(
+                    rid,
+                    count=(
+                        0
+                        if case == "abort_prefill"
+                        else (2 if case == "abort_decode" else output_len)
+                    ),
+                )
+                if case == "abort_prefill":
+                    extend(rid, 2048)
+                else:
+                    extend(rid, length)
+                    decode([rid], 1)
+                    if case == "retract_decode":
+                        extend(rid, 4096)
+                        decode([rid], output_len - 2)
+                        fault["meta_info"]["total_retractions"] = 1
+                if case != "retract_decode":
+                    fault["meta_info"]["finish_reason"] = {"type": "abort"}
+                extend(recovery_id, length)
+                decode([recovery_id], output_len - 1)
+                item = {
+                    "case": case,
+                    "attempt": 0,
+                    "status": "passed",
+                    "request_id": rid,
+                    "response": fault,
+                    "recovery_response": response(recovery_id),
+                    "forward_facts": tool.CORRECTNESS.LIFECYCLE.forward_facts(
+                        [rows], rid, 1
+                    ),
+                    "recovery_comparison": {
+                        "exact_greedy_token_match": True,
+                        "max_abs_logprob_error": 0.0,
+                        "logprob_atol": 0.02,
+                    },
+                }
+                if case == "retract_decode":
+                    item["resumed_comparison"] = copy.deepcopy(
+                        item["recovery_comparison"]
+                    )
+                write(prefix.with_name(f"{prefix.name}-{case}-0.json"), item)
+                group["lifecycle_results"].append(item)
+            rows.append({"type": "idle_flush", "last_sequence": len(rows) - 2})
+            trace_path = Path(group["trace_dir"]) / "forward.jsonl"
+            trace_path.parent.mkdir(parents=True)
+            trace_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            write(
+                output_dir / (gid + "-server-info.json"),
+                {
+                    "disable_cuda_graph": eager,
+                    "internal_states": [
+                        {"disable_cuda_graph": eager, "cuda_graph_bs": [1, 2, batch]}
+                    ],
+                },
+            )
+            fresh, outputs = tool.verify_round_trace(group, args, batch)
+            group["large_batch_trace_equivalence"] = fresh
+            reference = outputs if reference is None else reference
+            group["comparison_to_cpu_hisparse"] = tool.CORRECTNESS.COMPARE.compare(
+                reference, outputs, 0.02
+            )
+            group["slot_reuse_comparison"] = tool.CORRECTNESS.COMPARE.compare(
+                [outputs[0]], [outputs[2]], 0.02
+            )
+            native["groups"].append(group)
+        native_path = write(output_dir / "manifest.json", native)
+        control["cases"].append(
+            {
+                "arm": arm,
+                "batch": batch,
+                "stage": stage,
+                "settings": settings,
+                "status": "success",
+                "native_manifest": str(native_path),
+            }
+        )
+        natives[arm], arguments[arm] = native, args
+    comparisons = tool.compare_arms(
+        natives[tool.ARMS[0]],
+        natives[tool.ARMS[1]],
+        arguments[tool.ARMS[0]],
+        arguments[tool.ARMS[1]],
+        batch,
+    )
+    control["comparisons"] = [
+        {"batch": batch, "status": "passed", "groups": comparisons}
+    ]
+    control_path = write(tmp_path / "summary-batch-correctness.json", control)
+    evidence.append((control_path, control))
+    return SimpleNamespace(
+        contracts=contracts,
+        data=data,
+        evidence=evidence,
+        control=control,
+        control_path=control_path,
+        natives=natives,
+        arguments=arguments,
+        proof_path=proof_path,
+    )
+
+
+def test_actual_large_cpu_summary_control_admits_capacity_without_fake_hbm(
+    large_contracts,
+):
+    fixture = large_contracts
+    audit = REPORT.audit_report_evidence(fixture.contracts.analyses, fixture.evidence)
+    assert audit["status"] == "passed", audit["failures"]
+    control = audit["analysis_model_proof_bindings"][0]["large_batch_summary_controls"][
+        0
+    ]
+    assert control["batch"] == 4 and "no large-batch full-HBM" in control["scope"]
+    assert all(
+        native["settings"]["execute"] is False for native in fixture.natives.values()
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "planned",
+        "source",
+        "precursor",
+        "small_native",
+        "batch",
+        "workload",
+        "archive",
+        "recipe",
+        "trace",
+        "graph",
+        "reuse",
+        "lifecycle",
+        "recovery",
+        "comparison",
+    ],
+)
+def test_incomplete_large_control_blocks_capacity_only(large_contracts, mutation):
+    fixture = large_contracts
+    if mutation == "missing":
+        fixture.evidence = [
+            (path, record)
+            for path, record in fixture.evidence
+            if record.get("phase") != "large_batch_summary_equivalence"
+        ]
+    elif mutation == "planned":
+        fixture.control["settings"]["execute"] = False
+    elif mutation == "source":
+        fixture.control["source_fingerprint"] = {"sha256": "e" * 64}
+    elif mutation == "precursor":
+        fixture.control["small_hbm_gate"]["sha256"] = "e" * 64
+    elif mutation == "small_native":
+        fixture.control["small_hbm_gate"]["native_reports"][0]["bytes"] += 1
+    elif mutation == "batch":
+        fixture.control["cases"][0]["batch"] = 8
+    elif mutation == "comparison":
+        fixture.control["comparisons"][0]["groups"][0]["max_abs_logprob_error"] = 0.01
+    else:
+        native = fixture.natives["combined-protected"]
+        group = native["groups"][0]
+        if mutation == "workload":
+            native["settings"]["workload_sha256"] = "e" * 64
+        elif mutation == "archive":
+            native["runtime"]["archived_source"]["source_archive_sha256"] = "e" * 64
+        elif mutation == "recipe":
+            native["stage"]["xm_adaptation"]["arm"] = "combined"
+        elif mutation == "trace":
+            Path(group["large_batch_trace_equivalence"]["trace"]["path"]).write_text(
+                "changed", encoding="utf-8"
+            )
+        elif mutation == "graph":
+            graph = native["groups"][1]
+            write(
+                fixture.arguments["combined-protected"].output_dir
+                / (graph["id"] + "-server-info.json"),
+                {
+                    "disable_cuda_graph": True,
+                    "internal_states": [
+                        {"disable_cuda_graph": True, "cuda_graph_bs": [4]}
+                    ],
+                },
+            )
+        elif mutation == "reuse":
+            group["slot_reuse_comparison"]["exact_greedy_token_match"] = False
+        elif mutation == "lifecycle":
+            group["lifecycle_results"].pop()
+        else:
+            prefix = fixture.arguments["combined-protected"].output_dir / (
+                group["id"] + "-lifecycle"
+            )
+            path = prefix.with_name(prefix.name + "-abort_decode-0.json")
+            receipt = json.loads(path.read_text())
+            receipt["recovery_response"]["meta_info"]["output_token_logprobs"][0][1] = 9
+            write(path, receipt)
+            group["lifecycle_results"][1] = receipt
+        write(
+            fixture.arguments["combined-protected"].output_dir / "manifest.json", native
+        )
+    audit = REPORT.audit_report_evidence(fixture.contracts.analyses, fixture.evidence)
+    assert audit["status"] == "blocked", audit
+    assert not REPORT.display_analyses(fixture.contracts.analyses, audit)[0][1]["rows"]
+
+
+def test_missing_capacity_control_preserves_valid_latency(
+    large_contracts, tmp_path, monkeypatch
+):
+    fixture = large_contracts
+    performance = copy.deepcopy(fixture.data)
+    performance.update(phase="performance", cache_hbm_budget_bytes=None)
+    performance["rows"] = [
+        dict(performance["rows"][0], actual_batch=1, client_concurrency=1)
+    ]
+    campaign = write(
+        tmp_path / "performance-campaign.json",
+        {
+            "phase": "performance",
+            "correctness_gate": REPORT.identity(fixture.proof_path),
+        },
+    )
+    performance["artifacts"][0] = REPORT.identity(campaign)
+    performance_path = write(tmp_path / "performance-analysis.json", performance)
+    real_tool = REPORT.report_tool
+    replays = {
+        performance["artifacts"][0]["path"]: performance,
+        fixture.data["artifacts"][0]["path"]: fixture.data,
+    }
+    monkeypatch.setattr(
+        REPORT,
+        "report_tool",
+        lambda name: (
+            SimpleNamespace(
+                analyze_campaign=lambda path: copy.deepcopy(replays[str(path)]),
+                equal=lambda a, b: a == b,
+            )
+            if name == "analyze"
+            else real_tool(name)
+        ),
+    )
+    analyses = [(performance_path, performance)] + fixture.contracts.analyses
+    evidence = [
+        (path, record)
+        for path, record in fixture.evidence
+        if record.get("phase") != "large_batch_summary_equivalence"
+    ]
+    audit = REPORT.audit_report_evidence(analyses, evidence)
+    assert audit["status"] == "partial" and audit["model_result_claims_allowed"]
+    shown = REPORT.display_analyses(analyses, audit)
+    assert shown[0][1]["rows"] and shown[1][1]["rows"] == []
+
+
+def test_completed_batch_in_failed_later_control_remains_scoped(large_contracts):
+    fixture = large_contracts
+    fixture.control["status"] = "failed"
+    fixture.control["settings"]["batch_sizes"].append(8)
+    fixture.control["cases"].append({"arm": "fused", "batch": 8, "status": "failed"})
+    audit = REPORT.audit_report_evidence(fixture.contracts.analyses, fixture.evidence)
+    assert audit["status"] == "passed", audit["failures"]
+    control = audit["analysis_model_proof_bindings"][0]["large_batch_summary_controls"][
+        0
+    ]
+    assert control["batch"] == 4 and control["summary_campaign_status"] == "failed"

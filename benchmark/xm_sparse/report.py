@@ -20,6 +20,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from xml.sax.saxutils import escape
 
 ARMS = (
@@ -468,7 +469,315 @@ def verify_model_receipt(proof_path, proof, evidence, data, benchmark_models):
                 "correctness_round_sizes": sorted(
                     {len(r) for g in groups for r in g.get("rounds", [])}
                 ),
+                "hbm_context_batch_sizes": sorted(
+                    {
+                        (length, len(round_))
+                        for group in groups
+                        if group.get("variant") == "hbm"
+                        for round_ in group.get("rounds", [])
+                        for length in round_
+                    }
+                ),
             }
+        )
+    return accepted
+
+
+def _summary_lifecycle(tool, args, group, trace, artifacts):
+    """Replay fault phase and recovery from raw files, without using a server."""
+    compare, lifecycle = tool.CORRECTNESS.COMPARE, tool.CORRECTNESS.LIFECYCLE
+    length = max(args.input_lens)
+    prefix = args.output_dir / (group["id"] + "-lifecycle")
+    baseline_path = prefix.with_name(prefix.name + "-baseline.json")
+    baseline = read(baseline_path)
+    expected = compare.normalize_outputs([baseline], [length], args.output_len)
+    baseline_id = baseline["meta_info"]["id"]
+    baseline_facts = lifecycle.forward_facts([trace], baseline_id, 1)
+    require(
+        len(baseline_facts) == 1
+        and baseline_facts[0]["prefill_tokens"] == length
+        and baseline_facts[0]["decode_forwards"] == args.output_len - 1,
+        "Missing complete lifecycle baseline forwards",
+    )
+    artifacts.append(identity(baseline_path))
+    require(group.get("lifecycle_required") is True, "Missing large-batch lifecycle")
+    for case in ("abort_prefill", "abort_decode", "retract_decode"):
+        passed = [
+            item
+            for item in group.get("lifecycle_results", [])
+            if item.get("case") == case and item.get("status") == "passed"
+        ]
+        require(len(passed) == 1, "Missing unambiguous large-batch " + case)
+        item = passed[0]
+        path = prefix.with_name(f"{prefix.name}-{case}-{item['attempt']}.json")
+        raw = read(path)
+        require(raw == item, "Large-batch lifecycle receipt differs from raw file")
+        require(
+            raw["response"]["meta_info"]["id"] == raw["request_id"],
+            "Lifecycle fault response has another request ID",
+        )
+        artifacts.append(identity(path))
+        facts = lifecycle.forward_facts([trace], raw["request_id"], 1)
+        require(facts == raw.get("forward_facts"), "Lifecycle fault trace changed")
+        lifecycle.validate_fault(case, raw["response"], facts, length, args.output_len)
+        recovered = compare.normalize_outputs(
+            [raw["recovery_response"]], [length], args.output_len
+        )
+        actual = compare.compare([expected], [recovered], args.logprob_atol)
+        require(actual == raw.get("recovery_comparison"), "Recovery output changed")
+        if case == "retract_decode":
+            resumed = compare.normalize_outputs(
+                [raw["response"]], [length], args.output_len
+            )
+            require(
+                compare.compare([expected], [resumed], args.logprob_atol)
+                == raw.get("resumed_comparison"),
+                "Retracted output changed",
+            )
+        recovery_id = raw["recovery_response"]["meta_info"]["id"]
+        require(
+            len({baseline_id, raw["request_id"], recovery_id}) == 3,
+            "Lifecycle baseline/fault/recovery IDs are not independent",
+        )
+        recovery = lifecycle.forward_facts([trace], recovery_id, 1)
+        require(
+            len(recovery) == 1
+            and recovery[0]["prefill_tokens"] == length
+            and recovery[0]["decode_forwards"] == args.output_len - 1,
+            "Missing complete lifecycle recovery forwards",
+        )
+
+
+def verify_large_summary_control(
+    path, control, data, proof_path, proof, evidence, batch, length
+):
+    """Audit the CPU-DDR resident/offloaded summary control, never full-HBM B."""
+    tool, replay = report_tool("summary_batch_correctness"), report_tool("analyze")
+    settings, gate = control.get("settings", {}), control.get("small_hbm_gate", {})
+    require(
+        control.get("schema_version") == 1
+        and control.get("phase") == "large_batch_summary_equivalence"
+        and control.get("status") in ("success", "failed")
+        and settings.get("execute") is True
+        and control.get("source_fingerprint") == data.get("source_fingerprint")
+        and settings.get("model") == proof.get("settings", {}).get("model")
+        and settings.get("input_len") == length
+        and batch in settings.get("batch_sizes", []),
+        "Large-batch summary control has another source/model/context or was not executed",
+    )
+    require(
+        gate.get("status") == "passed"
+        and {key: gate.get(key) for key in ("sha256", "bytes")}
+        == {key: identity(proof_path)[key] for key in ("sha256", "bytes")},
+        "Large-batch summary precursor is not the original bound correctness proof",
+    )
+    require(
+        identity(gate["path"])["sha256"] == gate["sha256"],
+        "Summary precursor path changed",
+    )
+    small_data = dict(
+        data,
+        rows=[
+            {"arm": arm, "input_len": length, "graph_enabled": True}
+            for arm in tool.ARMS
+        ],
+        samples=[],
+        same_actual_batch_comparisons=[],
+        observed_stable_capacity_points=[],
+    )
+    verify_model_receipt(proof_path, proof, evidence, small_data, {settings["model"]})
+    artifacts, natives, arguments = [identity(path)], {}, {}
+    markers = set()
+    for arm in tool.ARMS:
+        small_case = next(case for case in proof["cases"] if case["arm"] == arm)
+        small_path, small_native = _native_correctness(proof_path, small_case, evidence)
+        small_identity = identity(small_path)
+        require(
+            len(
+                [
+                    item
+                    for item in gate.get("native_reports", [])
+                    if item.get("arm") == arm
+                    and item.get("sha256") == small_identity["sha256"]
+                    and item.get("bytes") == small_identity["bytes"]
+                ]
+            )
+            == 1,
+            "Missing hash-bound small native summary precursor",
+        )
+        cases = [
+            case
+            for case in control.get("cases", [])
+            if case.get("arm") == arm and case.get("batch") == batch
+        ]
+        require(
+            len(cases) == 1 and cases[0].get("status") == "success",
+            "Missing successful actual summary batch/arm",
+        )
+        case = cases[0]
+        native_path = Path(case["native_manifest"])
+        native = read(native_path)
+        stage, native_settings, runtime = (
+            native.get("stage"),
+            native.get("settings", {}),
+            native.get("runtime", {}),
+        )
+        require(
+            native.get("kind") == "correctness"
+            and native.get("status") == "success"
+            and stage == case.get("stage") == tool.CAMPAIGN.recipe(arm)
+            and native_settings == case.get("settings")
+            and native_settings.get("model") == settings["model"]
+            and native_settings.get("workload") == settings.get("workload")
+            and native_settings.get("workload_sha256")
+            == data.get("workload_identity", {}).get("sha256")
+            and native_settings.get("input_lens") == [length]
+            and native_settings.get("output_len") == settings.get("output_len")
+            and 0 <= native_settings.get("logprob_atol", -1) <= 0.02
+            and runtime.get("git_commit") in data.get("native_source_commits", [])
+            and runtime.get("archived_source")
+            == small_native.get("runtime", {}).get("archived_source"),
+            "Large native control recipe/model/workload/archive differs",
+        )
+        markers.add(json.dumps(runtime["archived_source"], sort_keys=True))
+        args = SimpleNamespace(**native_settings)
+        args.output_dir = native_path.parent
+        require(
+            native_settings.get("output_dir") == str(args.output_dir),
+            "Large native output path differs",
+        )
+        groups = native.get("groups", [])
+        require(
+            len(groups) == 2
+            and {(g.get("variant"), g.get("eager")) for g in groups}
+            == {("cpu", True), ("cpu", False)},
+            "Large summary control requires CPU eager and Graph, not HBM",
+        )
+        need = tool.allocation_requirements(stage, args, batch)
+        normalized = []
+        artifacts.append(identity(native_path))
+        require(
+            native.get("cpu_ram_preflight")
+            and all(
+                item.get("status") == "passed" for item in native["cpu_ram_preflight"]
+            ),
+            "Large CPU RAM preflight missing or failed",
+        )
+        for group in groups:
+            require(
+                group.get("status") == "success"
+                and group.get("rounds") == need["rounds"],
+                "Missing complete long-short-long group",
+            )
+            tool.check_actual_capacity(group.get("capacity", []), need)
+            fresh, outputs = tool.verify_round_trace(group, args, batch)
+            require(
+                replay.equal(fresh, group.get("large_batch_trace_equivalence")),
+                "Large actual-batch trace/response hashes changed",
+            )
+            artifacts.extend(
+                [fresh["trace"]] + [r["response"] for r in fresh["rounds"]]
+            )
+            artifacts.append(
+                identity(args.output_dir / (group["id"] + "-server-info.json"))
+            )
+            comparison = tool.CORRECTNESS.COMPARE.compare(
+                normalized[0] if normalized else outputs, outputs, args.logprob_atol
+            )
+            reuse = tool.CORRECTNESS.COMPARE.compare(
+                [outputs[0]], [outputs[2]], args.logprob_atol
+            )
+            require(
+                replay.equal(comparison, group.get("comparison_to_cpu_hisparse"))
+                and replay.equal(reuse, group.get("slot_reuse_comparison")),
+                "Large summary token/logprob or slot reuse receipt changed",
+            )
+            normalized.append(outputs)
+            trace = [
+                json.loads(line)
+                for line in Path(fresh["trace"]["path"])
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            _summary_lifecycle(tool, args, group, trace, artifacts)
+        natives[arm], arguments[arm] = native, args
+    require(len(markers) == 1, "Large summary arms use different archived sources")
+    comparisons = [
+        item for item in control.get("comparisons", []) if item.get("batch") == batch
+    ]
+    require(
+        len(comparisons) == 1 and comparisons[0].get("status") == "passed",
+        "Missing passed large summary comparison",
+    )
+    actual = tool.compare_arms(
+        natives[tool.ARMS[0]],
+        natives[tool.ARMS[1]],
+        arguments[tool.ARMS[0]],
+        arguments[tool.ARMS[1]],
+        batch,
+    )
+    require(
+        replay.equal(actual, comparisons[0].get("groups")),
+        "Large summary comparison differs from raw replay",
+    )
+    return {
+        "status": "passed",
+        "batch": batch,
+        "input_len": length,
+        "modes": ["CPU eager", "CPU Graph"],
+        "summary": identity(path),
+        "summary_campaign_status": control["status"],
+        "precursor": identity(proof_path),
+        "artifacts": artifacts,
+        "scope": "Only this actual batch is admitted. CPU-DDR full KV: resident versus offloaded Quest summaries; no large-batch full-HBM proof. Graph evidence is actual server/capture configuration and full-batch forwards, not a per-forward replay flag.",
+    }
+
+
+def audit_large_capacity_controls(data, proof_path, proof, receipts, evidence):
+    if data.get("phase") != "capacity":
+        return []
+    covered = {
+        item["arm"]: item.get("hbm_context_batch_sizes", []) for item in receipts
+    }
+    required = set()
+    rows = [row for row in data.get("rows", []) if row.get("eligible") is True]
+    rows += data.get("observed_stable_capacity_points", [])
+    for row in rows:
+        arm, length = row["arm"], row["input_len"]
+        batch = row.get("actual_batch", row.get("actual_batch_size"))
+        if arm in (
+            "bounds-on-demand",
+            "bounds-prefetch",
+            "combined",
+            "combined-protected",
+        ):
+            small = max((b for n, b in covered.get(arm, []) if n == length), default=0)
+            if batch > small:
+                require(
+                    arm == "combined-protected",
+                    "No large CPU summary control for capacity arm " + arm,
+                )
+                required.add((batch, length))
+    accepted = []
+    for batch, length in sorted(required):
+        candidates = [
+            (path, record)
+            for path, record in evidence
+            if record.get("phase") == "large_batch_summary_equivalence"
+            and record.get("source_fingerprint") == data.get("source_fingerprint")
+            and record.get("settings", {}).get("input_len") == length
+            and batch in record.get("settings", {}).get("batch_sizes", [])
+        ]
+        require(
+            len(candidates) == 1,
+            f"Missing unambiguous CPU summary control for actual B={batch}, input={length}; small HBM proof does not cover this capacity sample",
+        )
+        path, record = candidates[0]
+        accepted.append(
+            verify_large_summary_control(
+                path, record, data, proof_path, proof, evidence, batch, length
+            )
         )
     return accepted
 
@@ -576,6 +885,9 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                 receipts = verify_model_receipt(
                     proof_path, proof, evidence, data, benchmark_models
                 )
+                controls = audit_large_capacity_controls(
+                    data, proof_path, proof, receipts, evidence
+                )
                 accepted.extend(dict(item, analysis=str(path)) for item in receipts)
                 bindings.append(
                     {
@@ -591,28 +903,46 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                             }
                         ),
                         "model_receipts": receipts,
+                        "large_batch_summary_controls": controls,
                     }
                 )
-            except (OSError, ValueError, KeyError, TypeError) as error:
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
                 failures.append(str(path) + ": " + str(error))
                 bindings.append(
-                    {"analysis": str(path), "status": "blocked", "reason": str(error)}
+                    {
+                        "analysis": str(path),
+                        "phase": data.get("phase"),
+                        "status": "blocked",
+                        "reason": str(error),
+                    }
                 )
+    passed = any(binding["status"] == "passed" for binding in bindings)
     return {
-        "status": "passed" if observed and not failures else "blocked",
-        "model_result_claims_allowed": observed and not failures,
+        "status": ("partial" if failures else "passed") if passed else "blocked",
+        "model_result_claims_allowed": passed and not diagnostic_only,
         "failures": failures,
         "accepted_model_receipts": accepted,
         "analysis_model_proof_bindings": bindings,
-        "scope": "Each analysis's raw campaign proof path/hash is independently bound. Same archived source/workload, CPU/HBM, modes, tokens/logprobs, reuse and lifecycle are rechecked. Actual measurement batches and correctness round sizes are separate; a small HBM precursor is not proof of a large full-HBM reference.",
+        "scope": "Each analysis is independently admitted or suppressed. Its raw campaign proof path/hash, archived source/workload, CPU/HBM, modes, tokens/logprobs, reuse and lifecycle are rechecked. Capacity summary-offload batches beyond the small HBM context/batch coverage require an exact actual-batch CPU resident/offloaded summary control. That control is not a large full-HBM reference.",
     }
 
 
 def display_analyses(analyses, audit):
-    if audit["model_result_claims_allowed"]:
+    if audit.get("status") == "internal_layout_fixture":
         return analyses
+    verdicts = {
+        (
+            str(binding["analysis"].get("path"))
+            if isinstance(binding.get("analysis"), dict)
+            else str(binding.get("analysis"))
+        ): binding["status"]
+        for binding in audit.get("analysis_model_proof_bindings", [])
+    }
     result = []
     for path, original in analyses:
+        if audit["model_result_claims_allowed"] and verdicts.get(str(path)) == "passed":
+            result.append((path, original))
+            continue
         data = copy.deepcopy(original)
         data["suppressed_model_samples"] = len(data.get("samples", []))
         for key in (
@@ -1104,6 +1434,12 @@ def render_report(
             "同源模型正确性、独立 HBM/CPU、模式、token/logprob、slot reuse 与 lifecycle 证据已审核。HBM 正确性覆盖的 round batch 大小与当前扫描实际 batch 应分别阅读；小批 HBM 前置证明不代表大批 full-HBM 对照。",
             "small",
         )
+        if report_audit["status"] == "partial":
+            add(
+                "部分分析缺证：只展示逐项通过审核的测量；被阻止的容量分析不会抹掉合格的延迟结果。"
+            )
+            for reason in report_audit.get("failures", []):
+                add("未通过的分析：" + reason, "small")
     comparisons = [
         row
         for _, data in analyses
@@ -1145,6 +1481,10 @@ def render_report(
         "带宽、重叠程度是不同证据。缺失 child memcpy 活动、受限 GPU counters 都不能被写成 CE 性能结论。"
     )
     add("Attention 机制身份：" + attention_identity["status"], "small")
+    add(
+        "SASS 中 UBLKCP／HMMA 等计数是静态指令条目，不能解释为每 decode step 的动态执行次数、搬运流量或有效带宽。",
+        "small",
+    )
     if attention_identity.get("unverified_reason"):
         add("缺证原因：" + attention_identity["unverified_reason"], "small")
 
@@ -1189,6 +1529,17 @@ def render_report(
         "因此保护结果只覆盖当前单卡 Attention 路径。表 1、表 2 与 A.2 借鉴论文的问题分解方式，"
         "不代表完整作者软件复现。"
     )
+    add(
+        "on-demand 与 lookahead 都使用 GPU 发起的 child-graph DMA，因此两者对照只隔离跨层 lookahead。"
+        "当前没有 CPU 提交 DMA 或 SM 搬运摘要的卸载对照臂，不能独立归因 GPU 发起相对 CPU 提交的收益，"
+        "也不构成论文 Figure 10 的复现。"
+    )
+    add(
+        "本次融合内核在每个 32-token tile 只激活一个 KV consumer warp，并使用 CTA 同步；"
+        "下一 tile 的 TMA 可与当前计算流水。它保留原 selected-token 数学顺序，"
+        "没有论文的 resident-first 遍历，也不是作者优化的 FlashMLA 调度。"
+        "性能改善或回退都只说明该 Qwen BF16 MMA＋TMA 实现与 H800 PCIe 的组合，不能据此否定论文机制。"
+    )
     table(
         ["指标", "本报告的定义与限制"],
         [
@@ -1223,6 +1574,11 @@ def render_report(
     add(
         "扣除 prefill 时间不能消除准入与排队差异。NoPD 用于排除分离 prefill/decode 通信路径；"
         "模型、固定 token workload、sampling、Graph 与 hot/backing 配置应随原始 manifest 一起审查。"
+    )
+    add(
+        "baseline 是冻结 006 版本关闭两机制的 HiSparse 对照，继承 01 的 Quest／hot-LRU／swap／FlashInfer 与 NoPD 语义。"
+        "新增 guard、idle ledger 与 kernel 参数可能引起重新编译，因此不宣称与历史 b61 基点的机器码或墙钟耗时逐字相同。"
+        "正式六臂使用同一冻结模型源码与统一实验工具；历史基点与实际运行 revision 分开记录。"
     )
     source = report_source(analyses, evidence)
     add(
@@ -1785,6 +2141,43 @@ def render_report(
     )
 
     section("7　正确性、机制证据与可复核边界")
+    bindings = report_audit.get("analysis_model_proof_bindings", [])
+    if bindings:
+        table(
+            ["分析", "审核", "范围／缺证"],
+            [
+                [
+                    (
+                        Path(binding["analysis"].get("path", "")).name
+                        if isinstance(binding.get("analysis"), dict)
+                        else Path(binding.get("analysis", "")).name
+                    ),
+                    binding["status"],
+                    binding.get("reason", "原始测量与模型证明逐项通过"),
+                ]
+                for binding in bindings
+            ],
+            [1.5, 0.65, 3.35],
+        )
+    controls = [
+        item
+        for binding in bindings
+        for item in binding.get("large_batch_summary_controls", [])
+    ]
+    if controls:
+        table(
+            ["输入／实际 B", "审核", "独立对照", "HBM 证明范围"],
+            [
+                [
+                    f"{item['input_len']:,} / B={item['batch']}",
+                    item["status"] + "；campaign=" + item["summary_campaign_status"],
+                    "CPU DDR 全量 KV；常驻／卸载摘要；eager＋Graph；三轮／reuse／lifecycle",
+                    "仅绑定的小批 HBM precursor；此大 batch 控制不是 full-HBM",
+                ]
+                for item in controls
+            ],
+            [1.1, 0.55, 2.5, 2.35],
+        )
     for path, record in evidence:
         arm = (
             record.get("stage", {}).get("xm_adaptation", {}).get("arm")
