@@ -589,6 +589,9 @@ class ServerArgs:
     # Hierarchical sparse attention
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
+    # Isolated correctness or same-cohort comparisons, not normal serving/capacity.
+    xm_correctness_cohort_barrier: bool = False
+    xm_correctness_cohort_timeout_seconds: float = 30.0
 
     # LMCache
     enable_lmcache: bool = False
@@ -5748,6 +5751,21 @@ class ServerArgs:
             "mpu_memory_reserve_bytes (per storage GPU, default 1073741824). "
             'Example: \'{"algorithm": "quest", "backing_store": "mpu", "mpu_device_ids": [1]}\'',
         )
+        parser.add_argument(
+            "--xm-correctness-cohort-barrier",
+            action="store_true",
+            help="Test-only Qwen/Quest mode: defer decode while queued prefill or "
+            "HiSparse staging remains, so an already submitted batch can start "
+            "decode together. Use only for isolated correctness or same-cohort "
+            "comparisons, not ordinary serving or capacity scans.",
+        )
+        parser.add_argument(
+            "--xm-correctness-cohort-timeout-seconds",
+            type=float,
+            default=ServerArgs.xm_correctness_cohort_timeout_seconds,
+            help="Fail the correctness server if the cohort barrier makes no "
+            "prefill progress for this many seconds; never release a partial cohort.",
+        )
 
         # LMCache
         parser.add_argument(
@@ -6827,6 +6845,8 @@ class ServerArgs:
                     f"Please use --kv-cache-dtype=bfloat16."
                 )
 
+        self._check_xm_correctness_cohort_barrier()
+
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
@@ -6873,6 +6893,48 @@ class ServerArgs:
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
+
+    def _check_xm_correctness_cohort_barrier(self):
+        """Keep the isolated cohort protocol out of ordinary serving paths."""
+        if not self.xm_correctness_cohort_barrier:
+            return
+        timeout = self.xm_correctness_cohort_timeout_seconds
+        if type(timeout) not in (int, float) or not 0 < timeout < float("inf"):
+            raise ValueError(
+                "--xm-correctness-cohort-timeout-seconds must be positive and finite"
+            )
+        for name in ("tp_size", "dp_size", "pp_size", "ep_size", "nnodes"):
+            if getattr(self, name) != 1:
+                raise ValueError(
+                    "XM correctness cohort barrier requires "
+                    f"--{name.replace('_', '-')} 1"
+                )
+        if (
+            self.disaggregation_mode != "null"
+            or not self.disable_overlap_schedule
+            or self.speculative_algorithm is not None
+            or self.dllm_algorithm is not None
+            or self.enable_mixed_chunk
+            or self.enable_two_batch_overlap
+            or self.enable_pdmux
+            or self.enable_dp_attention
+            or self.enable_prefill_delayer
+        ):
+            raise ValueError(
+                "XM correctness cohort barrier requires NoPD, a non-overlapped "
+                "scheduler, and no speculative/diffusion or mixed/parallel scheduling"
+            )
+        if self.device is None or not self.device.startswith("cuda"):
+            raise ValueError("XM correctness cohort barrier requires one CUDA GPU")
+        config = json.loads(self.hisparse_config or "{}")
+        if not isinstance(config, dict) or config.get("algorithm") != "quest":
+            raise ValueError("XM correctness cohort barrier requires Quest")
+        architectures = self.get_model_config().hf_config.architectures
+        if architectures != ["Qwen3MoeForCausalLM"]:
+            raise ValueError(
+                "XM correctness cohort barrier currently supports Qwen3MoeForCausalLM"
+            )
+        self._check_quest_server_args()
 
     def _check_mpu_server_args(self):
         """MPU simulation currently has one CUDA compute rank and MHA/GQA KV."""

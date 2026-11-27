@@ -73,6 +73,42 @@ def read(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def cohort_stage_enabled(stage):
+    options = stage.get("server_options", {})
+    require(isinstance(options, dict), "Malformed cohort stage server_options")
+    enabled = options.get("xm_correctness_cohort_barrier", False)
+    require(type(enabled) is bool, "Cohort barrier recipe must be a boolean")
+    return enabled
+
+
+def verify_cohort_command(stage, group, info):
+    """Bind the declared control to actual argv and observed server settings."""
+    enabled = cohort_stage_enabled(stage)
+    command = group.get("server_command", [])
+    require(isinstance(command, list), "Missing actual cohort server command")
+    flag = "--xm-correctness-cohort-barrier"
+    require(
+        command.count(flag) == int(enabled),
+        "Actual cohort server command differs from its declared recipe",
+    )
+    require(
+        info.get("xm_correctness_cohort_barrier", False) is enabled,
+        "Observed cohort barrier mode differs from the actual recipe",
+    )
+    if enabled:
+        timeout = stage["server_options"].get("xm_correctness_cohort_timeout_seconds")
+        number(timeout, positive=True)
+        timeout_flag = "--xm-correctness-cohort-timeout-seconds"
+        require(
+            command.count(timeout_flag) == 1
+            and command.index(timeout_flag) + 1 < len(command)
+            and command[command.index(timeout_flag) + 1] == str(timeout)
+            and info.get("xm_correctness_cohort_timeout_seconds") == timeout,
+            "Observed cohort timeout differs from its finite declared control",
+        )
+    return enabled
+
+
 def identity(path):
     path = Path(path).resolve(strict=True)
     digest = hashlib.sha256()
@@ -444,6 +480,7 @@ def replay_correctness_execution(native_path, native, *, required_batches=()):
         )
         info_path = root / f"{gid}-server-info.json"
         info = read(info_path)
+        cohort_barrier = verify_cohort_command(native.get("stage", {}), group, info)
         enabled = run.decode_graph_enabled(info)
         require(
             type(group.get("eager")) is bool and enabled is not group["eager"],
@@ -541,6 +578,13 @@ def replay_correctness_execution(native_path, native, *, required_batches=()):
                     for rid, count in zip(row["request_ids"], chunks):
                         prefill[rid] += count
                 elif row.get("forward_mode") == "decode":
+                    if cohort_barrier:
+                        require(
+                            set(row["request_ids"]) == members
+                            and prefill == dict(zip(ids, lengths))
+                            and len(set(decode.values())) == 1,
+                            "Controlled correctness decode released a partial or ordinal-misaligned cohort",
+                        )
                     for rid in row["request_ids"]:
                         decode[rid] += 1
                 else:
@@ -646,6 +690,7 @@ def replay_correctness_execution(native_path, native, *, required_batches=()):
                 "eager": group["eager"],
                 "actual_graph_enabled": enabled,
                 "captured_shapes": shapes,
+                "cohort_barrier": cohort_barrier,
                 "trace": identity(paths[0]),
                 "server_info": identity(info_path),
                 "rounds": round_receipts,
@@ -727,7 +772,14 @@ def verify_model_receipt(proof_path, proof, evidence, data, benchmark_models):
             .get("xm_cache_hbm_budget_bytes")
         )
         require(
-            case.get("stage") == report_tool("campaign").recipe(arm, budget=budget),
+            case.get("stage")
+            == report_tool("campaign").recipe(
+                arm,
+                budget=budget,
+                cohort_barrier=cohort_stage_enabled(case.get("stage", {})),
+            )
+            and cohort_stage_enabled(case.get("stage", {}))
+            is proof.get("settings", {}).get("xm_correctness_cohort_barrier", False),
             "Correctness case is not the exact declared arm recipe",
         )
         settings, runtime = native.get("settings", {}), native.get("runtime", {})
@@ -997,7 +1049,11 @@ def verify_large_summary_control(
         require(
             native.get("kind") == "correctness"
             and native.get("status") == "success"
-            and stage == case.get("stage") == tool.CAMPAIGN.recipe(arm)
+            and stage
+            == case.get("stage")
+            == tool.CAMPAIGN.recipe(arm, cohort_barrier=cohort_stage_enabled(stage))
+            and cohort_stage_enabled(stage)
+            is cohort_stage_enabled(small_case.get("stage", {}))
             and native_settings == case.get("settings")
             and native_settings.get("model") == settings["model"]
             and native_settings.get("workload") == settings.get("workload")
@@ -1042,6 +1098,11 @@ def verify_large_summary_control(
                 "Missing complete long-short-long group",
             )
             tool.check_actual_capacity(group.get("capacity", []), need)
+            verify_cohort_command(
+                stage,
+                group,
+                read(args.output_dir / f"{group['id']}-server-info.json"),
+            )
             fresh, outputs = tool.verify_round_trace(group, args, batch)
             require(
                 replay.equal(fresh, group.get("large_batch_trace_equivalence")),
@@ -1181,6 +1242,18 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                     "Missing native source commit for measured results",
                 )
                 require(data.get("artifacts"), "Missing raw replay artifact identities")
+                campaign = read(data["artifacts"][0]["path"])
+                require(
+                    campaign.get("phase") == data["phase"], "Raw campaign phase differs"
+                )
+                controlled = campaign.get("settings", {}).get(
+                    "xm_correctness_cohort_barrier", False
+                )
+                require(type(controlled) is bool, "Invalid measured cohort mode")
+                require(
+                    not controlled or data["phase"] == "performance",
+                    "Capacity must retain ordinary admission without a cohort barrier",
+                )
                 benchmark_models = set()
                 for artifact in data["artifacts"]:
                     actual = identity(artifact["path"])
@@ -1193,6 +1266,20 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                         raw = read(artifact["path"])
                         if raw.get("kind") == "benchmark":
                             benchmark_models.add(raw.get("settings", {}).get("model"))
+                            stage = raw.get("stage", {})
+                            require(
+                                cohort_stage_enabled(stage) is controlled,
+                                "Measured cohort mode differs from its bound campaign",
+                            )
+                            for group in raw.get("groups", []):
+                                verify_cohort_command(
+                                    stage,
+                                    group,
+                                    read(
+                                        Path(artifact["path"]).parent
+                                        / f"{group['id']}-server-info.json"
+                                    ),
+                                )
                             if data["phase"] == "capacity":
                                 require(
                                     raw.get("stage", {})
@@ -1205,10 +1292,6 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                                     and data["cache_hbm_budget_bytes"] > 0,
                                     "Capacity report has no same configured budget in its actual native stage",
                                 )
-                campaign = read(data["artifacts"][0]["path"])
-                require(
-                    campaign.get("phase") == data["phase"], "Raw campaign phase differs"
-                )
                 gate = campaign.get("correctness_gate", {})
                 require(
                     re.fullmatch("[0-9a-f]{64}", gate.get("sha256", ""))
@@ -1244,6 +1327,12 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                     "Missing or ambiguous proof bound to this analysis campaign",
                 )
                 proof_path, proof = candidates[0]
+                require(
+                    not controlled
+                    or proof.get("settings", {}).get("xm_correctness_cohort_barrier")
+                    is True,
+                    "Controlled same-cohort timing lacks a bound cohort model proof",
+                )
                 replay_module = report_tool("analyze")
                 replay = replay_module.analyze_campaign(data["artifacts"][0]["path"])
                 for key in (
@@ -1274,6 +1363,12 @@ def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
                         "original_gate": gate,
                         "proof": identity(proof_path),
                         "status": "passed",
+                        "cohort_barrier": controlled,
+                        "ttft_scope": (
+                            "Controlled cohort TTFT includes prefill/staging barrier; not ordinary NoPD serving TTFT."
+                            if controlled
+                            else "Ordinary NoPD admission without cohort barrier."
+                        ),
                         "actual_measurement_batches": sorted(
                             {
                                 row.get("actual_batch")
@@ -2021,8 +2116,18 @@ def render_report(
         "扣除 prefill 时间不能消除准入与排队差异。NoPD 用于排除分离 prefill/decode 通信路径；"
         "模型、固定 token workload、sampling、Graph 与 hot/backing 配置应随原始 manifest 一起审查。"
     )
+    if any(
+        binding.get("status") == "passed" and binding.get("cohort_barrier") is True
+        for binding in report_audit.get("analysis_model_proof_bindings", [])
+    ):
+        add(
+            "本部分固定 batch 性能启用了同 cohort 控制：全部 pending prefill 与 HiSparse staging 就绪后统一放行 decode，"
+            "所有软件臂使用相同设置，并逐份核对实际 server argv、启用状态和超时。"
+            "其 TTFT 是包含 cohort 前 prefill/staging 屏障的控制值，不能解释为普通 NoPD 服务的 TTFT 收益；"
+            "稳定 decode 间隔和 TPOT 仍分别按原始 scheduler／HTTP 定义统计。容量扫描关闭该屏障，保留普通准入行为。"
+        )
     add(
-        "baseline 是冻结 006 版本关闭两机制的 HiSparse 对照，继承 01 的 Quest／hot-LRU／swap／FlashInfer 与 NoPD 语义。"
+        "baseline 是本部分同一冻结模型源码关闭两机制的 HiSparse 对照，继承 01 的 Quest／hot-LRU／swap／FlashInfer 与 NoPD 语义。"
         "新增 guard、idle ledger 与 kernel 参数可能引起重新编译，因此不宣称与历史 b61 基点的机器码或墙钟耗时逐字相同。"
         "正式六臂使用同一冻结模型源码与统一实验工具；历史基点与实际运行 revision 分开记录。"
     )

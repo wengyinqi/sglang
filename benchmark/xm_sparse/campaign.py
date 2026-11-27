@@ -16,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "benchmark" / "mpu_stages"
 BASE_COMMIT = "b61d8c7f1529ff1971026ae68dcc42af80e7a592"
+COHORT_TIMEOUT_SECONDS = 30.0
 ARMS = {
     "baseline": (False, False, "none", False),
     "fused": (True, False, "none", False),
@@ -79,25 +80,62 @@ def correctness_gate(args, manifest):
         "disable_cuda_graph"
     ):
         raise ValueError("CUDA Graph mode has not passed model correctness")
+    if accepted.get("settings", {}).get("xm_correctness_cohort_barrier") is not True:
+        raise ValueError(
+            "Execution requires the bound cohort-ready correctness protocol"
+        )
     by_arm = {case["arm"]: case for case in accepted.get("cases", [])}
     for arm in args.arms:
         case = by_arm.get(arm)
         if not case or case.get("status") != "success":
             raise ValueError(f"No passed model correctness for {arm}")
+        if case.get("stage") != recipe(arm, cohort_barrier=True):
+            raise ValueError("Correctness does not use the exact cohort control recipe")
         raw_path = Path(case["stage_path"]).parent / "evidence" / "manifest.json"
         native = json.loads(raw_path.read_text(encoding="utf-8"))
         if native.get("status") != "success" or not native.get("groups"):
             raise ValueError("Missing successful raw model correctness manifest")
+        if native.get("stage") != case["stage"]:
+            raise ValueError(
+                "Native correctness cohort recipe differs from its campaign"
+            )
         if any(g.get("status") != "success" for g in native["groups"]):
             raise ValueError("Incomplete native model correctness groups")
         if not any(g["variant"] == "hbm" for g in native["groups"]):
             raise ValueError("Independent HBM Quest correctness comparison is missing")
+        for group in native["groups"]:
+            command = group.get("server_command", [])
+            timeout_flag = "--xm-correctness-cohort-timeout-seconds"
+            if (
+                command.count("--xm-correctness-cohort-barrier") != 1
+                or command.count(timeout_flag) != 1
+                or command.index(timeout_flag) + 1 >= len(command)
+                or command[command.index(timeout_flag) + 1]
+                != str(COHORT_TIMEOUT_SECONDS)
+            ):
+                raise ValueError(
+                    "Native correctness command differs from its cohort barrier/timeout recipe"
+                )
+            info_path = raw_path.parent / f"{group['id']}-server-info.json"
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            if (
+                info.get("xm_correctness_cohort_barrier") is not True
+                or info.get("xm_correctness_cohort_timeout_seconds")
+                != COHORT_TIMEOUT_SECONDS
+            ):
+                raise ValueError(
+                    "Observed native cohort mode/timeout differs from its recipe"
+                )
     return {"path": str(proof.resolve()), **identity(proof)}
 
 
-def recipe(arm, *, budget=None):
+def recipe(arm, *, budget=None, cohort_barrier=False):
     if arm not in ARMS:
         raise ValueError("Unknown XM-Sparse adaptation arm")
+    if type(cohort_barrier) is not bool:
+        raise ValueError("Cohort recipe selection must be a boolean")
+    if cohort_barrier and budget is not None:
+        raise ValueError("Cohort control is separate from capacity timing")
     stage = json.loads((TOOLS / "stage.json").read_text(encoding="utf-8"))
     stage = copy.deepcopy(stage)
     fused, offload, mode, protect = ARMS[arm]
@@ -121,6 +159,18 @@ def recipe(arm, *, budget=None):
         "backing": "CPU pinned DDR; one H800 PCIe; NoPD",
         "budget_scope": "KV and named Quest/HiSparse cache metadata; weights, attention workspace and graph pools reported separately",
     }
+    if cohort_barrier:
+        stage["server_options"] = {
+            "xm_correctness_cohort_barrier": True,
+            "xm_correctness_cohort_timeout_seconds": COHORT_TIMEOUT_SECONDS,
+        }
+        stage["xm_adaptation"]["cohort_protocol"] = {
+            "id": "cohort_ready_v1",
+            "scope": "Correctness and controlled same-cohort timing: finish pending prefill and HiSparse staging before decode. TTFT includes this cohort barrier and is not ordinary NoPD serving TTFT; capacity keeps the barrier off.",
+            "timeout_seconds": COHORT_TIMEOUT_SECONDS,
+            "greedy": "all output token IDs exact",
+            "maximum_logprob_atol": 0.02,
+        }
     return stage
 
 
@@ -150,6 +200,15 @@ def parse(argv=None):
     args = p.parse_args(argv)
     if args.num_prompts is not None and args.num_prompts < max(args.concurrencies):
         p.error("num-prompts must cover every requested client concurrency")
+    if args.phase == "performance" and max(args.concurrencies) > 1:
+        if len(args.concurrencies) != 1:
+            p.error(
+                "Controlled performance requires one client concurrency per campaign"
+            )
+        concurrency = args.concurrencies[0]
+        if args.num_prompts is not None and args.num_prompts != concurrency:
+            p.error("Controlled performance requires exactly one cohort: num-prompts=C")
+        args.num_prompts = concurrency
     if (
         min(
             args.input_lens
@@ -175,9 +234,47 @@ def parse(argv=None):
     return args
 
 
+def correctness_allocation_requirements(stage, args):
+    page = stage["page_size"]
+    hot = stage["variants"]["cpu"]["hisparse_config"]["device_buffer_size"]
+    short = [page + 1, min(hot + 1, max(args.input_lens))]
+    rounds = [args.input_lens, short, args.input_lens]
+    peak = max(
+        sum(((n + args.output_len + page - 1) // page) * page for n in lengths)
+        for lengths in rounds
+    )
+    maximum_batch = max(map(len, rounds))
+    # This explicit conservative allowance is not the allocator's padding page.
+    # For B4/page64 it is 1024 slots, kept separate from logical full KV.
+    allowance = 4 * maximum_batch * page
+    return {
+        "rounds": rounds,
+        "full_hbm_paged_slots_required": peak,
+        "maximum_round_batch": maximum_batch,
+        "page_size": page,
+        "cohort_admission_allowance_slots": allowance,
+        "allowance_formula": "4 * maximum_round_batch * page_size",
+        "minimum_requested_physical_slots": peak + allowance,
+        "requested_physical_slots": args.max_total_tokens,
+        "scope": "Correctness only. Conservative admission allowance is explicit; actual complete cohort, allocator capacity and tokens/logprobs remain runtime evidence gates.",
+    }
+
+
 def make_plan(args):
     root = args.output_dir.resolve()
     cases = []
+    cohort_barrier = args.phase == "correctness" or (
+        args.phase == "performance" and max(args.concurrencies) > 1
+    )
+    allocation = None
+    if args.phase == "correctness":
+        allocation = correctness_allocation_requirements(recipe(args.arms[0]), args)
+        if args.max_total_tokens < allocation["minimum_requested_physical_slots"]:
+            raise ValueError(
+                "Correctness cohort requires at least "
+                f"{allocation['minimum_requested_physical_slots']} requested token slots "
+                "including its explicit admission allowance; no budget was changed"
+            )
     # Capacity points change the maximum admitted batch and report actual
     # stable windows. A client concurrency is never treated as an actual batch.
     points = args.concurrencies if args.phase == "capacity" else [None]
@@ -196,7 +293,11 @@ def make_plan(args):
             name += f"-r{repeat}"
         case_root = root / name
         stage_path = case_root / "stage.json"
-        stage = recipe(arm, budget=args.cache_budget_bytes)
+        stage = recipe(
+            arm,
+            budget=args.cache_budget_bytes,
+            cohort_barrier=cohort_barrier,
+        )
         command = [
             sys.executable,
             str(
@@ -268,9 +369,9 @@ def make_plan(args):
         "phase": args.phase,
         "baseline_commit": BASE_COMMIT,
         "workload": str(args.workload.resolve()),
-        "workload_identity": identity(args.workload)
-        if args.workload.is_file()
-        else None,
+        "workload_identity": (
+            identity(args.workload) if args.workload.is_file() else None
+        ),
         "source_fingerprint": source_fingerprint(),
         "settings": {
             "model": args.model,
@@ -279,6 +380,17 @@ def make_plan(args):
             "max_total_tokens": args.max_total_tokens,
             "capacity_ratio": args.capacity_ratio,
             "cache_budget_bytes": args.cache_budget_bytes,
+            "num_prompts": args.num_prompts,
+            "xm_correctness_cohort_barrier": cohort_barrier,
+            "xm_correctness_cohort_timeout_seconds": (
+                COHORT_TIMEOUT_SECONDS if cohort_barrier else None
+            ),
+            "ttft_scope": (
+                "Controlled cohort TTFT includes a prefill/staging barrier; not ordinary NoPD serving TTFT."
+                if cohort_barrier
+                else "Ordinary NoPD admission without a cohort barrier."
+            ),
+            "correctness_allocation_requirements": allocation,
         },
         "cases": cases,
         "evidence_boundary": "Real H800 Qwen adaptation. Fixed-batch stable decode and budget capacity are separate; subtracting prefill does not remove admission or queue effects.",

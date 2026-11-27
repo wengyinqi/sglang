@@ -40,6 +40,10 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def control_recipe(arm):
+    return CAMPAIGN.recipe(arm, cohort_barrier=True)
+
+
 def allocation_requirements(stage, args, batch):
     config = RUN.STAGE.config_for(stage, args, "cpu", args.capacity_ratios[0])
     page = stage["page_size"]
@@ -91,7 +95,7 @@ def allocation_requirements(stage, args, batch):
 
 def make_groups(stage, args, batch):
     require(
-        stage == CAMPAIGN.recipe(stage["xm_adaptation"]["arm"]),
+        stage == control_recipe(stage["xm_adaptation"]["arm"]),
         "Use the exact CPU summary control recipe",
     )
     require(
@@ -295,7 +299,7 @@ def small_hbm_gate(control):
     for arm in ARMS:
         case = next(case for case in accepted["cases"] if case["arm"] == arm)
         require(
-            case.get("returncode") == 0 and case.get("stage") == CAMPAIGN.recipe(arm),
+            case.get("returncode") == 0 and case.get("stage") == control_recipe(arm),
             "Missing actual successful small-batch arm recipe",
         )
         path = Path(case["stage_path"]).parent / "evidence/manifest.json"
@@ -369,6 +373,25 @@ def verify_round_trace(group, args, batch):
             encoding="utf-8"
         )
     )
+    cohort_flag = "--xm-correctness-cohort-barrier"
+    command = group.get("server_command", [])
+    cohort_barrier = cohort_flag in command
+    require(
+        command.count(cohort_flag) == int(cohort_barrier)
+        and server_info.get("xm_correctness_cohort_barrier", False) is cohort_barrier,
+        "Observed cohort barrier differs from its native control command",
+    )
+    if cohort_barrier:
+        timeout_flag = "--xm-correctness-cohort-timeout-seconds"
+        require(
+            command.count(timeout_flag) == 1
+            and command.index(timeout_flag) + 1 < len(command)
+            and command[command.index(timeout_flag) + 1]
+            == str(CAMPAIGN.COHORT_TIMEOUT_SECONDS)
+            and server_info.get("xm_correctness_cohort_timeout_seconds")
+            == CAMPAIGN.COHORT_TIMEOUT_SECONDS,
+            "Observed cohort timeout differs from its declared summary control",
+        )
     require(
         RUN.decode_graph_enabled(server_info) is not group["eager"],
         "Observed server Graph mode differs from the control",
@@ -431,6 +454,13 @@ def verify_round_trace(group, args, batch):
                 for rid, count in zip(row["request_ids"], chunks):
                     prefill[rid] += count
             elif row["forward_mode"] == "decode":
+                if cohort_barrier:
+                    require(
+                        set(row["request_ids"]) == members
+                        and prefill == dict(zip(ids, lengths))
+                        and len(set(decode.values())) == 1,
+                        "Controlled summary decode released a partial or ordinal-misaligned cohort",
+                    )
                 for rid in row["request_ids"]:
                     decode[rid] += 1
             else:
@@ -541,9 +571,16 @@ def execute_native(stage, args, groups, batch):
 
 def compare_arms(left, right, left_args, right_args, batch):
     result = []
+    cohort_barrier = (
+        left["stage"]
+        .get("server_options", {})
+        .get("xm_correctness_cohort_barrier", False)
+    )
     require(
-        left["stage"] == CAMPAIGN.recipe("fused")
-        and right["stage"] == CAMPAIGN.recipe("combined-protected"),
+        type(cohort_barrier) is bool
+        and left["stage"] == CAMPAIGN.recipe("fused", cohort_barrier=cohort_barrier)
+        and right["stage"]
+        == CAMPAIGN.recipe("combined-protected", cohort_barrier=cohort_barrier),
         "Different summary comparison recipes",
     )
     require(
@@ -559,6 +596,14 @@ def compare_arms(left, right, left_args, right_args, batch):
         require(
             a["eager"] == b["eager"] and a["rounds"] == b["rounds"],
             "Different actual round/mode controls",
+        )
+        require(
+            all(
+                group.get("server_command", []).count("--xm-correctness-cohort-barrier")
+                == int(cohort_barrier)
+                for group in (a, b)
+            ),
+            "Actual resident/offloaded cohort commands differ from their recipes",
         )
         require(
             len(a.get("capacity", [])) == len(b.get("capacity", [])) == 1
@@ -626,12 +671,14 @@ def parse(argv=None):
     if len(set(control.batch_sizes)) != len(control.batch_sizes):
         parser.error("Batch controls must not repeat an evidence directory")
     control.output_dir = control.output_dir.resolve()
+    control.xm_correctness_cohort_barrier = True
+    control.xm_correctness_cohort_timeout_seconds = CAMPAIGN.COHORT_TIMEOUT_SECONDS
     return control
 
 
 def native_settings(control, batch, arm):
     case = control.output_dir / f"b{batch}-{arm}"
-    stage = CAMPAIGN.recipe(arm)
+    stage = control_recipe(arm)
     stage_path = case / "stage.json"
     CAMPAIGN.write(stage_path, stage)
     stage, args = RUN.STAGE.parse_args(

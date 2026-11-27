@@ -387,6 +387,7 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self._xm_cohort_wait_started: Optional[float] = None
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -2342,6 +2343,53 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _xm_wait_for_correctness_cohort(self, prefill_batch) -> bool:
+        """Hold decode while an isolated, already submitted cohort is pending.
+
+        Prefill and staging collection continue normally. This does not wait
+        for max_running_requests: short rounds and one-request lifecycle probes
+        release as soon as their own queues drain. An unadmittable cohort fails
+        after a bounded no-prefill interval instead of running partially.
+        """
+        if not self.server_args.xm_correctness_cohort_barrier:
+            return False
+        coordinator = getattr(self, "hisparse_coordinator", None)
+        staging = coordinator is not None and coordinator.has_ongoing_staging()
+        pending = bool(self.waiting_queue) or self.chunked_req is not None or staging
+        if prefill_batch is not None or not pending:
+            if self._xm_cohort_wait_started is not None:
+                logger.info(
+                    "XM correctness cohort barrier resumed: prefill_progress=%s, "
+                    "pending=%s, running=%s",
+                    prefill_batch is not None,
+                    pending,
+                    len(self.running_batch.reqs),
+                )
+            self._xm_cohort_wait_started = None
+            return False
+        now = time.monotonic()
+        if self._xm_cohort_wait_started is None:
+            self._xm_cohort_wait_started = now
+            logger.info(
+                "XM correctness cohort barrier waiting: queued=%s, chunked=%s, "
+                "staging=%s, running=%s",
+                len(self.waiting_queue),
+                self.chunked_req is not None,
+                staging,
+                len(self.running_batch.reqs),
+            )
+        elapsed = now - self._xm_cohort_wait_started
+        if elapsed >= self.server_args.xm_correctness_cohort_timeout_seconds:
+            raise RuntimeError(
+                "XM correctness cohort barrier timed out without prefill progress; "
+                f"elapsed={elapsed:.3f}s, waiting_rids="
+                f"{[req.rid for req in self.waiting_queue]}, "
+                f"chunked={self.chunked_req is not None}, staging={staging}, "
+                f"running_rids={[req.rid for req in self.running_batch.reqs]}. "
+                "The cohort was not released for partial decode."
+            )
+        return True
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
@@ -2431,12 +2479,19 @@ class Scheduler(
 
         if new_batch is not None:
             # Run prefill first if possible
+            if self.server_args.xm_correctness_cohort_barrier:
+                self._xm_wait_for_correctness_cohort(new_batch)
             ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
+            cohort_wait = (
+                self.server_args.xm_correctness_cohort_barrier
+                and self._xm_wait_for_correctness_cohort(None)
+            )
             if (
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
+                and not cohort_wait
             ):
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None

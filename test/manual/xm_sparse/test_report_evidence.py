@@ -275,6 +275,95 @@ def test_complete_same_source_model_gate_allows_measurements(contracts):
     assert "no per-forward" in replay["graph_scope"]
 
 
+@pytest.mark.parametrize("mutation", [None, "argv", "mode", "timeout", "duplicate"])
+def test_declared_cohort_control_requires_actual_argv_and_observed_settings(mutation):
+    stage = REPORT.report_tool("campaign").recipe("baseline", cohort_barrier=True)
+    group = {
+        "server_command": [
+            "--xm-correctness-cohort-barrier",
+            "--xm-correctness-cohort-timeout-seconds",
+            "30.0",
+        ]
+    }
+    info = {
+        "xm_correctness_cohort_barrier": True,
+        "xm_correctness_cohort_timeout_seconds": 30.0,
+    }
+    if mutation == "argv":
+        group["server_command"].remove("--xm-correctness-cohort-barrier")
+    elif mutation == "mode":
+        info["xm_correctness_cohort_barrier"] = False
+    elif mutation == "timeout":
+        info["xm_correctness_cohort_timeout_seconds"] = 60.0
+    elif mutation == "duplicate":
+        group["server_command"].append("--xm-correctness-cohort-barrier")
+    if mutation:
+        with pytest.raises(ValueError, match="cohort"):
+            REPORT.verify_cohort_command(stage, group, info)
+    else:
+        assert REPORT.verify_cohort_command(stage, group, info) is True
+
+
+def test_legacy_recipe_cannot_be_relabelled_as_a_new_cohort_control():
+    stage = REPORT.report_tool("campaign").recipe("baseline")
+    assert REPORT.verify_cohort_command(stage, {}, {}) is False
+    with pytest.raises(ValueError, match="cohort"):
+        REPORT.verify_cohort_command(stage, {}, {"xm_correctness_cohort_barrier": True})
+
+
+@pytest.mark.parametrize("mutation", [None, "partial", "prefill_pending"])
+def test_new_protocol_replays_complete_cohort_before_all_decode_tokens(
+    contracts, tmp_path, mutation
+):
+    native = copy.deepcopy(contracts.native)
+    native["stage"] = REPORT.report_tool("campaign").recipe(
+        "fused", cohort_barrier=True
+    )
+    native["settings"]["input_lens"] = [32768]
+    root = tmp_path / "new-cohort/evidence"
+    populate_raw_correctness(root, native, long_round=[32768] * 4)
+    for group in native["groups"]:
+        group["server_command"] = [
+            "--xm-correctness-cohort-barrier",
+            "--xm-correctness-cohort-timeout-seconds",
+            "30.0",
+        ]
+        info_path = root / f"{group['id']}-server-info.json"
+        info = REPORT.read(info_path)
+        info.update(
+            xm_correctness_cohort_barrier=True,
+            xm_correctness_cohort_timeout_seconds=30.0,
+        )
+        write(info_path, info)
+    if mutation:
+        trace_path = Path(native["groups"][0]["trace_dir"]) / "forward.jsonl"
+        rows = [json.loads(line) for line in trace_path.read_text().splitlines()]
+        first_decode = next(
+            i for i, row in enumerate(rows) if row.get("forward_mode") == "decode"
+        )
+        if mutation == "partial":
+            rows[first_decode]["request_ids"].pop()
+        else:
+            row = rows.pop(first_decode)
+            rows.insert(first_decode - 1, row)
+            for sequence, forward in enumerate(
+                r for r in rows if r["type"] == "forward"
+            ):
+                forward["sequence"] = sequence
+        trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    if mutation:
+        with pytest.raises(ValueError, match="partial or ordinal-misaligned cohort"):
+            REPORT.replay_correctness_execution(root / "manifest.json", native)
+    else:
+        receipt = REPORT.replay_correctness_execution(
+            root / "manifest.json",
+            native,
+            required_batches=[(32768, 4, False), (32768, 4, True)],
+        )
+        assert receipt["status"] == "passed"
+        assert all(group["cohort_barrier"] is True for group in receipt["groups"])
+
+
 def test_requested_mixed_batch_cannot_prove_same_context_main_performance(contracts):
     contracts.data["rows"][0]["actual_batch"] = 2
     contracts.replay.update(copy.deepcopy(contracts.data))
@@ -1502,6 +1591,14 @@ def test_rendered_metric_numa_and_parent_graph_scope_preserve_evidence_boundarie
             "status": "blocked",
             "model_result_claims_allowed": False,
             "failures": [],
+            "analysis_model_proof_bindings": [
+                {
+                    "analysis": "synthetic-cohort-layout.json",
+                    "status": "passed",
+                    "cohort_barrier": True,
+                    "reason": "Synthetic layout fixture; no model claim",
+                }
+            ],
         },
     )
     text = "\n".join(paragraphs)
@@ -1520,3 +1617,6 @@ def test_rendered_metric_numa_and_parent_graph_scope_preserve_evidence_boundarie
     assert "child 图、memcpy、图外 CPU／采样／HTTP 均未覆盖" in text
     assert "不是关键路径或 CE 耗时" in text
     assert "这些次数不是 SASS 静态指令计数" in text
+    assert "TTFT 是包含 cohort 前 prefill/staging 屏障的控制值" in text
+    assert "不能解释为普通 NoPD 服务的 TTFT 收益" in text
+    assert "容量扫描关闭该屏障" in text

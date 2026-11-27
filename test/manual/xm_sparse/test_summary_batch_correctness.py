@@ -41,7 +41,7 @@ def test_cold_full_prefill_hot_and_cpu_context_are_separate_budgets(
     monkeypatch.setattr(
         TOOL.RUN.STAGE, "server_command", lambda *a, **k: ["portable-plan"]
     )
-    stage, args = TOOL.CAMPAIGN.recipe("fused"), settings(tmp_path)
+    stage, args = TOOL.control_recipe("fused"), settings(tmp_path)
     groups = TOOL.make_groups(stage, args, 12)
     need = groups[0]["large_batch_allocation_requirements"]
     assert need["historical_backing_slots_required"] == 394752
@@ -63,7 +63,7 @@ def test_chunk_only_or_missing_new_hot_coexistence_budget_is_rejected(
     args = settings(tmp_path)
     args.max_total_tokens = slots
     with pytest.raises(ValueError, match="full-prefill plus hot"):
-        TOOL.make_groups(TOOL.CAMPAIGN.recipe("fused"), args, 12)
+        TOOL.make_groups(TOOL.control_recipe("fused"), args, 12)
 
 
 @pytest.mark.parametrize("constraint", ["gpu", "cpu", "prefill"])
@@ -77,12 +77,12 @@ def test_requested_budgets_are_separately_guarded(tmp_path, monkeypatch, constra
     else:
         args.prefill_max_requests = 2
     with pytest.raises(ValueError):
-        TOOL.make_groups(TOOL.CAMPAIGN.recipe("fused"), args, 12)
+        TOOL.make_groups(TOOL.control_recipe("fused"), args, 12)
 
 
 def test_actual_backing_padding_cannot_count_as_usable_context(tmp_path):
     need = TOOL.allocation_requirements(
-        TOOL.CAMPAIGN.recipe("fused"), settings(tmp_path), 12
+        TOOL.control_recipe("fused"), settings(tmp_path), 12
     )
     capacity = {
         "backing_store": "cpu",
@@ -105,7 +105,7 @@ def test_actual_backing_padding_cannot_count_as_usable_context(tmp_path):
 @pytest.mark.parametrize("mutation", ["ratio", "cpu_bytes", "gpu_bytes"])
 def test_actual_full_kv_allocation_shape_is_independently_checked(tmp_path, mutation):
     need = TOOL.allocation_requirements(
-        TOOL.CAMPAIGN.recipe("fused"), settings(tmp_path), 12
+        TOOL.control_recipe("fused"), settings(tmp_path), 12
     )
     capacity = {
         "backing_store": "cpu",
@@ -130,7 +130,7 @@ def test_actual_full_kv_allocation_shape_is_independently_checked(tmp_path, muta
 def completed_rounds(tmp_path):
     batch, length = 4, 5000
     args = settings(tmp_path, batch=batch, length=length)
-    stage = TOOL.CAMPAIGN.recipe("fused")
+    stage = TOOL.control_recipe("fused")
     need = TOOL.allocation_requirements(stage, args, batch)
     group = {
         "id": "cpu-eager-ratio16",
@@ -140,6 +140,11 @@ def completed_rounds(tmp_path):
         "eager": True,
         "rounds": need["rounds"],
         "trace_dir": str(tmp_path / "trace"),
+        "server_command": [
+            "--xm-correctness-cohort-barrier",
+            "--xm-correctness-cohort-timeout-seconds",
+            "30.0",
+        ],
         "capacity": [
             {
                 "physical_compute_slots": 98304,
@@ -215,6 +220,8 @@ def completed_rounds(tmp_path):
         tmp_path / f"{group['id']}-server-info.json",
         {
             "disable_cuda_graph": True,
+            "xm_correctness_cohort_barrier": True,
+            "xm_correctness_cohort_timeout_seconds": 30.0,
             "internal_states": [
                 {"disable_cuda_graph": True, "cuda_graph_bs": [1, 2, 4]}
             ],
@@ -234,6 +241,24 @@ def test_actual_batch_comes_from_complete_round_membership(completed_rounds):
         79,
     ]
     assert len(outputs) == 3
+
+
+@pytest.mark.parametrize("mutation", ["argv", "observed_mode", "timeout"])
+def test_cohort_command_and_observed_settings_are_hash_bound(
+    completed_rounds, mutation
+):
+    group, args, batch, _, _ = completed_rounds
+    path = args.output_dir / f"{group['id']}-server-info.json"
+    info = json.loads(path.read_text())
+    if mutation == "argv":
+        group["server_command"].remove("--xm-correctness-cohort-barrier")
+    elif mutation == "observed_mode":
+        info["xm_correctness_cohort_barrier"] = False
+    else:
+        info["xm_correctness_cohort_timeout_seconds"] = 60.0
+    TOOL.CAMPAIGN.write(path, info)
+    with pytest.raises(ValueError, match="cohort"):
+        TOOL.verify_round_trace(group, args, batch)
 
 
 @pytest.mark.parametrize(
@@ -268,6 +293,8 @@ def test_failed_raw_coverage_is_never_reported_as_actual_batch(
             args.output_dir / f"{group['id']}-server-info.json",
             {
                 "disable_cuda_graph": False,
+                "xm_correctness_cohort_barrier": True,
+                "xm_correctness_cohort_timeout_seconds": 30.0,
                 "internal_states": [
                     {"disable_cuda_graph": False, "cuda_graph_bs": [1, 2]}
                 ],
@@ -317,7 +344,7 @@ def test_complete_responses_at_partial_batches_do_not_prove_requested_batch(
         else:
             partial.append(row)
     trace.write_text("".join(json.dumps(row) + "\n" for row in partial))
-    with pytest.raises(ValueError, match="never observed"):
+    with pytest.raises(ValueError, match="partial or ordinal-misaligned cohort"):
         TOOL.verify_round_trace(group, args, batch)
 
 
@@ -352,13 +379,15 @@ def test_cross_arm_comparison_requires_same_inputs_kv_and_tokens(
                     destination / f"{group['id']}-server-info.json",
                     {
                         "disable_cuda_graph": False,
+                        "xm_correctness_cohort_barrier": True,
+                        "xm_correctness_cohort_timeout_seconds": 30.0,
                         "internal_states": [
                             {"disable_cuda_graph": False, "cuda_graph_bs": [1, 2, 4]}
                         ],
                     },
                 )
             groups.append(group)
-        manifests.append({"stage": TOOL.CAMPAIGN.recipe(arm), "groups": groups})
+        manifests.append({"stage": TOOL.control_recipe(arm), "groups": groups})
         arguments.append(SimpleNamespace(**(vars(args) | {"output_dir": destination})))
     if mutation == "kv":
         manifests[1]["groups"][0]["capacity"][0]["compute_kv_bytes"] += 1
@@ -421,7 +450,7 @@ def test_cli_default_retains_complete_cold_prefill_capacity(tmp_path):
     args.capacity_ratios = [control.capacity_ratio]
     args.cpu_capacity_ratio = control.capacity_ratio
     args.output_len = 512
-    need = TOOL.allocation_requirements(TOOL.CAMPAIGN.recipe("fused"), args, 12)
+    need = TOOL.allocation_requirements(TOOL.control_recipe("fused"), args, 12)
     assert need["historical_backing_slots_required"] == 399360
     assert need["gpu_cold_nopd_admission_slots_required"] == 83200
     assert args.max_total_tokens >= need["gpu_cold_nopd_admission_slots_required"]
@@ -442,7 +471,7 @@ def test_cpu_ram_preflight_uses_full_allocation_and_host_reserve(
         Path(args.model) / "config.json",
         {"num_hidden_layers": 48, "num_key_value_heads": 4, "head_dim": 128},
     )
-    stage = TOOL.CAMPAIGN.recipe("combined-protected")
+    stage = TOOL.control_recipe("combined-protected")
     need = TOOL.allocation_requirements(stage, args, 12)
     required = need["planned_cpu_backing_allocation_bytes"] + (10 << 30)
     monkeypatch.setattr(
@@ -467,7 +496,7 @@ def test_ram_preflight_cannot_assume_an_unrelated_model_shape(tmp_path, monkeypa
         TOOL, "observe_cpu_ram", lambda: pytest.fail("Do not use assumed KV size")
     )
     with pytest.raises(ValueError, match="actual Qwen"):
-        TOOL.cpu_ram_preflight(TOOL.CAMPAIGN.recipe("fused"), args, 12)
+        TOOL.cpu_ram_preflight(TOOL.control_recipe("fused"), args, 12)
 
 
 @pytest.mark.parametrize("limit", [str(200 << 30), "max", "invalid"])
@@ -530,7 +559,7 @@ def test_invalid_cold_budget_plan_saves_failed_evidence(tmp_path, monkeypatch):
     )
 
     def native_settings(control, batch, arm):
-        stage, args = TOOL.CAMPAIGN.recipe(arm), settings(tmp_path)
+        stage, args = TOOL.control_recipe(arm), settings(tmp_path)
         args.max_total_tokens = control.max_total_tokens
         return stage, args, TOOL.make_groups(stage, args, batch)
 
@@ -557,7 +586,7 @@ def test_prelaunch_ram_failure_saves_native_manifest_and_restores_hooks(
 ):
     args = settings(tmp_path / "native")
     args.model = str(tmp_path / "missing-model")
-    stage = TOOL.CAMPAIGN.recipe("fused")
+    stage = TOOL.control_recipe("fused")
     groups = [{"id": "cpu-eager-ratio16", "status": "planned"}]
     monkeypatch.setattr(
         TOOL.RUN,
@@ -589,7 +618,7 @@ def test_prelaunch_ram_failure_saves_native_manifest_and_restores_hooks(
 def test_failed_actual_full_prefill_capacity_is_retained_as_failed_evidence(
     tmp_path, monkeypatch
 ):
-    args, stage = settings(tmp_path / "native"), TOOL.CAMPAIGN.recipe("fused")
+    args, stage = settings(tmp_path / "native"), TOOL.control_recipe("fused")
     groups = [{"id": "cpu-eager-ratio16", "status": "planned"}]
     monkeypatch.setattr(
         TOOL.RUN,

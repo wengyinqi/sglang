@@ -8,6 +8,30 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+SERVER_OPTION_FLAGS = {
+    "xm_correctness_cohort_barrier": "--xm-correctness-cohort-barrier",
+    "xm_correctness_cohort_timeout_seconds": "--xm-correctness-cohort-timeout-seconds",
+}
+
+
+def server_options(stage):
+    """Emit managed experimental options without changing other stage defaults."""
+    options = stage.get("server_options", {})
+    if not isinstance(options, dict) or options.keys() - SERVER_OPTION_FLAGS.keys():
+        raise ValueError("Unknown or malformed stage server_options")
+    enabled = options.get("xm_correctness_cohort_barrier", False)
+    if type(enabled) is not bool:
+        raise ValueError("xm_correctness_cohort_barrier must be a JSON boolean")
+    timeout = options.get("xm_correctness_cohort_timeout_seconds")
+    if timeout is not None and (
+        type(timeout) not in (int, float)
+        or not math.isfinite(timeout)
+        or timeout <= 0
+        or not enabled
+    ):
+        raise ValueError("A finite positive cohort timeout requires its barrier")
+    return options
+
 
 def load_stage(path):
     stage = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -45,6 +69,7 @@ def load_stage(path):
             not isinstance(flag, str) for flag in flags
         ):
             raise ValueError("server_args must be an exact JSON array of CLI strings")
+    server_options(stage)
     return stage
 
 
@@ -326,6 +351,16 @@ def server_command(stage, args, variant, input_len, ratio, *, eager=None):
         *stage.get("server_args", []),
         *recipe.get("server_args", []),
     ]
+    experimental = server_options(stage)
+    for name, flag in SERVER_OPTION_FLAGS.items():
+        value = experimental.get(name)
+        if flag in cmd:
+            raise ValueError(f"Declare managed option {flag} in stage server_options")
+        if type(value) is bool:
+            if value:
+                cmd.append(flag)
+        elif value is not None:
+            cmd += [flag, str(value)]
     options = {
         "--model-path": args.model,
         "--host": "127.0.0.1",

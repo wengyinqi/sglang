@@ -121,11 +121,35 @@ configuration pass correctness. A planned command, compilation, or CPU test
 is not a real model/performance result.
 
 For a four-request performance point, first run additional real model
-correctness with four equal input lengths. `correctness.py` sets the batch
-from the number of lengths in each round, so a `16384 32768` correctness
-campaign covers batch two, not batch four. Four 16K/32K requests with 80
-output tokens need at least 66048/131584 page-aligned token slots. The HBM
-reference must fit on the actual device; do not waive its output comparison.
+correctness with four equal input lengths. `correctness.py` sets the requested
+cohort from the number of lengths in each round, so a `16384 32768` campaign
+requests two members. The trace must independently prove its actual batch.
+Four 16K/32K requests with 128 output tokens require 66048/131584 paged KV
+slots, plus an explicit conservative admission allowance of
+`4 * maximum_round_batch * page_size`: 1024 slots at B4/page64. Use
+67072/132608 requested slots for these proofs. Exact full-KV bytes alone do
+not cover the ignore-EOS admission reserve. The HBM reference must fit on
+the actual device; do not waive its output comparison.
+
+Correctness, large-batch CPU summary controls, and same-batch performance
+with B>1 enable the isolated `--xm-correctness-cohort-barrier`. It continues
+prefill and staging collection while deferring decode until the already
+submitted cohort is ready. The raw replay requires every decode forward
+to contain the complete cohort with equal output ordinals, starting at
+token one. Full greedy token equality and the 0.02 logprob tolerance are
+unchanged. An unadmittable cohort fails after 30 seconds without prefill
+progress; it is never released as a partial batch. Short rounds and
+one-request lifecycle probes do not wait for a maximum batch size.
+
+This is a validation and same-cohort control, not a serving optimization.
+Its TTFT includes waiting for the cohort's prefill/staging and must not be
+presented as ordinary NoPD serving TTFT. B1 timing and capacity scans leave
+the barrier off. The original source006 B4 failures remain separate evidence:
+CPU reuse had mismatched output ordinals, and the 32K HBM reference never
+observed B4. Different schedule shapes were observed; the cause of their
+logprob and greedy differences has not been established. New controlled
+measurements use a new frozen source and are reported separately from
+source006 B1/Nsight results.
 
 The capacity scan uses CPU backing ratio eight to retain complete contexts
 without exceeding the H800 server's pinned-memory NUMA allocation domain.
