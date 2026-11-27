@@ -8,8 +8,10 @@ sidecar receipt. ReportLab, pypdf, and matplotlib are report-only dependencies.
 """
 
 import argparse
+import copy
 import csv
 import hashlib
+import importlib.util
 import json
 import math
 import re
@@ -267,6 +269,531 @@ def validate_analyses(paths, *, internal_fixture=False):
     return result
 
 
+def report_source(analyses, evidence):
+    if analyses:
+        return analyses[0][1]
+    for _, record in evidence:
+        if record.get("phase") == "correctness":
+            stages = [case.get("stage") for case in record.get("cases", [])]
+            commits = {
+                native.get("runtime", {}).get("git_commit")
+                for _, native in evidence
+                if native.get("kind") == "correctness"
+                and native.get("stage") in stages
+                and native.get("runtime", {})
+                .get("archived_source", {})
+                .get("source_commit")
+                == native.get("runtime", {}).get("git_commit")
+            }
+            commits = {
+                commit
+                for commit in commits
+                if isinstance(commit, str) and re.fullmatch("[0-9a-f]{40}", commit)
+            }
+            return dict(
+                record,
+                native_source_commits=sorted(commits) if len(commits) == 1 else [],
+            )
+    return {}
+
+
+def report_tool(name):
+    spec = importlib.util.spec_from_file_location(
+        "xm_report_" + name, Path(__file__).with_name(name + ".py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _native_correctness(proof_path, case, evidence):
+    declared = Path(case.get("stage_path", "")).parent / "evidence/manifest.json"
+    if declared.is_file():
+        return declared, read(declared)
+    candidates = [
+        (path, record)
+        for path, record in evidence
+        if record.get("kind") == "correctness"
+        and record.get("stage") == case.get("stage")
+    ]
+    require(
+        len(candidates) == 1,
+        f"Missing unambiguous native correctness for {case.get('arm')}",
+    )
+    return candidates[0]
+
+
+def measurement_scope(data):
+    arms, lengths, graph = set(), set(), False
+    rows = data.get("rows", []) + data.get("samples", [])
+    observed = bool(
+        data.get("samples")
+        or data.get("same_actual_batch_comparisons")
+        or data.get("observed_stable_capacity_points")
+    ) or any(row.get("eligible") is True for row in rows)
+    for row in rows:
+        arms.add(row["arm"])
+        lengths.add(row["input_len"])
+        graph |= row.get("graph_enabled", not data.get("samples")) is True
+    for row in data.get("same_actual_batch_comparisons", []):
+        arms.update((row["baseline"], row["changed"]))
+        lengths.add(row["input_len"])
+        graph |= row.get("graph_enabled", True) is True
+    for row in data.get("observed_stable_capacity_points", []):
+        arms.add(row["arm"])
+        lengths.add(row["input_len"])
+        graph |= row.get("graph_enabled", True) is True
+    return observed, arms, lengths, graph
+
+
+def verify_model_receipt(proof_path, proof, evidence, data, benchmark_models):
+    _, arms, lengths, graph = measurement_scope(data)
+    require(
+        proof.get("status") == "success",
+        "Bound model correctness campaign did not pass",
+    )
+    require(
+        proof.get("source_fingerprint") == data.get("source_fingerprint")
+        and (proof.get("workload_identity") or {}).get("sha256")
+        == (data.get("workload_identity") or {}).get("sha256"),
+        "Bound model proof has another implementation/workload",
+    )
+    require(
+        benchmark_models == {proof.get("settings", {}).get("model")},
+        "Measured and correctness model identities differ or native benchmark manifests are missing",
+    )
+    require(
+        lengths <= set(proof.get("settings", {}).get("input_lens", [])),
+        "Measured contexts were not covered by model correctness",
+    )
+    require(
+        not graph or not proof.get("settings", {}).get("disable_cuda_graph"),
+        "Measured Graph mode was not covered by correctness",
+    )
+    by_arm = {case.get("arm"): case for case in proof.get("cases", [])}
+    require(
+        len(by_arm) == len(proof.get("cases", [])),
+        "Duplicate model correctness arm receipt",
+    )
+    accepted = []
+    for arm in sorted(arms):
+        case = by_arm.get(arm, {})
+        require(
+            case.get("status") == "success" and case.get("returncode") == 0,
+            f"No passed model correctness for {arm}",
+        )
+        native_path, native = _native_correctness(proof_path, case, evidence)
+        budget = (
+            case.get("stage", {})
+            .get("variants", {})
+            .get("cpu", {})
+            .get("hisparse_config", {})
+            .get("xm_cache_hbm_budget_bytes")
+        )
+        require(
+            case.get("stage") == report_tool("campaign").recipe(arm, budget=budget),
+            "Correctness case is not the exact declared arm recipe",
+        )
+        settings, runtime = native.get("settings", {}), native.get("runtime", {})
+        require(
+            native.get("status") == "success"
+            and native.get("kind") == "correctness"
+            and native.get("stage") == case.get("stage")
+            and settings.get("execute") is True,
+            "Native correctness was not an actual successful exact-stage execution",
+        )
+        require(
+            settings.get("model") == proof.get("settings", {}).get("model"),
+            "Correctness model differs between campaign and native receipt",
+        )
+        require(
+            settings.get("workload_sha256")
+            == data.get("workload_identity", {}).get("sha256"),
+            "Native correctness workload differs",
+        )
+        require(
+            runtime.get("git_commit") in data["native_source_commits"],
+            "Native correctness revision differs from measured results",
+        )
+        marker = runtime.get("archived_source", {})
+        require(
+            marker.get("provenance") == "git_archive"
+            and marker.get("source_commit") == runtime.get("git_commit")
+            and re.fullmatch("[0-9a-f]{64}", marker.get("source_archive_sha256", "")),
+            "Missing exact archived native source provenance",
+        )
+        modes = {True, False} if graph else {True}
+        groups = native.get("groups", [])
+        require(
+            {(g.get("variant"), g.get("eager")) for g in groups}
+            >= {(variant, eager) for variant in ("cpu", "hbm") for eager in modes},
+            "Missing independent CPU/HBM or eager/Graph correctness groups",
+        )
+        for group in groups:
+            require(
+                group.get("status") == "success",
+                "Native correctness contains failed groups",
+            )
+            for key in ("comparison_to_cpu_hisparse", "slot_reuse_comparison"):
+                comparison = group.get(key, {})
+                require(
+                    comparison.get("exact_greedy_token_match") is True,
+                    "Missing exact token/slot reuse comparison",
+                )
+                atol, error = comparison.get("logprob_atol"), comparison.get(
+                    "max_abs_logprob_error"
+                )
+                number(atol)
+                number(error)
+                require(
+                    atol <= 0.02 and error <= atol,
+                    "Model logprob comparison did not pass its frozen tolerance",
+                )
+            lifecycle = {
+                item.get("case")
+                for item in group.get("lifecycle_results", [])
+                if item.get("status") == "passed"
+            }
+            require(
+                group.get("lifecycle_required") is True
+                and {"abort_prefill", "abort_decode", "retract_decode"} <= lifecycle,
+                "Missing actual abort/retract recovery proof",
+            )
+        accepted.append(
+            {
+                "arm": arm,
+                "campaign": identity(proof_path),
+                "native": identity(native_path),
+                "context_lengths": settings.get("input_lens"),
+                "correctness_round_sizes": sorted(
+                    {len(r) for g in groups for r in g.get("rounds", [])}
+                ),
+            }
+        )
+    return accepted
+
+
+def audit_report_evidence(analyses, evidence, *, diagnostic_only=False):
+    """Each analysis must bind its original campaign's exact model proof hash."""
+    failures, accepted, bindings = [], [], []
+    observed = any(measurement_scope(data)[0] for _, data in analyses)
+    if diagnostic_only:
+        failures.append("Explicit diagnostic-only report: no model benefit claims")
+    if not observed:
+        failures.append(
+            "No eligible model measurements supplied; report contains scoped diagnostics only"
+        )
+    if observed and not diagnostic_only:
+        for path, data in analyses:
+            if not measurement_scope(data)[0]:
+                continue
+            try:
+                require(
+                    data.get("native_source_commits"),
+                    "Missing native source commit for measured results",
+                )
+                require(data.get("artifacts"), "Missing raw replay artifact identities")
+                benchmark_models = set()
+                for artifact in data["artifacts"]:
+                    actual = identity(artifact["path"])
+                    require(
+                        actual["sha256"] == artifact.get("sha256")
+                        and actual["bytes"] == artifact.get("bytes"),
+                        "Raw replay artifact changed or is missing",
+                    )
+                    if Path(artifact["path"]).name == "manifest.json":
+                        raw = read(artifact["path"])
+                        if raw.get("kind") == "benchmark":
+                            benchmark_models.add(raw.get("settings", {}).get("model"))
+                            if data["phase"] == "capacity":
+                                require(
+                                    raw.get("stage", {})
+                                    .get("variants", {})
+                                    .get("cpu", {})
+                                    .get("hisparse_config", {})
+                                    .get("xm_cache_hbm_budget_bytes")
+                                    == data.get("cache_hbm_budget_bytes")
+                                    and type(data.get("cache_hbm_budget_bytes")) is int
+                                    and data["cache_hbm_budget_bytes"] > 0,
+                                    "Capacity report has no same configured budget in its actual native stage",
+                                )
+                campaign = read(data["artifacts"][0]["path"])
+                require(
+                    campaign.get("phase") == data["phase"], "Raw campaign phase differs"
+                )
+                gate = campaign.get("correctness_gate", {})
+                require(
+                    re.fullmatch("[0-9a-f]{64}", gate.get("sha256", ""))
+                    and type(gate.get("bytes")) is int
+                    and gate["bytes"] > 0
+                    and isinstance(gate.get("path"), str),
+                    "Analysis is not bound to its original campaign correctness proof identity",
+                )
+                candidates = [
+                    (proof_path, proof)
+                    for proof_path, proof in evidence
+                    if proof.get("phase") == "correctness"
+                    and isinstance(proof.get("cases"), list)
+                    and identity(proof_path)["sha256"] == gate["sha256"]
+                    and identity(proof_path)["bytes"] == gate["bytes"]
+                ]
+                declared = Path(gate["path"])
+                if declared.is_file():
+                    require(
+                        identity(declared)["sha256"] == gate["sha256"]
+                        and identity(declared)["bytes"] == gate["bytes"],
+                        "Original campaign proof path now contains another proof",
+                    )
+                    direct = [
+                        (p, proof)
+                        for p, proof in candidates
+                        if p.resolve() == declared.resolve()
+                    ]
+                    if direct:
+                        candidates = direct
+                require(
+                    len(candidates) == 1,
+                    "Missing or ambiguous proof bound to this analysis campaign",
+                )
+                proof_path, proof = candidates[0]
+                replay_module = report_tool("analyze")
+                replay = replay_module.analyze_campaign(data["artifacts"][0]["path"])
+                for key in (
+                    "rows",
+                    "samples",
+                    "paired_repeat_rows",
+                    "same_actual_batch_comparisons",
+                    "observed_stable_capacity_points",
+                    "native_source_commits",
+                    "source_fingerprint",
+                    "workload_identity",
+                    "cache_hbm_budget_bytes",
+                ):
+                    require(
+                        replay_module.equal(data.get(key), replay.get(key)),
+                        "Report analysis differs from a fresh raw replay: " + key,
+                    )
+                receipts = verify_model_receipt(
+                    proof_path, proof, evidence, data, benchmark_models
+                )
+                accepted.extend(dict(item, analysis=str(path)) for item in receipts)
+                bindings.append(
+                    {
+                        "analysis": identity(path),
+                        "original_gate": gate,
+                        "proof": identity(proof_path),
+                        "status": "passed",
+                        "actual_measurement_batches": sorted(
+                            {
+                                row.get("actual_batch")
+                                for row in data.get("rows", [])
+                                if type(row.get("actual_batch")) is int
+                            }
+                        ),
+                        "model_receipts": receipts,
+                    }
+                )
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                failures.append(str(path) + ": " + str(error))
+                bindings.append(
+                    {"analysis": str(path), "status": "blocked", "reason": str(error)}
+                )
+    return {
+        "status": "passed" if observed and not failures else "blocked",
+        "model_result_claims_allowed": observed and not failures,
+        "failures": failures,
+        "accepted_model_receipts": accepted,
+        "analysis_model_proof_bindings": bindings,
+        "scope": "Each analysis's raw campaign proof path/hash is independently bound. Same archived source/workload, CPU/HBM, modes, tokens/logprobs, reuse and lifecycle are rechecked. Actual measurement batches and correctness round sizes are separate; a small HBM precursor is not proof of a large full-HBM reference.",
+    }
+
+
+def display_analyses(analyses, audit):
+    if audit["model_result_claims_allowed"]:
+        return analyses
+    result = []
+    for path, original in analyses:
+        data = copy.deepcopy(original)
+        data["suppressed_model_samples"] = len(data.get("samples", []))
+        for key in (
+            "rows",
+            "samples",
+            "paired_repeat_rows",
+            "same_actual_batch_comparisons",
+            "observed_stable_capacity_points",
+        ):
+            data[key] = []
+        data["status"] = "no_eligible_samples"
+        data.setdefault("excluded_cases", []).append(
+            {"case": "report model-claim gate", "reason": "; ".join(audit["failures"])}
+        )
+        result.append((path, data))
+    return result
+
+
+def mechanism_identity(source, evidence):
+    """MMA is a selected model path only with same-source TMA+MMA SASS proof."""
+    result = {
+        "attention_implementation": "unverified",
+        "status": "missing_source_bound_native_identity",
+        "unverified_reason": "No source-bound selected scalar/MMA model-backend identity supplied",
+        "scope": "Missing implementation identity is not evidence of scalar or deployed MMA",
+    }
+    candidates = [
+        record
+        for _, record in evidence
+        if record.get("kind") == "xm_mechanism_identity"
+        and record.get("source_fingerprint") == source.get("source_fingerprint")
+        and record.get("native_source_commit")
+        in source.get("native_source_commits", [])
+    ]
+    selected = {
+        record.get("selected_model_backend")
+        for record in candidates
+        if record.get("selected_model_backend")
+        == record.get("attention_implementation")
+        and record.get("selected_model_backend") in ("scalar", "mma")
+    }
+    if len(selected) > 1:
+        result["unverified_reason"] = (
+            "Conflicting source-bound selected scalar/MMA identities"
+        )
+        return result
+    for record in candidates:
+        if (
+            record.get("selected_model_backend")
+            == record.get("attention_implementation")
+            == "scalar"
+        ):
+            return {
+                "attention_implementation": "scalar",
+                "status": "source_bound_selected_scalar",
+                "scope": "Explicit same-source selected scalar model backend; native instruction and model result proofs remain separate",
+            }
+        if (
+            record.get("selected_model_backend") != "mma"
+            or record.get("attention_implementation") != "mma"
+        ):
+            continue
+        sass = record.get("native_sass", {})
+        try:
+            require(
+                sass.get("tma_instruction_observed") is True
+                and sass.get("mma_instruction_observed") is True,
+                "MMA model identity needs both native TMA and MMA instructions",
+            )
+            artifact = sass.get("artifact", {})
+            actual = identity(artifact["path"])
+            require(
+                actual["sha256"] == artifact.get("sha256")
+                and actual["bytes"] == artifact.get("bytes"),
+                "Native SASS artifact changed",
+            )
+            disassembly = Path(artifact["path"]).read_text(encoding="utf-8")
+            symbol = sass.get("kernel_symbol")
+            require(
+                isinstance(symbol, str) and symbol,
+                "Missing selected fused-attention native function symbol",
+            )
+            functions = list(
+                re.finditer(r"^\s*Function\s*:\s*(\S+)\s*$", disassembly, re.MULTILINE)
+            )
+            matches = [
+                index
+                for index, match in enumerate(functions)
+                if match.group(1) == symbol
+            ]
+            require(
+                len(matches) == 1,
+                "Missing unambiguous selected fused-attention SASS function section",
+            )
+            index = matches[0]
+            body = disassembly[
+                functions[index].end() : (
+                    functions[index + 1].start()
+                    if index + 1 < len(functions)
+                    else len(disassembly)
+                )
+            ]
+            require(
+                re.search(r"\b(?:UBLKCP|UTMA[A-Z0-9_]*)\b", body)
+                and re.search(r"\b(?:HMMA|HGMMA)\b", body),
+                "Selected fused-attention SASS function does not contain both TMA and TensorCore MMA instructions",
+            )
+            result = {
+                "attention_implementation": "mma",
+                "status": "native_selected_mma_verified",
+                "native_sass": actual,
+                "kernel_symbol": symbol,
+                "scope": "Selected model backend with same-source TMA (UBLKCP/UTMA) and MMA in the same native fused-attention function; model correctness remains a separate gate",
+            }
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            result["unverified_reason"] = str(error)
+    return result
+
+
+def attention_description(identity):
+    if identity.get("attention_implementation") == "mma":
+        return "选中模型后端的同源 fused Attention 函数 SASS 已同时观测 TMA 与 MMA；当前融合 Attention 按 TensorCore QK/PV/rowsum 适配记录。"
+    if identity.get("attention_implementation") == "scalar":
+        return "同源选中模型后端的显式身份为 scalar；独立 MMA 候选不能当作此模型运行的后端。"
+    return "当前模型融合 Attention 的实际 scalar/MMA 身份尚未提供可验证的同源选中后端证据；不指定实现，也不把独立候选视为已部署。"
+
+
+def capacity_groups(data):
+    grouped = defaultdict(list)
+    for row in data.get("observed_stable_capacity_points", []):
+        grouped[
+            (row["input_len"], row["client_concurrency"], row.get("graph_enabled"))
+        ].append(row)
+    return grouped
+
+
+def audit_profile_identities(profiles, source):
+    result = []
+    for arm, path, original in profiles:
+        data = copy.deepcopy(original)
+        if data.get("status") == "analyzed":
+            try:
+                scope_path = path.parent / "decode-scope.json"
+                scope = read(scope_path)
+                require(
+                    scope.get("status") == "passed"
+                    and scope.get("actual_decode_scope_verified") is True
+                    and scope.get("arm") == arm,
+                    "Missing passed actual decode-scope receipt for this arm",
+                )
+                require(
+                    scope.get("sqlite_sha256") == data.get("sqlite", {}).get("sha256"),
+                    "Profile SQLite differs from passed scope",
+                )
+                provenance = scope.get("provenance", {})
+                require(
+                    provenance.get("source_fingerprint")
+                    == source.get("source_fingerprint"),
+                    "Independent profile belongs to another implementation",
+                )
+                if source.get("native_source_commits"):
+                    require(
+                        provenance.get("source_commit")
+                        in source["native_source_commits"],
+                        "Independent profile source revision differs",
+                    )
+                require(
+                    scope.get("actual_batch_size") == data.get("actual_batch_size")
+                    and scope.get("actual_decode_graph_launches")
+                    == data.get("observed_decode_steps")
+                    and len(data.get("per_step", []))
+                    == data.get("observed_decode_steps"),
+                    "Independent profile batch/step coverage differs from scope",
+                )
+                data["report_scope_receipt"] = identity(scope_path)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                data.update(status="unverified_report_scope", reason=str(error))
+        result.append((arm, path, data))
+    return result
+
+
 def validate_profile(spec):
     arm, separator, declared = spec.partition("=")
     require(separator and arm in ARMS, "Profile must use ARM=PATH")
@@ -349,8 +876,14 @@ def draw_plots(analyses, profiles, directory):
                 figure, axis = plt.subplots(figsize=(8, 4.4))
                 grouped = defaultdict(list)
                 for point in points:
-                    grouped[(point["arm"], point["input_len"])].append(point)
-                for (arm, length), rows in sorted(grouped.items()):
+                    grouped[
+                        (
+                            point["arm"],
+                            point["input_len"],
+                            str(point.get("graph_enabled")),
+                        )
+                    ].append(point)
+                for (arm, length, graph), rows in sorted(grouped.items()):
                     rows.sort(
                         key=lambda row: (
                             row["actual_batch_size"],
@@ -362,7 +895,7 @@ def draw_plots(analyses, profiles, directory):
                         [row["stable_tokens_per_second"]["mean"] for row in rows],
                         "o-",
                         color=colors[arm],
-                        label=f"{arm}, L={length}",
+                        label=f"{arm}, L={length}, graph={graph}",
                     )
                 axis.set_xlabel("Observed stable actual decode batch (requests)")
                 axis.set_ylabel("Stable scheduler-span output rate (tokens/s)")
@@ -425,6 +958,8 @@ def render_report(
     font_path,
     internal_fixture=False,
     images=None,
+    report_audit=None,
+    attention_identity=None,
 ):
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_LEFT
@@ -548,6 +1083,27 @@ def render_report(
             "heading",
         )
     add("结果判断", "heading")
+    report_audit = report_audit or {
+        "status": "blocked",
+        "model_result_claims_allowed": False,
+        "failures": ["No report evidence audit supplied"],
+    }
+    attention_identity = attention_identity or {
+        "attention_implementation": "unverified",
+        "status": "missing_source_bound_native_identity",
+    }
+    add("报告模型证据审核：" + report_audit["status"], "heading")
+    if not report_audit.get("model_result_claims_allowed"):
+        add(
+            "本次为正式审查说明：模型结果 gate 未通过或尚未取得合格测量；不报告软件机制的模型加速、容量或吞吐收益。原始失败记录和独立诊断仍保留。"
+        )
+        for reason in report_audit.get("failures", []):
+            add("审核原因：" + reason, "small")
+    else:
+        add(
+            "同源模型正确性、独立 HBM/CPU、模式、token/logprob、slot reuse 与 lifecycle 证据已审核。HBM 正确性覆盖的 round batch 大小与当前扫描实际 batch 应分别阅读；小批 HBM 前置证明不代表大批 full-HBM 对照。",
+            "small",
+        )
     comparisons = [
         row
         for _, data in analyses
@@ -584,10 +1140,13 @@ def render_report(
         add("尚未取得同 cache HBM 预算的容量扫描；摘要卸载的并发与吞吐收益保留待验证。")
     add("证据边界", "heading")
     add(
-        "融合内核使用真实 TMA global-to-shared 指令；当前 Attention 为标量 FP32 online softmax＋Split-K，"
-        "尚非论文的 Tensor Core 优化内核。预取通过 GPU 发起 device-graph memcpy；正确性与物理 CE 利用率、"
+        attention_description(attention_identity)
+        + "预取通过 GPU 发起 device-graph memcpy；正确性与物理 CE 利用率、"
         "带宽、重叠程度是不同证据。缺失 child memcpy 活动、受限 GPU counters 都不能被写成 CE 性能结论。"
     )
+    add("Attention 机制身份：" + attention_identity["status"], "small")
+    if attention_identity.get("unverified_reason"):
+        add("缺证原因：" + attention_identity["unverified_reason"], "small")
 
     section("1　实验设计、六条路径与指标")
     table(
@@ -665,12 +1224,23 @@ def render_report(
         "扣除 prefill 时间不能消除准入与排队差异。NoPD 用于排除分离 prefill/decode 通信路径；"
         "模型、固定 token workload、sampling、Graph 与 hot/backing 配置应随原始 manifest 一起审查。"
     )
-    source = analyses[0][1]
-    add("实现指纹 SHA256：" + source["source_fingerprint"]["sha256"], "small")
-    add("固定 workload SHA256：" + source["workload_identity"]["sha256"], "small")
+    source = report_source(analyses, evidence)
+    add(
+        "实现指纹 SHA256："
+        + source.get("source_fingerprint", {}).get("sha256", "未记录"),
+        "small",
+    )
+    add(
+        "固定 workload SHA256："
+        + (source.get("workload_identity") or {}).get("sha256", "未记录"),
+        "small",
+    )
     add(
         "真实模型运行 git commit："
-        + (", ".join(source["native_source_commits"]) or "未记录；仅存在未完成样本"),
+        + (
+            ", ".join(source.get("native_source_commits", []))
+            or "未记录；仅存在未完成样本"
+        ),
         "small",
     )
 
@@ -722,6 +1292,8 @@ def render_report(
     add(
         "主比较为 fused→combined-protected：以此分离历史摘要卸载的容量效果与移除 FlashInfer workspace 的效果。"
         "配置的 cache HBM budget 不是模型、activation、Graph、驱动的总显存预算。"
+        "cold NoPD 准入同时需要完整 prefill KV 与已准入/短暂共存的 hot；chunked prefill 不会逐 chunk 释放历史 KV。"
+        "max-total-tokens、请求槽位、CPU backing 和准入策略也可能成为上限。已分配 GPU KV 池含 prefill/free reserve，不能全部解释为 live decode hot。"
     )
     if capacity:
         for _, data in analyses:
@@ -743,6 +1315,7 @@ def render_report(
                     "输入 tokens",
                     "客户端 C",
                     "实际 B",
+                    "Graph",
                     "重复",
                     "稳定间隔 ms",
                     "稳定 tokens/s",
@@ -753,32 +1326,44 @@ def render_report(
                         f"{r['input_len']:,}",
                         r["client_concurrency"],
                         r["actual_batch_size"],
+                        str(r.get("graph_enabled", "未记录")),
                         r["observed_repeats"],
                         fmt(r["mean_launch_gap_ms"]["mean"]),
                         fmt(r["stable_tokens_per_second"]["mean"], 1),
                     ]
                     for r in rows
                 ],
-                [1.65, 1, 0.7, 0.65, 0.55, 1, 1.05],
+                [1.55, 0.95, 0.6, 0.6, 0.65, 0.55, 0.95, 1],
             )
-            maxima = {}
-            for row in rows:
-                key = row["arm"], row["input_len"]
-                if (
-                    key not in maxima
-                    or row["actual_batch_size"] > maxima[key]["actual_batch_size"]
-                ):
-                    maxima[key] = row
-            for length in sorted({r["input_len"] for r in rows}):
-                left = maxima.get(("fused", length))
-                right = maxima.get(("combined-protected", length))
-                if left and right and budget:
+            for (length, concurrency, graph), points in capacity_groups(data).items():
+                maxima = {}
+                for row in points:
+                    if (
+                        row["arm"] not in maxima
+                        or row["actual_batch_size"]
+                        > maxima[row["arm"]]["actual_batch_size"]
+                    ):
+                        maxima[row["arm"]] = row
+                left, right = maxima.get("fused"), maxima.get("combined-protected")
+                same_repeats = (
+                    left
+                    and right
+                    and set(left.get("repeat_ids", []))
+                    == set(right.get("repeat_ids", []))
+                    and bool(left.get("repeat_ids"))
+                )
+                if same_repeats and budget:
                     add(
-                        f"输入 {length:,} tokens：当前扫描的稳定 batch 观测上界为 "
+                        f"输入 {length:,} tokens、同客户端 C={concurrency}、Graph={graph}、同重复集合：此扫描点的稳定 batch 观测上界为 "
                         f"fused {left['actual_batch_size']} → combined-protected {right['actual_batch_size']}；"
                         f"对应稳定输出率 {left['stable_tokens_per_second']['mean']:.1f} → "
                         f"{right['stable_tokens_per_second']['mean']:.1f} tokens/s。"
                         "此句比较的是各自已观测容量点，不是同 batch 单步加速。"
+                    )
+                elif left and right:
+                    add(
+                        f"输入 {length:,}、C={concurrency}、Graph={graph}：重复覆盖或预算证据不足，仅保留各自观测点，不形成容量收益判断。",
+                        "small",
                     )
         for index, (_, _) in enumerate(analyses):
             if (index, "capacity") in images:
@@ -966,7 +1551,11 @@ def render_report(
         ("GPU 历史 min/max 摘要", "cache", "quest_resident_summary_bytes"),
         ("GPU 分层摘要 stage", "cache", "quest_layer_staging_bytes"),
         ("GPU running bounds", "cache", "quest_running_bounds_bytes"),
-        ("GPU 物理 hot KV", "cache", "physical_compute_kv_bytes"),
+        (
+            "GPU 已分配 KV 池（含 prefill/free reserve）",
+            "cache",
+            "physical_compute_kv_bytes",
+        ),
         ("GPU plan 数组", "cache", "fused_plan_bytes"),
         ("GPU 其他 cache 管理（合并）", "cache", "other_named_gpu_bytes"),
         ("Attention split partial", "backend", "fused_split_workspace_bytes"),
@@ -1351,6 +1940,8 @@ def render_report(
             "git_commit",
             "result",
             "adaptation",
+            "error",
+            "failure_phase",
         ):
             if key in record:
                 add(f"{key}：{record[key]}", "small")
@@ -1497,7 +2088,7 @@ def write_named_allocations(analyses, output):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--analysis", type=Path, action="append", required=True)
+    parser.add_argument("--analysis", type=Path, action="append", default=[])
     parser.add_argument("--profile", action="append", default=[], metavar="ARM=PATH")
     parser.add_argument("--evidence", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
@@ -1507,6 +2098,7 @@ def main(argv=None):
     parser.add_argument("--plot-packages", type=Path)
     parser.add_argument("--skip-plots", action="store_true")
     parser.add_argument("--internal-layout-fixture", action="store_true")
+    parser.add_argument("--diagnostic-only", action="store_true")
     args = parser.parse_args(argv)
     require(
         bool(args.base_pdf) == bool(args.merged_output),
@@ -1516,69 +2108,74 @@ def main(argv=None):
         not args.internal_layout_fixture or args.base_pdf is None,
         "Internal fixture cannot be appended to a real report",
     )
+    require(
+        args.analysis or (args.diagnostic_only and args.evidence),
+        "Supply audited analyses, or --diagnostic-only with failure evidence",
+    )
     require(args.font.is_file(), "Chinese TrueType font not found; pass --font")
     require(not args.output.exists(), "Refusing to overwrite existing PDF")
     if args.merged_output:
         require(not args.merged_output.exists(), "Refusing to overwrite merged PDF")
     if args.plot_packages:
         sys.path.insert(0, str(args.plot_packages.resolve(strict=True)))
-    analyses = validate_analyses(
-        args.analysis, internal_fixture=args.internal_layout_fixture
+    analyses = (
+        validate_analyses(args.analysis, internal_fixture=args.internal_layout_fixture)
+        if args.analysis
+        else []
     )
     profiles = [validate_profile(spec) for spec in args.profile]
     evidence = [(path.resolve(strict=True), read(path)) for path in args.evidence]
-    source = analyses[0][1]
-    for path, record in evidence:
-        if record.get("phase") == "correctness":
-            require(
-                record.get("source_fingerprint") == source["source_fingerprint"],
-                f"Correctness source differs: {path}",
-            )
-            require(
-                record.get("workload_identity", {}).get("sha256")
-                == source["workload_identity"]["sha256"],
-                f"Correctness workload differs: {path}",
-            )
-        if (
-            record.get("kind") == "correctness"
-            and record.get("settings", {}).get("execute") is True
-        ):
-            require(
-                record.get("runtime", {}).get("git_commit")
-                in source["native_source_commits"],
-                f"Native correctness source differs: {path}",
-            )
-            workload = record.get("settings", {}).get("workload_sha256")
-            require(
-                workload is None or workload == source["workload_identity"]["sha256"],
-                f"Native correctness workload differs: {path}",
-            )
+    source = report_source(analyses, evidence)
+    audit = audit_report_evidence(
+        analyses, evidence, diagnostic_only=args.diagnostic_only
+    )
+    if args.internal_layout_fixture:
+        audit = {
+            "status": "internal_layout_fixture",
+            "model_result_claims_allowed": True,
+            "failures": [],
+            "accepted_model_receipts": [],
+        }
+    shown = display_analyses(analyses, audit)
+    profiles = audit_profile_identities(profiles, source)
+    attention = mechanism_identity(source, evidence)
+    audit["attention_identity_status"] = attention["status"]
+    if attention.get("attention_implementation") == "unverified":
+        audit["mechanism_identity_limitation"] = attention["unverified_reason"]
     images = (
         {}
         if args.skip_plots
         else draw_plots(
-            analyses, profiles, args.output.parent / (args.output.stem + "-figures")
+            shown, profiles, args.output.parent / (args.output.stem + "-figures")
         )
     )
     render_report(
-        analyses,
+        shown,
         profiles,
         evidence,
         args.output,
         font_path=args.font,
         internal_fixture=args.internal_layout_fixture,
         images=images,
+        report_audit=audit,
+        attention_identity=attention,
     )
     named_csv = write_named_allocations(
-        analyses, args.output.with_name(args.output.stem + "-named-allocations.csv")
+        shown, args.output.with_name(args.output.stem + "-named-allocations.csv")
     )
     receipt = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "model_evidence_audit": audit,
+        "attention_mechanism_identity": attention,
         "scope": (
             "internal layout fixture"
             if args.internal_layout_fixture
-            else "rendered observed analysis, scoped probes and independent profiles"
+            else (
+                "rendered audited model results"
+                if audit["model_result_claims_allowed"]
+                else "formal failure/diagnostic review; model benefit claims suppressed"
+            )
         ),
         "inputs": [identity(path) for path in args.analysis + args.evidence]
         + [identity(path) for _, path, _ in profiles],
@@ -1586,6 +2183,11 @@ def main(argv=None):
         "figures": [identity(path) for path in sorted(set(images.values()))],
         "visual_review": "pending_external_render_and_inspection",
     }
+    receipt["verified_profile_scopes"] = [
+        data["report_scope_receipt"]
+        for _, _, data in profiles
+        if data.get("report_scope_receipt")
+    ]
     if named_csv:
         receipt["named_allocations_csv"] = identity(named_csv)
     if args.base_pdf:
