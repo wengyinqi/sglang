@@ -647,6 +647,7 @@ def flat_rows(samples, *, min_intervals=16):
 def same_batch_pairs(samples, *, min_intervals=16):
     comparisons = (
         ("baseline", "fused"),
+        ("baseline", "bounds-on-demand"),
         ("bounds-on-demand", "bounds-prefetch"),
         ("fused", "combined"),
         ("combined", "combined-protected"),
