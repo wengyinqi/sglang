@@ -19,7 +19,7 @@ def load(name):
     return module
 
 
-PROFILE = load("profile")
+PROFILE = load("profile_decode")
 TELEMETRY = load("telemetry")
 
 

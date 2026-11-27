@@ -191,10 +191,12 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         self._wrapper: Optional[BatchDecodeWithPagedKVCacheWrapper] = None
         self._current_bs: Optional[int] = None
         if xm_fused_retrieval_attention:
-            from sglang.jit_kernel.fused_hisparse_tma import FusedHiSparseTMAWorkspace
+            from sglang.jit_kernel.fused_hisparse_tma_mma import (
+                FusedHiSparseTMAMMAWorkspace,
+            )
 
             pool = coordinator.mem_pool_host
-            self._fused_tma = FusedHiSparseTMAWorkspace(
+            self._fused_tma = FusedHiSparseTMAMMAWorkspace(
                 device=device,
                 max_bs=max_bs,
                 top_k=self.top_k,

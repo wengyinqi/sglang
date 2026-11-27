@@ -1,9 +1,9 @@
-"""Opt-in SM90 BF16 GQA retrieval-attention fusion over mapped host KV.
+"""Shared SM90 TMA workspace and retained scalar arithmetic diagnostic.
 
 This module preserves Quest selection. Resolve emits a plan without copying KV;
 the CUDA kernel reads hot or host rows by TMA into shared memory, computes
-attention, and refills misses. Scalar FP32 QK accumulation and BF16 probability,
-partial-output and cascade rounding follow the frozen FlashInfer FA2 path.
+attention, and refills misses. This scalar class retains the arithmetic candidate
+whose real-model gate failed. The backend selects the BF16 MMA subclass.
 This is an experimental adaptation rather than the XM-Sparse author's code.
 """
 
@@ -102,7 +102,10 @@ def validate_fused_tma_configuration(
 
 
 class FusedHiSparseTMAWorkspace:
-    """Precompiled kernel, retained mapped owners and Graph-stable buffers."""
+    """Scalar diagnostic with shared mapped owners and Graph-stable buffers."""
+
+    def _load_module(self, top_k: int):
+        return _jit_fused_retrieval_attention(top_k)
 
     def __init__(
         self,
@@ -137,7 +140,7 @@ class FusedHiSparseTMAWorkspace:
         ).multi_processor_count
         self.host_k_layers = tuple(host_k_layers)
         self.host_v_layers = tuple(host_v_layers)
-        self._module = _jit_fused_retrieval_attention(top_k)
+        self._module = self._load_module(top_k)
         self._sources = []
         for k, v in zip(self.host_k_layers, self.host_v_layers):
             if (

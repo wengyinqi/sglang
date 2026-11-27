@@ -35,7 +35,9 @@ class TestFusedFlashInferNumericGPU(unittest.TestCase):
             self.skipTest("Linux SM90 required")
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
-        from sglang.jit_kernel.fused_hisparse_tma import FusedHiSparseTMAWorkspace
+        from sglang.jit_kernel.fused_hisparse_tma_mma import (
+            FusedHiSparseTMAMMAWorkspace,
+        )
 
         torch.manual_seed(418)
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -45,7 +47,7 @@ class TestFusedFlashInferNumericGPU(unittest.TestCase):
         host_v = torch.empty_like(host_k, pin_memory=True)
         hot_k = torch.empty_like(host_k, device=device)
         hot_v = torch.empty_like(host_k, device=device)
-        tma = FusedHiSparseTMAWorkspace(
+        tma = FusedHiSparseTMAMMAWorkspace(
             device=device,
             max_bs=1,
             top_k=topk,
@@ -146,7 +148,9 @@ class TestFusedFlashInferNumericGPU(unittest.TestCase):
             self.skipTest("Linux SM90 required")
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
-        from sglang.jit_kernel.fused_hisparse_tma import FusedHiSparseTMAWorkspace
+        from sglang.jit_kernel.fused_hisparse_tma_mma import (
+            FusedHiSparseTMAMMAWorkspace,
+        )
 
         torch.manual_seed(715)
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -158,7 +162,7 @@ class TestFusedFlashInferNumericGPU(unittest.TestCase):
         host_k.copy_(qk_norm_rope(host_k.shape, torch.arange(rows), 1.0))
         host_v.copy_(torch.randn(host_v.shape).to(torch.bfloat16))
         hot_k, hot_v = host_k.to(device), host_v.to(device)
-        tma = FusedHiSparseTMAWorkspace(
+        tma = FusedHiSparseTMAMMAWorkspace(
             device=device,
             max_bs=batch,
             top_k=topk,

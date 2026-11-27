@@ -16,11 +16,14 @@ policy. A payload-free cache plan precedes a BF16 SM90 kernel that fetches
 selected K/V into double-buffered shared memory with TMA, computes online
 softmax, and refills the hot slots. Split partials have a separate reduction.
 The output must pass numerical, refill, repeated-step and CUDA Graph tests.
-The current Qwen kernel uses scalar FP32 dot products and state with BF16
-softmax weights/partial outputs aligned to the FlashInfer reference, not
-the paper's Tensor Core FlashMLA implementation. The measured
-effect therefore belongs to this explicit implementation and hardware pair.
-The numerical-compatibility candidate preserves the selected-token order;
+The Qwen kernel uses BF16 Tensor Core MMA for QK, PV and probability row
+sums, with FP32 accumulation and the frozen FlashInfer FA2 softmax,
+partition and partial/cascade rounding order. This is a Qwen GQA kernel,
+not the paper's FlashMLA implementation. Its measured effect belongs to
+this explicit implementation and hardware pair. The initial scalar FP32
+implementation remains available only for arithmetic diagnostics; its
+failed real-model comparisons are retained as separate evidence.
+The numerical-compatibility implementation preserves selected-token order;
 it does not retain the initial resident-first mathematical traversal. TMA
 still retrieves K/V directly into double-buffered shared memory and the
 kernel refills hot slots. The CPU partition planner follows the frozen FA2

@@ -37,10 +37,12 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
             or torch.cuda.get_device_capability() != (9, 0)
         ):
             raise unittest.SkipTest("Linux NVIDIA SM90 CUDA host required")
-        from sglang.jit_kernel.fused_hisparse_tma import FusedHiSparseTMAWorkspace
+        from sglang.jit_kernel.fused_hisparse_tma_mma import (
+            FusedHiSparseTMAMMAWorkspace,
+        )
         from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mha
 
-        cls.workspace_cls = FusedHiSparseTMAWorkspace
+        cls.workspace_cls = FusedHiSparseTMAMMAWorkspace
         cls.baseline_loader = staticmethod(load_cache_to_device_buffer_mha)
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
@@ -51,7 +53,9 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
         self.host = torch.empty(
             (2, 1, self.rows, 4, 128), dtype=torch.bfloat16, pin_memory=True
         )
-        self.host.copy_(torch.randn(self.host.shape, dtype=torch.float32).to(torch.bfloat16))
+        self.host.copy_(
+            torch.randn(self.host.shape, dtype=torch.float32).to(torch.bfloat16)
+        )
         self.hot_buffer = torch.zeros(
             (2, 1, self.requests_count * (self.hot + 1), 4, 128),
             dtype=torch.bfloat16,
@@ -59,7 +63,9 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
         )
         self.reference_buffer = torch.empty_like(self.hot_buffer)
         self.mapping = (
-            torch.arange(self.requests_count * self.seq, dtype=torch.int64, device=self.device)
+            torch.arange(
+                self.requests_count * self.seq, dtype=torch.int64, device=self.device
+            )
             .mul(7)
             .remainder(self.rows)
             .reshape(self.requests_count, self.seq)
@@ -68,7 +74,9 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
             self.requests_count * (self.hot + 1), dtype=torch.int32, device=self.device
         ).reshape(self.requests_count, self.hot + 1)
         self.tokens = torch.empty(
-            (1, self.requests_count, self.hot + 1), dtype=torch.int32, device=self.device
+            (1, self.requests_count, self.hot + 1),
+            dtype=torch.int32,
+            device=self.device,
         )
         self.lru = torch.empty(
             (1, self.requests_count, self.hot), dtype=torch.int16, device=self.device
@@ -80,14 +88,22 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
         )
         self.metrics = torch.zeros((1, 5), dtype=torch.int64, device=self.device)
         self.reference_metrics = torch.zeros(5, dtype=torch.int64, device=self.device)
-        self.requests = torch.tensor([0, 1, 99999], dtype=torch.int64, device=self.device)
+        self.requests = torch.tensor(
+            [0, 1, 99999], dtype=torch.int64, device=self.device
+        )
         self.lengths = torch.tensor(
             [self.seq, self.seq, 99999], dtype=torch.int32, device=self.device
         )
         self.real = torch.tensor([2], dtype=torch.int32, device=self.device)
-        self.actual = torch.tensor([self.topk, self.topk, 1], dtype=torch.int32, device=self.device)
-        self.top = torch.zeros((self.batch, self.topk), dtype=torch.int32, device=self.device)
-        self.q = torch.randn((self.batch, 32, 128), device=self.device, dtype=torch.bfloat16)
+        self.actual = torch.tensor(
+            [self.topk, self.topk, 1], dtype=torch.int32, device=self.device
+        )
+        self.top = torch.zeros(
+            (self.batch, self.topk), dtype=torch.int32, device=self.device
+        )
+        self.q = torch.randn(
+            (self.batch, 32, 128), device=self.device, dtype=torch.bfloat16
+        )
         self.workspace = self.workspace_cls(
             device=self.device,
             max_bs=self.batch,
@@ -122,7 +138,11 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
         elif case == "misses":
             selected = list(range(2500, 2500 + self.topk - 1)) + [self.seq - 1]
         elif case == "mixed":
-            selected = list(range(512)) + list(range(2500, 2500 + self.topk - 513)) + [self.seq - 1]
+            selected = (
+                list(range(512))
+                + list(range(2500, 2500 + self.topk - 513))
+                + [self.seq - 1]
+            )
         elif case == "short":
             selected = list(range(17)) + [-1] * (self.topk - 17)
             self.lengths[:2] = 17
@@ -132,14 +152,18 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
         self.top[:2] = torch.tensor(selected, dtype=torch.int32, device=self.device)
 
     def reset_hot(self):
-        self.tokens[:, :, :self.hot] = torch.arange(self.hot, dtype=torch.int32, device=self.device)
+        self.tokens[:, :, : self.hot] = torch.arange(
+            self.hot, dtype=torch.int32, device=self.device
+        )
         self.tokens[:, :, self.hot] = self.seq - 1
         self.lru[:] = torch.arange(self.hot, dtype=torch.int16, device=self.device)
         for request in range(self.requests_count):
-            selected = torch.cat((self.mapping[request, :self.hot], self.mapping[request, -1:]))
+            selected = torch.cat(
+                (self.mapping[request, : self.hot], self.mapping[request, -1:])
+            )
             source = self.host[:, :, selected.cpu()].to(self.device)
             start = request * (self.hot + 1)
-            self.hot_buffer[:, :, start:start + self.hot + 1].copy_(source)
+            self.hot_buffer[:, :, start : start + self.hot + 1].copy_(source)
         self.reference_buffer.copy_(self.hot_buffer)
         self.reference_tokens.copy_(self.tokens)
         self.reference_lru.copy_(self.lru)
@@ -164,7 +188,7 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
             layer_id=0,
             actual_lens=self.actual,
             num_real_reqs=self.real,
-            scaling=128 ** -0.5,
+            scaling=128**-0.5,
             logits_soft_cap=cap,
         )
 
@@ -204,15 +228,30 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
         for request in range(int(self.real.item())):
             count = int(self.actual[request].item())
             physical = self.reference_locations[request, :count].long()
-            keys = self.reference_buffer[0, 0, physical].float().repeat_interleave(8, dim=1)
-            values = self.reference_buffer[1, 0, physical].float().repeat_interleave(8, dim=1)
-            scores = torch.einsum("hd,khd->hk", self.q[request].float(), keys) * (128 ** -0.5)
+            keys = (
+                self.reference_buffer[0, 0, physical]
+                .float()
+                .repeat_interleave(8, dim=1)
+            )
+            values = (
+                self.reference_buffer[1, 0, physical]
+                .float()
+                .repeat_interleave(8, dim=1)
+            )
+            scores = torch.einsum("hd,khd->hk", self.q[request].float(), keys) * (
+                128**-0.5
+            )
             if cap:
                 scores = cap * torch.tanh(scores / cap)
             expected = torch.einsum("hk,khd->hd", scores.softmax(-1), values)
-            max_error = max(max_error, float((output[request].float() - expected).abs().max().item()))
-            torch.testing.assert_close(output[request].float(), expected, atol=0.003, rtol=0.02)
-        self.assertTrue(torch.all(output[int(self.real.item()):] == 0).item())
+            max_error = max(
+                max_error,
+                float((output[request].float() - expected).abs().max().item()),
+            )
+            torch.testing.assert_close(
+                output[request].float(), expected, atol=0.003, rtol=0.02
+            )
+        self.assertTrue(torch.all(output[int(self.real.item()) :] == 0).item())
         print(f"FP32 reference max_abs_error={max_error:.8f}", flush=True)
 
     def test_all_hits_preserve_residency(self):
@@ -238,7 +277,12 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
         self.plan()
         self.check(self.fused())
         self.assertEqual(self.metrics[0, 4].item(), 0)
-        torch.testing.assert_close(self.workspace.device_locs[:2, -1], self.locations[:, self.hot], rtol=0, atol=0)
+        torch.testing.assert_close(
+            self.workspace.device_locs[:2, -1],
+            self.locations[:, self.hot],
+            rtol=0,
+            atol=0,
+        )
 
     def test_short_sequence_and_invalid_padded_request(self):
         self.select("short")
@@ -258,8 +302,12 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
         def store_mapped(source, destination_ptrs, side_elements: tl.constexpr):
             offsets = tl.program_id(0) * 256 + tl.arange(0, 256)
             side = tl.program_id(1)
-            destination = tl.load(destination_ptrs + side).to(tl.pointer_type(tl.bfloat16))
-            values = tl.load(source + side * side_elements + offsets, offsets < side_elements, 0)
+            destination = tl.load(destination_ptrs + side).to(
+                tl.pointer_type(tl.bfloat16)
+            )
+            values = tl.load(
+                source + side * side_elements + offsets, offsets < side_elements, 0
+            )
             tl.store(destination + offsets, values, offsets < side_elements)
 
         self.select("misses")
@@ -281,7 +329,10 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
             physical = self.workspace.device_locs[request, :-1].long()
             backing_rows = self.mapping[request, self.top[request, :-1].long()]
             torch.testing.assert_close(
-                self.hot_buffer[:, 0, physical], fresh[:, 0, backing_rows], rtol=0, atol=0
+                self.hot_buffer[:, 0, physical],
+                fresh[:, 0, backing_rows],
+                rtol=0,
+                atol=0,
             )
 
     def test_graph_replay_changed_sources_selection_lengths_and_real_batch(self):
@@ -298,7 +349,11 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
         with torch.cuda.graph(graph):
             self.plan()
             output = self.fused()
-        pointers = (self.workspace.device_locs.data_ptr(), self.workspace.miss_host_locs.data_ptr(), output.data_ptr())
+        pointers = (
+            self.workspace.device_locs.data_ptr(),
+            self.workspace.miss_host_locs.data_ptr(),
+            output.data_ptr(),
+        )
         for case, real in (("misses", 2), ("hits", 1), ("short", 2), ("mixed", 2)):
             torch.cuda.synchronize(self.device)
             # CPU producer changes the retained pinned source only after the
@@ -311,7 +366,14 @@ class TestFusedHiSparseTMAGPU(unittest.TestCase):
             self.reset_hot()
             graph.replay()
             self.check(output)
-            self.assertEqual(pointers, (self.workspace.device_locs.data_ptr(), self.workspace.miss_host_locs.data_ptr(), output.data_ptr()))
+            self.assertEqual(
+                pointers,
+                (
+                    self.workspace.device_locs.data_ptr(),
+                    self.workspace.miss_host_locs.data_ptr(),
+                    output.data_ptr(),
+                ),
+            )
 
 
 if __name__ == "__main__":
