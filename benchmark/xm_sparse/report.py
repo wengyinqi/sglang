@@ -1728,7 +1728,7 @@ def draw_plots(analyses, profiles, directory):
             axis.axvline(0, color="#444444", linewidth=0.8)
             axis.set_xlabel("Matched scheduler decode-interval reduction (%)")
             axis.set_title(
-                "Same requests and decode ordinals; paired-repeat 95% t intervals"
+                "Same requests and decode ordinals\nPaired-repeat 95% t intervals"
             )
             axis.grid(axis="x", alpha=0.18)
             figure.tight_layout()
