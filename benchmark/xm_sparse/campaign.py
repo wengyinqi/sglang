@@ -139,6 +139,7 @@ def parse(argv=None):
     p.add_argument("--concurrencies", nargs="+", type=int, default=[1, 4])
     p.add_argument("--output-len", type=int, default=512)
     p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--num-prompts", type=int)
     p.add_argument("--max-total-tokens", type=int, default=65536)
     p.add_argument("--capacity-ratio", type=int, default=8)
     p.add_argument("--cache-budget-bytes", type=int)
@@ -147,6 +148,8 @@ def parse(argv=None):
     p.add_argument("--correctness-campaign", type=Path)
     p.add_argument("--execute", action="store_true")
     args = p.parse_args(argv)
+    if args.num_prompts is not None and args.num_prompts < max(args.concurrencies):
+        p.error("num-prompts must cover every requested client concurrency")
     if (
         min(
             args.input_lens
@@ -216,7 +219,11 @@ def make_plan(args):
             "--repeats",
             "1",
             "--num-prompts",
-            str(point if point is not None else max(16, max(args.concurrencies))),
+            str(
+                point
+                if point is not None
+                else (args.num_prompts or max(16, max(args.concurrencies)))
+            ),
             "--max-total-tokens",
             str(args.max_total_tokens),
             "--capacity-ratios",
