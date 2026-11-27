@@ -1,4 +1,4 @@
-"""Audit XM/Qwen decode scope without relabeling scalar TMA as TensorCore.
+"""Audit XM/Qwen decode scope and identify the observed fusion implementation.
 
 A passed scope binds raw trace membership, the bounded trigger, all 48 layers,
 main graph runtime correlations, archived core source and actual correctness,
@@ -529,9 +529,15 @@ def kernel_kind(name, fused):
     if name == "_quest_score_kernel":
         return "score"
     if fused:
-        if "xm_hisparse_tma::attention_kernel<" in name:
+        if any(
+            namespace + "::attention_kernel<" in name
+            for namespace in ("xm_hisparse_tma", "xm_hisparse_tma_mma")
+        ):
             return "attention"
-        if "xm_hisparse_tma::merge_kernel<" in name:
+        if any(
+            namespace + "::merge_kernel<" in name
+            for namespace in ("xm_hisparse_tma", "xm_hisparse_tma_mma")
+        ):
             return "merge"
     elif name == BASE_SCOPE.DECODE_ATTENTION_KERNEL:
         return "attention"
@@ -584,6 +590,22 @@ def verify_graphs(conn, profile, arm, compute_device, *, layers=48):
         "Unknown or genuine prefill kernel in decode capture",
     )
     relevant = [r for r in rows if kernel_kind(r[6], fused) != "other"]
+    implementation = None
+    if fused:
+        implementations = {
+            "bf16_mma" if "xm_hisparse_tma_mma::" in row[6] else "scalar_fp32"
+            for row in relevant
+            if kernel_kind(row[6], True) in ("attention", "merge")
+        }
+        require(
+            len(implementations) == 1,
+            "Mixed or missing fused attention/merge implementations",
+        )
+        implementation = next(iter(implementations))
+        require(
+            not any(row[6] == BASE_SCOPE.DECODE_ATTENTION_KERNEL for row in rows),
+            "Separate FlashInfer reference/fallback in fused decode capture",
+        )
     require(
         relevant and all(r[4] in launch_ids for r in relevant),
         "Score/attention associated with an unobserved main runtime launch",
@@ -651,8 +673,14 @@ def verify_graphs(conn, profile, arm, compute_device, *, layers=48):
         "decode_attention_calls": counts["attention"],
         "fused_merge_calls": counts.get("merge", 0),
         "observed_attention_kernel_names": names,
+        "observed_fused_implementation": implementation,
+        "native_instruction_validation_included": False,
         "attention_path": (
-            "scalar FP32 BF16 GQA + cp.async.bulk TMA + split merge"
+            (
+                "scalar FP32 BF16 GQA + cp.async.bulk TMA + split merge"
+                if implementation == "scalar_fp32"
+                else "BF16 MMA fusion kernel symbols + split merge; native TMA/MMA instructions require separate source-bound validation"
+            )
             if fused
             else "known FlashInfer TensorCore decode specialization using paged-prefill module; one query row/request"
         ),

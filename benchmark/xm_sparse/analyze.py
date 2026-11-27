@@ -826,6 +826,8 @@ def _kind(name):
     if (
         "xm_hisparse_tma::attention_kernel" in low
         or "xm_hisparse_tma::merge_kernel" in low
+        or "xm_hisparse_tma_mma::attention_kernel" in low
+        or "xm_hisparse_tma_mma::merge_kernel" in low
     ):
         return "attention"
     if "flashinfer::" in low and any(

@@ -104,10 +104,10 @@ bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/campaign.py \
   --output-dir /results/results/performance --execute
 
 bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/campaign.py \
-  --phase capacity --cache-budget-bytes 4294967296 \
+  --phase capacity --cache-budget-bytes 8589934592 \
   --model /models/qwen --workload /data/frozen-xm-qwen-20261127/workload.json \
   --input-lens 32768 --concurrencies 4 8 12 --capacity-ratio 16 \
-  --output-len 512 --repeats 3 \
+  --max-total-tokens 98304 --output-len 512 --repeats 3 \
   --arms fused combined-protected --output-dir /results/results/capacity \
   --correctness-campaign /results/results/correctness/campaign.json \
   --execute
@@ -133,11 +133,23 @@ Choose a cache budget that actually creates pressure within the scanned
 concurrencies. At 32K and at most twelve clients, an 8-GiB budget plus the
 65536-token physical cap can leave both paths below the admission limit;
 that point alone cannot establish a summary-offload capacity gain. The
-4-GiB example is a pressure experiment; runtime allocations and stable
-batch traces determine whether it reaches the expected boundary.
+98304-token cap in the example exceeds what the 8-GiB cache budget can
+allocate, so the measured memory resolver determines physical capacity.
+Runtime allocations and stable batch traces determine the boundary.
+
+NoPD chunked prefill retains the current request's complete GPU KV history
+until CPU backup and hot-buffer admission finish. A one-chunk estimate of
+prefill staging memory is insufficient. Check full prefill KV plus all
+concurrently allocated hot buffers (including the newly admitted request)
+against actual physical slots. Cold NoPD admission can therefore limit
+batch size before the decode-only hot-buffer limit. Subtracting prefill
+time does not remove this memory/admission constraint. Report the observed
+cold NoPD batch, and do not label it an isolated maximum decode capacity.
+The allocated GPU KV pool includes hot payload, prefill storage and unused
+reserve; it must not all be labelled live hot KV.
 
 `analyze.py campaign` replays raw results and scheduler traces and emits
-JSON, CSV and optional PNG/SVG. `profile.py` adapts only an actually passed
+JSON, CSV and optional PNG/SVG. `profile_decode.py` adapts only an actually passed
 model correctness receipt to an independent Nsight decode capture.
 `report.py` renders the analyses and can append new pages to an existing
 PDF without replacing it. `telemetry.py` records low-rate host NVML totals
@@ -150,7 +162,7 @@ the additional profiling container options:
 
 ```bash
 XM_NSIGHT_ROOT=/home/user/Workspace/mpu/tools/nsight-2026.6.1 \
-  bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/profile.py \
+  bash benchmark/xm_sparse/run_h800.sh benchmark/xm_sparse/profile_decode.py \
   --correctness-campaign /results/results/correctness-001/campaign.json \
   --arm fused --input-len 16384 --batch-size 1 --output-len 256 \
   --profile-steps 32 --stable-steps 16 \

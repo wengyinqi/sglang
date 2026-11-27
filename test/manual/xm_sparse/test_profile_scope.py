@@ -275,6 +275,51 @@ def test_fixture_binds_main_graph_uuid_and_exact_arm(scope_fixture, arm):
         assert report["fused_merge_calls"] == 96
 
 
+def reseal_sqlite_fixture(args):
+    profile = S.read(args["profile_path"])
+    profile["artifacts"] = [identity(args["database"])]
+    write(args["profile_path"], profile)
+
+
+def test_mma_symbols_identify_path_without_claiming_native_instructions(scope_fixture):
+    args = scope_fixture()
+    with sqlite3.connect(args["database"]) as conn:
+        conn.execute(
+            "UPDATE StringIds SET value=replace(value, 'xm_hisparse_tma::', 'xm_hisparse_tma_mma::')"
+        )
+    reseal_sqlite_fixture(args)
+    report = S.verify(**args)
+    assert report["observed_fused_implementation"] == "bf16_mma"
+    assert report["native_instruction_validation_included"] is False
+    assert "native TMA/MMA instructions require separate" in report["attention_path"]
+
+
+def test_mixed_fusion_implementations_are_rejected(scope_fixture):
+    args = scope_fixture()
+    with sqlite3.connect(args["database"]) as conn:
+        conn.execute(
+            "UPDATE StringIds SET value=replace(value, 'xm_hisparse_tma::', 'xm_hisparse_tma_mma::') WHERE id=3"
+        )
+    reseal_sqlite_fixture(args)
+    with pytest.raises(ValueError, match="Mixed or missing fused"):
+        S.verify(**args)
+
+
+def test_fused_profile_cannot_hide_an_extra_reference_attention(scope_fixture):
+    args = scope_fixture()
+    with sqlite3.connect(args["database"]) as conn:
+        conn.execute(
+            "INSERT INTO StringIds VALUES (20, ?)",
+            (S.BASE_SCOPE.DECODE_ATTENTION_KERNEL,),
+        )
+        conn.execute(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (10050,10060,3,7,1,11,20)"
+        )
+    reseal_sqlite_fixture(args)
+    with pytest.raises(ValueError, match="prefill kernel|reference/fallback"):
+        S.verify(**args)
+
+
 @pytest.mark.parametrize(
     "mutation,pattern",
     [

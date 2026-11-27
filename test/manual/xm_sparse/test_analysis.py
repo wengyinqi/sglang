@@ -412,6 +412,11 @@ def profile_fixture(tmp_path, *, missing_attention=False):
     return path, scope
 
 
+def test_mma_attention_and_reduction_have_the_same_profile_category():
+    assert A._kind("void xm_hisparse_tma_mma::attention_kernel<2048>()") == "attention"
+    assert A._kind("void xm_hisparse_tma_mma::merge_kernel<16>()") == "attention"
+
+
 def test_attention_path_includes_idle_gaps_and_excludes_unrelated_child_graph(tmp_path):
     path, scope = profile_fixture(tmp_path)
     result = A.attention_profile(path, scope)
