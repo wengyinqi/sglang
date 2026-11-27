@@ -1,6 +1,7 @@
 """Explicit MMA replay of saved same-QKV diagnostic tensors, not a model gate."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -10,28 +11,28 @@ import torch
 def difference(actual, expected):
     values = actual.float() - expected.float()
     return {
+        "torch_equal": torch.equal(actual, expected),
         "max_abs": float(values.abs().max().item()),
         "rms": float(values.square().mean().sqrt().item()),
         "unequal": int((actual != expected).sum().item()),
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--snapshots", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
+def replay_snapshots(snapshots, *, include_graph=False):
+    """Replay externally supplied real Q/K/V without changing their model history."""
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+
     from sglang.jit_kernel.fused_hisparse_tma_mma import FusedHiSparseTMAMMAWorkspace
 
     records = []
     device = torch.device("cuda", torch.cuda.current_device())
-    for path in sorted(args.snapshots.glob("*.pt")):
+    for path in sorted(Path(snapshots).glob("step0-layer*.pt")):
         data = torch.load(path, map_location="cpu", weights_only=True)
         keys, values = data["selected_k"], data["selected_v"]
         batch, topk = keys.shape[:2]
         assert keys.shape == values.shape == (batch, topk, 4, 128)
         assert torch.all(data["valid"]).item()
+        assert data["stats"]["selected_payload_exact"]
         host_k = keys.reshape(-1, 4, 128).pin_memory()
         host_v = values.reshape(-1, 4, 128).pin_memory()
         hot_k, hot_v = host_k.to(device), host_v.to(device)
@@ -99,6 +100,10 @@ def main():
             logits_soft_cap=cap,
         ).clone()
         workspace.miss_host_locs.copy_(physical.long())
+        # A matching output with an already populated hot buffer would not
+        # independently verify mapped-DDR retrieval or raw refill.
+        hot_k.zero_()
+        hot_v.zero_()
         mapped = workspace.run(
             q,
             hot_k=hot_k,
@@ -111,18 +116,82 @@ def main():
         ).clone()
         record = {
             "snapshot": str(path),
+            "snapshot_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "original_scalar_difference": data["stats"]["max_abs_output_error"],
             "same_dense_fi_vs_saved_fi": difference(
                 reference.reshape(batch, -1), data["reference_output"].to(device)
             ),
             "mma_vs_fi": difference(output, reference),
             "mapped_vs_hot": difference(mapped, output),
+            "mapped_refill_k_exact": torch.equal(hot_k.cpu(), host_k),
+            "mapped_refill_v_exact": torch.equal(hot_v.cpu(), host_v),
             "chunk_size": int(workspace.kv_chunk_size.item()),
             "scope": "Saved same-QKV attention arithmetic replay; not full-model correctness",
+            "fused_model_correctness_verified": False,
+            "performance_result": False,
         }
+        if include_graph:
+            warmup = torch.cuda.Stream()
+            warmup.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup):
+                for _ in range(3):
+                    workspace.run(
+                        q,
+                        hot_k=hot_k,
+                        hot_v=hot_v,
+                        layer_id=0,
+                        actual_lens=actual,
+                        num_real_reqs=real,
+                        scaling=scale,
+                        logits_soft_cap=cap,
+                    )
+            torch.cuda.current_stream().wait_stream(warmup)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = workspace.run(
+                    q,
+                    hot_k=hot_k,
+                    hot_v=hot_v,
+                    layer_id=0,
+                    actual_lens=actual,
+                    num_real_reqs=real,
+                    scaling=scale,
+                    logits_soft_cap=cap,
+                )
+            pointers = (
+                workspace.kv_chunk_size.data_ptr(),
+                workspace.miss_host_locs.data_ptr(),
+                graph_output.data_ptr(),
+            )
+            workspace.miss_host_locs.fill_(-1)
+            graph.replay()
+            record["graph_hot_vs_fi"] = difference(graph_output.clone(), reference)
+            workspace.miss_host_locs.copy_(physical.long())
+            hot_k.zero_()
+            hot_v.zero_()
+            graph.replay()
+            record["graph_mapped_vs_fi"] = difference(graph_output.clone(), reference)
+            record["graph_refill_k_exact"] = torch.equal(hot_k.cpu(), host_k)
+            record["graph_refill_v_exact"] = torch.equal(hot_v.cpu(), host_v)
+            record["graph_addresses_stable"] = pointers == (
+                workspace.kv_chunk_size.data_ptr(),
+                workspace.miss_host_locs.data_ptr(),
+                graph_output.data_ptr(),
+            )
         print(json.dumps(record), flush=True)
         records.append(record)
         torch.cuda.synchronize()
+    return records
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--snapshots", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--include-graph", action="store_true")
+    args = parser.parse_args()
+    records = replay_snapshots(args.snapshots, include_graph=args.include_graph)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps({"records": records}, indent=2) + "\n", encoding="utf-8"

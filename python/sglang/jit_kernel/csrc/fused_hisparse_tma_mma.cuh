@@ -200,6 +200,19 @@ __global__ void attention_kernel(
     }
     __syncthreads();
   }
+  // The reference FA2 kernel executes a full four-warp iteration even when
+  // the last 128-row iteration has no rows for a previously active warp.
+  // Its FMUL + FFMA + EX2 rescaling is not necessarily an exact no-op: the
+  // first product is rounded before the fused multiply/subtract. Preserve
+  // that final masked iteration without issuing zero-byte TMA operations.
+  if (warp > 0 && maximum > -INFINITY && tiles % 4 != 0 && warp > tiles % 4) {
+    const float scaled_maximum = __fmul_rn(maximum, sm_scale_log2);
+    const float alpha = exp2_approx(__fmaf_rn(maximum, sm_scale_log2, -scaled_maximum));
+    denominator *= alpha;
+    for (int dim = 0; dim < 8; ++dim) {
+      for (int item = 0; item < 8; ++item) output_frag[dim][item] *= alpha;
+    }
+  }
   // No TMA is pending. Reuse its payload storage for the four warp states.
   if (warp > 0) {
     const int kv_warp = warp - 1;
