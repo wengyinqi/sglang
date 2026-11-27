@@ -23,8 +23,11 @@ effect therefore belongs to this explicit implementation and hardware pair.
 The numerical-compatibility candidate preserves the selected-token order;
 it does not retain the initial resident-first mathematical traversal. TMA
 still retrieves K/V directly into double-buffered shared memory and the
-kernel refills hot slots. Fixed-partition probes are diagnostic evidence;
-model and larger-batch partition acceptance are separate requirements.
+kernel refills hot slots. The CPU partition planner follows the frozen FA2
+scheduler using the actual device SM count and per-step lengths. It updates
+a four-byte Graph-stable chunk-size tensor outside capture; no FlashInfer
+planning workspace is retained. Model and larger-batch acceptance remain
+separate from the isolated numerical probes.
 
 `xm_quest_bounds_offload` moves complete historical min/max summaries to a
 CPU pinned owner. Running bounds remain on the GPU. Two fixed HBM layer

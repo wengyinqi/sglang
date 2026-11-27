@@ -11,7 +11,8 @@
 // Experimental SM90 BF16 GQA path. Every selected row is read directly from
 // hot HBM or mapped host DDR by cp.async.bulk into shared memory. There is no
 // standalone host-to-HBM swap-in before attention. The scalar FP32 attention
-// path is a correctness-first implementation, not the author's FlashMLA code.
+// QK path follows FlashInfer-compatible BF16 probability/partial rounding.
+// This is a correctness-first adaptation, not the author's FlashMLA code.
 namespace xm_hisparse_tma {
 
 constexpr int kQHeads = 32;
@@ -73,11 +74,10 @@ __device__ __forceinline__ float warp_sum(float value) {
 
 template <int TopK, int Splits, int TileRows>
 struct Shared {
-  static constexpr int kSpan = (TopK + Splits - 1) / Splits;
   alignas(16) bf16_t k[2][TileRows][kDim];
   alignas(16) bf16_t v[2][TileRows][kDim];
   alignas(8) uint64_t barrier[2];
-  int ordered[kSpan];
+  int ordered[TopK];
   int count;
 };
 
@@ -123,6 +123,7 @@ __global__ void attention_kernel(
     const int32_t* device_locs,
     const int32_t* actual_lens,
     const int32_t* num_real_reqs,
+    const int32_t* kv_chunk_size,
     float* partial,
     float scaling,
     float logits_soft_cap) {
@@ -130,7 +131,9 @@ __global__ void attention_kernel(
   const int kv_head = blockIdx.y;
   const int split = blockIdx.z;
   if (num_real_reqs[0] < 0 || num_real_reqs[0] > gridDim.x ||
-      actual_lens[request] < 0 || actual_lens[request] > TopK) {
+      actual_lens[request] < 0 || actual_lens[request] > TopK ||
+      kv_chunk_size[0] < 128 || kv_chunk_size[0] > max(128, TopK) ||
+      (TopK + kv_chunk_size[0] - 1) / kv_chunk_size[0] > Splits) {
     asm volatile("trap;");
     return;
   }
@@ -145,8 +148,8 @@ __global__ void attention_kernel(
     init_barrier(&s.barrier[1]);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     s.count = 0;
-    const int first = split * Shared<TopK, Splits, TileRows>::kSpan;
-    const int last = min(min(actual_lens[request], TopK), first + Shared<TopK, Splits, TileRows>::kSpan);
+    const int first = split * kv_chunk_size[0];
+    const int last = min(min(actual_lens[request], TopK), first + kv_chunk_size[0]);
     // Preserve the selected order: BF16 probability rounding depends on the
     // 32-row local maximum, so hot/miss reordering is not numerically neutral.
     for (int i = first; i < last; ++i) {
@@ -166,11 +169,11 @@ __global__ void attention_kernel(
 
   const int query_head = kv_head * kGroup + warp - 1;
   float q_values[4] = {};
-  constexpr int kMaxTiles = (Shared<TopK, Splits, TileRows>::kSpan + TileRows - 1) / TileRows;
-  float tile_numerator[kMaxTiles][4] = {};
-  float tile_maximum[kMaxTiles];
-  float tile_denominator[kMaxTiles] = {};
-  for (int i = 0; i < kMaxTiles; ++i) tile_maximum[i] = -INFINITY;
+  constexpr int kKVWarps = 4;
+  float tile_numerator[kKVWarps][4] = {};
+  float tile_maximum[kKVWarps];
+  float tile_denominator[kKVWarps] = {};
+  for (int i = 0; i < kKVWarps; ++i) tile_maximum[i] = -INFINITY;
   const float score_scale_log2 = (logits_soft_cap > 0 ? 1.0f : scaling) * kLog2E;
   if (warp > 0) {
     for (int j = 0; j < 4; ++j) q_values[j] = __bfloat162float(q[(request * kQHeads + query_head) * kDim + lane + j * 32]);
@@ -187,8 +190,13 @@ __global__ void attention_kernel(
         s, tile + 1, request, kv_head, host_locs, device_locs, host_k, host_v, hot_k, hot_v);
     const int rows = min(TileRows, s.count - tile * TileRows);
     if (warp > 0) {
+      // FA2 has four independent KV-warp states. Each state visits 32 rows
+      // every 128 rows within this runtime-sized chunk, including when the
+      // chunk boundary is not a multiple of 32 (e.g. H800 B4 => 147 rows).
+      const int kv_warp = tile % kKVWarps;
       float scores[TileRows];
-      float maximum = -INFINITY;
+      const float previous_maximum = tile_maximum[kv_warp];
+      float maximum = previous_maximum;
       for (int r = 0; r < rows; ++r) {
         float dot = 0.0f;
         for (int j = 0; j < 4; ++j) dot = fmaf(q_values[j], __bfloat162float(s.k[buffer][r][lane + j * 32]), dot);
@@ -197,15 +205,18 @@ __global__ void attention_kernel(
         scores[r] = score;
         maximum = fmaxf(maximum, score);
       }
-      tile_maximum[tile] = maximum;
+      tile_maximum[kv_warp] = maximum;
+      const float alpha = exp2_approx(previous_maximum * score_scale_log2 - maximum * score_scale_log2);
+      tile_denominator[kv_warp] *= alpha;
+      for (int j = 0; j < 4; ++j) tile_numerator[kv_warp][j] *= alpha;
       // FlashInfer's BF16 tensor-core path rounds the unnormalized tile P
       // once and uses those same BF16 values for both rowsum and PV.
       for (int r = 0; r < rows; ++r) {
         const float probability = __bfloat162float(__float2bfloat16(
             exp2_approx(scores[r] * score_scale_log2 - maximum * score_scale_log2)));
-        tile_denominator[tile] += probability;
-        for (int j = 0; j < 4; ++j) tile_numerator[tile][j] = fmaf(
-            probability, __bfloat162float(s.v[buffer][r][lane + j * 32]), tile_numerator[tile][j]);
+        tile_denominator[kv_warp] += probability;
+        for (int j = 0; j < 4; ++j) tile_numerator[kv_warp][j] = fmaf(
+            probability, __bfloat162float(s.v[buffer][r][lane + j * 32]), tile_numerator[kv_warp][j]);
       }
       // One warp per KV head refills raw BF16; the other seven query heads
       // must not duplicate this store. Reads finish before buffer reuse.
@@ -227,13 +238,15 @@ __global__ void attention_kernel(
   }
   if (warp > 0) {
     float maximum = -INFINITY;
-    for (int tile = 0; tile < tiles; ++tile) maximum = fmaxf(maximum, tile_maximum[tile]);
+    for (int state = 0; state < kKVWarps; ++state) maximum = fmaxf(maximum, tile_maximum[state]);
     float denominator = 0.0f;
     float numerator[4] = {};
-    for (int tile = 0; tile < tiles; ++tile) {
-      const float weight = exp2_approx(tile_maximum[tile] * score_scale_log2 - maximum * score_scale_log2);
-      denominator += weight * tile_denominator[tile];
-      for (int j = 0; j < 4; ++j) numerator[j] += weight * tile_numerator[tile][j];
+    for (int state = 0; state < kKVWarps; ++state) {
+      if (tile_denominator[state] > 0) {
+        const float weight = exp2_approx(tile_maximum[state] * score_scale_log2 - maximum * score_scale_log2);
+        denominator += weight * tile_denominator[state];
+        for (int j = 0; j < 4; ++j) numerator[j] += weight * tile_numerator[state][j];
+      }
     }
     const int64_t base = ((static_cast<int64_t>(request) * kQHeads + query_head) * Splits + split) * kPartialWidth;
     // The FA2 split output is BF16 before VariableLengthMergeStates reads it.
@@ -317,12 +330,14 @@ void fused_retrieval_attention(
     tvm::ffi::TensorView device_locs,
     tvm::ffi::TensorView actual_lens,
     tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView kv_chunk_size,
     tvm::ffi::TensorView partial,
     tvm::ffi::TensorView output,
     double scaling,
     double logits_soft_cap) {
   using namespace host;
   static_assert(SGL_ARCH_HOPPER_OR_GREATER, "This TMA path requires SM90 or later");
+  static_assert(TileRows == 32 && TopK <= Splits * 128, "Invalid FA2-compatible TMA tile/partition capacity");
   RuntimeCheck(q.ndim() == 3 && q.shape()[1] == kQHeads && q.shape()[2] == kDim, "TMA GQA requires [B,32,128]");
   RuntimeCheck(is_type<bf16_t>(q.dtype()) && is_type<bf16_t>(hot_k.dtype()) && is_type<bf16_t>(hot_v.dtype()), "TMA GQA requires BF16 Q/K/V");
   RuntimeCheck(q.device().device_type == kDLCUDA, "TMA attention requires CUDA");
@@ -341,6 +356,7 @@ void fused_retrieval_attention(
       reinterpret_cast<const bf16_t*>(host_k_pointer), reinterpret_cast<const bf16_t*>(host_v_pointer), host_rows, hot_k.shape()[0],
       static_cast<const int64_t*>(miss_host_locs.data_ptr()), static_cast<const int32_t*>(device_locs.data_ptr()),
       static_cast<const int32_t*>(actual_lens.data_ptr()), static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      static_cast<const int32_t*>(kv_chunk_size.data_ptr()),
       static_cast<float*>(partial.data_ptr()), static_cast<float>(scaling), static_cast<float>(logits_soft_cap));
   LaunchKernel(dim3(batch, kQHeads), kDim, device)(
       merge_kernel<Splits>, static_cast<const float*>(partial.data_ptr()), static_cast<bf16_t*>(output.data_ptr()),

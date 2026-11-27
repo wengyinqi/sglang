@@ -106,4 +106,5 @@ def estimate_quest_auxiliary_bytes(
         total += max_reqs  # Quest-only first-decode update mask (bool)
     if xm_fused_retrieval_attention:
         total += 12 * max_reqs * top_k  # int32 hot and int64 miss plan tables
+        total += 4  # Graph-stable int32 FA2-compatible KV chunk size
     return total

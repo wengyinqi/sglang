@@ -3,8 +3,9 @@
 SGLANG_RUN_XM_TMA_GPU_TESTS=1 PYTHONPATH=python python -m unittest \
     discover -s test/manual/xm_sparse -p test_fused_hisparse_tma_gpu.py -v
 
-Qwen BF16 GQA Q32/KV4/D128, top_k=2048. Each split consumes 32
-eight-row tiles, repeatedly reusing both mbarrier phases. No model required.
+Qwen BF16 GQA Q32/KV4/D128, top_k=2048. Thirty-two-row TMA tiles
+reuse both mbarrier phases. Raw refill and FP32 reference checks are retained.
+No model required.
 """
 
 import os

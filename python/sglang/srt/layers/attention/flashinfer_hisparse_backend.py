@@ -210,6 +210,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
             coordinator.xm_fused_plan = {
                 "miss_host_locs": self._fused_tma.miss_host_locs,
                 "device_locs": self._fused_tma.device_locs,
+                "kv_chunk_size": self._fused_tma.kv_chunk_size,
             }
         coordinator.xm_fused_memory_provider = self.xm_fused_memory_inventory
 
@@ -225,6 +226,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
             "plan": {
                 "miss_host_locs": self._fused_tma.miss_host_locs,
                 "device_locs": self._fused_tma.device_locs,
+                "kv_chunk_size": self._fused_tma.kv_chunk_size,
             },
             "split_partial_workspace": self._fused_tma.partial,
             "attention_output": self._fused_tma.output,
@@ -266,7 +268,9 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         if getattr(runner, "server_args", None) is not None:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            fused = parse_hisparse_config(runner.server_args).xm_fused_retrieval_attention
+            fused = parse_hisparse_config(
+                runner.server_args
+            ).xm_fused_retrieval_attention
 
         return cls(
             quest_algorithm=quest,
@@ -376,6 +380,7 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         self._cached_sm_scale = sm_scale
         self._cached_logits_soft_cap = logits_soft_cap
         if self.xm_fused_retrieval_attention:
+            self._fused_tma.plan_partition(actual_lens_cpu)
             return
 
         self._fast_decode_plan(
@@ -661,7 +666,9 @@ class FlashInferHiSparseDecodeBackend(AttentionBackend):
         for name in ("k_scale_float", "v_scale_float"):
             scale = getattr(layer, name, None)
             if scale is not None and (type(scale) not in (int, float) or scale != 1):
-                raise ValueError("The BF16 fused TMA path does not support quantized KV scales")
+                raise ValueError(
+                    "The BF16 fused TMA path does not support quantized KV scales"
+                )
         bs = self._current_bs
         self._fused_tma.resolve(
             self.coord,

@@ -2,8 +2,9 @@
 
 This module preserves Quest selection. Resolve emits a plan without copying KV;
 the CUDA kernel reads hot or host rows by TMA into shared memory, computes
-attention, and refills misses. The FP32 scalar/Split-K implementation is an
-experimental correctness-first kernel rather than the XM-Sparse author's code.
+attention, and refills misses. Scalar FP32 QK accumulation and BF16 probability,
+partial-output and cascade rounding follow the frozen FlashInfer FA2 path.
+This is an experimental adaptation rather than the XM-Sparse author's code.
 """
 
 from __future__ import annotations
@@ -27,6 +28,34 @@ NUM_Q_HEADS = 32
 NUM_KV_HEADS = 4
 HEAD_DIM = 128
 PARTIAL_WIDTH = HEAD_DIM + 2
+
+
+def flashinfer_compatible_kv_chunk_size(
+    actual_lens: Sequence[int], num_sms: int
+) -> int:
+    """CPU FA2 decode partition for Q32/KV4/D128, NHD page_size=1.
+
+    Matches PrefillBinarySearchKVChunkSize/PrefillSplitQOKVIndptr in the
+    frozen FlashInfer runtime scheduler.cuh (SHA256
+    3fdc85c6b42d9c27fd688c614fef162bb523f3a95f095ba40dc53e3c52712c3b).
+    Decode has one packed eight-head query per request, hence one CTA Q tile.
+    The device SM count is queried once; H800's 114 SMs are not hard-coded.
+    """
+    if type(num_sms) is not int or num_sms < 2:
+        raise ValueError("FA2 partition requires a valid device SM count")
+    lengths = tuple(actual_lens)
+    if not lengths or any(type(length) is not int or length < 0 for length in lengths):
+        raise ValueError("FA2 partition lengths must be nonnegative integers")
+    max_batch_size_if_split = (2 * num_sms) // NUM_KV_HEADS
+    low, high = 128, max(1, *lengths)
+    while low < high:
+        middle = (low + high) // 2
+        split_batch = sum((max(length, 1) + middle - 1) // middle for length in lengths)
+        if split_batch > max_batch_size_if_split:
+            low = middle + 1
+        else:
+            high = middle
+    return low
 
 
 @functools.cache
@@ -89,17 +118,23 @@ class FusedHiSparseTMAWorkspace:
     ) -> None:
         if max_bs <= 0 or not 0 < top_k <= hot_buffer_size <= 32767:
             raise ValueError("Invalid TMA batch/selection/hot-buffer capacity")
+        if top_k > NUM_SPLITS * 128:
+            raise ValueError("The experimental TMA partition supports top_k <= 2048")
         if item_size_bytes != NUM_KV_HEADS * HEAD_DIM * 2:
             raise ValueError("TMA BF16 GQA requires a 1024-byte K or V row stride")
         if len(host_k_layers) != len(host_v_layers) or not host_k_layers:
             raise ValueError("TMA requires complete K/V layer owner lists")
         self.device = torch.device(
-            "cuda", device.index if device.index is not None else torch.cuda.current_device()
+            "cuda",
+            device.index if device.index is not None else torch.cuda.current_device(),
         )
         self.max_bs = max_bs
         self.top_k = top_k
         self.hot_buffer_size = hot_buffer_size
         self.item_size_bytes = item_size_bytes
+        self.num_sms = torch.cuda.get_device_properties(
+            self.device
+        ).multi_processor_count
         self.host_k_layers = tuple(host_k_layers)
         self.host_v_layers = tuple(host_v_layers)
         self._module = _jit_fused_retrieval_attention(top_k)
@@ -122,7 +157,9 @@ class FusedHiSparseTMAWorkspace:
             # and CUDA mapping even for manually cudaHostRegister'd tensors.
             k_pointer = self._module.mapped_source_pointer(k)
             v_pointer = self._module.mapped_source_pointer(v)
-            self._sources.append((k_pointer, v_pointer, k.shape[0], k.data_ptr(), v.data_ptr()))
+            self._sources.append(
+                (k_pointer, v_pointer, k.shape[0], k.data_ptr(), v.data_ptr())
+            )
         prepare_plan_cache_to_device_buffer_mha(
             item_size_bytes,
             top_k,
@@ -134,6 +171,9 @@ class FusedHiSparseTMAWorkspace:
         )
         self.device_locs = torch.full(
             (max_bs, top_k), -1, dtype=torch.int32, device=self.device
+        )
+        self.kv_chunk_size = torch.full(
+            (1,), 128, dtype=torch.int32, device=self.device
         )
         self.partial = torch.empty(
             (max_bs, NUM_Q_HEADS, NUM_SPLITS, PARTIAL_WIDTH),
@@ -148,13 +188,36 @@ class FusedHiSparseTMAWorkspace:
         return {
             "plan_host_source_bytes": self.miss_host_locs.numel() * 8,
             "plan_device_destination_bytes": self.device_locs.numel() * 4,
+            "plan_kv_chunk_size_bytes": self.kv_chunk_size.numel() * 4,
             "split_partial_workspace_bytes": self.partial.numel() * 4,
             "attention_output_bytes": self.output.numel() * 2,
         }
 
-    def resolve(self, coordinator, *, top_k_tokens, req_pool_indices, seq_lens, layer_id):
+    def plan_partition(self, actual_lens_cpu: torch.Tensor) -> int:
+        """Metadata-only update outside capture; no GPU-to-CPU readback."""
+        if (
+            actual_lens_cpu.device.type != "cpu"
+            or actual_lens_cpu.ndim != 1
+            or actual_lens_cpu.dtype not in (torch.int32, torch.int64)
+            or not 0 < actual_lens_cpu.numel() <= self.max_bs
+        ):
+            raise ValueError("TMA partition requires a CPU integer length vector")
+        lengths = actual_lens_cpu.tolist()
+        if any(length > self.top_k for length in lengths):
+            raise ValueError("TMA partition length exceeds selection capacity")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "TMA partition metadata must be updated outside Graph capture"
+            )
+        chunk_size = flashinfer_compatible_kv_chunk_size(lengths, self.num_sms)
+        self.kv_chunk_size.fill_(chunk_size)
+        return chunk_size
+
+    def resolve(
+        self, coordinator, *, top_k_tokens, req_pool_indices, seq_lens, layer_id
+    ):
         bs = top_k_tokens.shape[0]
-        if bs > self.max_bs:
+        if not 0 < bs <= self.max_bs:
             raise ValueError("TMA resolve batch exceeds preallocated capacity")
         plan_cache_to_device_buffer_mha(
             top_k_tokens=top_k_tokens,
@@ -197,10 +260,15 @@ class FusedHiSparseTMAWorkspace:
             or q.device != self.device
             or q.shape != (bs, NUM_Q_HEADS, HEAD_DIM)
             or not q.is_contiguous()
-            or bs > self.max_bs
+            or not 0 < bs <= self.max_bs
         ):
             raise ValueError("TMA query must be contiguous CUDA BF16[B,32,128]")
-        if not math.isfinite(scaling) or scaling <= 0 or not math.isfinite(logits_soft_cap) or logits_soft_cap < 0:
+        if (
+            not math.isfinite(scaling)
+            or scaling <= 0
+            or not math.isfinite(logits_soft_cap)
+            or logits_soft_cap < 0
+        ):
             raise ValueError("Invalid attention scale or logits soft cap")
         for tensor in (hot_k, hot_v):
             if (
@@ -224,9 +292,16 @@ class FusedHiSparseTMAWorkspace:
             or num_real_reqs.shape != (1,)
             or not num_real_reqs.is_contiguous()
         ):
-            raise ValueError("TMA lengths/real-batch metadata require CUDA int32 vectors")
-        k_pointer, v_pointer, host_rows, original_k, original_v = self._sources[layer_id]
-        if self.host_k_layers[layer_id].data_ptr() != original_k or self.host_v_layers[layer_id].data_ptr() != original_v:
+            raise ValueError(
+                "TMA lengths/real-batch metadata require CUDA int32 vectors"
+            )
+        k_pointer, v_pointer, host_rows, original_k, original_v = self._sources[
+            layer_id
+        ]
+        if (
+            self.host_k_layers[layer_id].data_ptr() != original_k
+            or self.host_v_layers[layer_id].data_ptr() != original_v
+        ):
             raise RuntimeError("Mapped host allocation changed after TMA preparation")
         self._module.fused_retrieval_attention(
             q,
@@ -239,6 +314,7 @@ class FusedHiSparseTMAWorkspace:
             self.device_locs[:bs],
             actual_lens[:bs],
             num_real_reqs,
+            self.kv_chunk_size,
             self.partial[:bs],
             self.output[:bs],
             scaling,
