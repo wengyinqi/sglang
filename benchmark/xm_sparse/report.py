@@ -105,7 +105,7 @@ def ranges(values, divisor=1, digits=2):
         return "未观测"
     low, high = min(values), max(values)
     return (
-        fmt(low, digits) if low == high else f"{fmt(low, digits)}–{fmt(high, digits)}"
+        fmt(low, digits) if low == high else f"{fmt(low, digits)} - {fmt(high, digits)}"
     )
 
 
@@ -1602,7 +1602,7 @@ def render_report(
 
     section("2　表 1：同实际 batch 的软件机制效果（Table 3 式归因）")
     add(
-        "下降率=(原路径间隔−新路径间隔)／原路径间隔；负值表示回退。"
+        "下降率=(原路径间隔-新路径间隔)／原路径间隔；负值表示回退。"
         "只纳入 analysis 中满足稳定步数、恒定请求集合与 decode 序号配对的样本。"
     )
     all_pairs = []
@@ -2114,7 +2114,7 @@ def render_report(
                         name,
                         stats["samples"],
                         fmt(stats["mean"]),
-                        f"{fmt(stats['min'])}–{fmt(stats['max'])}",
+                        f"{fmt(stats['min'])} - {fmt(stats['max'])}",
                     ]
                     for name, stats in kernels
                 ],
