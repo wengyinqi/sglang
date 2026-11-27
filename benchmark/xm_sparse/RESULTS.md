@@ -119,14 +119,21 @@ no skips, including the four real snapshots and B4/B8/B12 dynamic partitions.
 Source016's earlier fixture failure and skipped fixture-dependent suite test
 remain recorded rather than relabelled as passed.
 
-The source017 16K B4 fused arm has completed all four CPU-DDR/independent
-HBM Quest eager/Graph groups, including long/short/reuse and lifecycle checks:
-all greedy token IDs match and maximum selected-token logprob error is zero.
-Raw replay independently verified 127 synchronized B4 decode forwards per
-long round in every group, starting at decode ordinal 1. The remaining five
-arms are still pending; no six-arm B4 or source017 performance conclusion is
-admitted yet. Kernel snapshots, native
-instructions and synthetic batch tests do not prove full greedy generation.
+The source017 full 16K B4 model campaign completed all 24 groups: six arms,
+CPU-DDR/independent HBM Quest, eager/Graph, long/short/reuse and lifecycle.
+All greedy token IDs match and maximum selected-token logprob error is zero,
+including independent cross-arm comparison to the original baseline.
+Raw replay verified 127 synchronized B4 decode forwards per long round in
+every group, starting at decode ordinal 1. The 325-member evidence archive
+was restored and every payload size and SHA256 verified. Its SHA256 is
+`f036e4409a3b35a4415f0572b73fea897947e05f39739312e102f085554d10ad`;
+the independent full raw/cohort/cross-arm acceptance SHA256 is
+`fdf607609871d9eeb69cc2656a25c0597e98b82e203b1eb25941a5210be5c1fc`.
+This establishes the declared 16K x 4 / 128-output model gate. The mixed
+16K/32K B2 campaign is now running with an explicit 65,536-slot physical pool;
+full 32K B4 and source017 performance/capacity remain pending.
+Kernel snapshots, native instructions and synthetic batch tests do not prove
+full greedy generation at other declared contexts/batches.
 Subsequent measurements must retain the exact greedy-token
 and 0.02 logprob gate, record actual batch/cohort and separate source revisions.
 Controlled cohort TTFT includes the prefill/staging barrier; capacity scans
