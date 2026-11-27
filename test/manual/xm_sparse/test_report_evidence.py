@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -967,3 +968,85 @@ def test_completed_batch_in_failed_later_control_remains_scoped(large_contracts)
         0
     ]
     assert control["batch"] == 4 and control["summary_campaign_status"] == "failed"
+
+
+def test_rendered_metric_and_numa_scope_preserve_evidence_boundaries(
+    tmp_path, monkeypatch
+):
+    """Capture actual paragraph inputs; no PDF library or GPU is needed."""
+    paragraphs = []
+
+    class Block:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def setStyle(self, style):
+            pass
+
+        def build(self, story, **kwargs):
+            assert story
+
+    def paragraph(text, style):
+        paragraphs.append(text)
+        return Block()
+
+    colors = SimpleNamespace(HexColor=lambda value: value, white="white")
+    modules = {
+        "reportlab": SimpleNamespace(),
+        "reportlab.lib": SimpleNamespace(colors=colors),
+        "reportlab.lib.enums": SimpleNamespace(TA_LEFT=0),
+        "reportlab.lib.pagesizes": SimpleNamespace(A4=(595, 842)),
+        "reportlab.lib.styles": SimpleNamespace(ParagraphStyle=Block),
+        "reportlab.pdfbase": SimpleNamespace(
+            pdfmetrics=SimpleNamespace(registerFont=lambda font: None)
+        ),
+        "reportlab.pdfbase.ttfonts": SimpleNamespace(TTFont=Block),
+        "reportlab.platypus": SimpleNamespace(
+            Image=Block,
+            LongTable=Block,
+            PageBreak=Block,
+            Paragraph=paragraph,
+            SimpleDocTemplate=Block,
+            Spacer=Block,
+            TableStyle=Block,
+        ),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    records = [
+        {
+            "kind": "unexecuted_cli_numa_capacity_adjustment",
+            "status": "planned",
+            "scope": "Synthetic test receipt: configuration only, not model evidence",
+        },
+        {
+            "kind": "numa_placement_preflight",
+            "status": "passed",
+            "scope": "Synthetic test receipt: not actual deployment evidence",
+        },
+    ]
+    evidence = [
+        (write(tmp_path / f"numa-{index}.json", record), record)
+        for index, record in enumerate(records)
+    ]
+    REPORT.render_report(
+        [],
+        [],
+        evidence,
+        tmp_path / "unused.pdf",
+        font_path=tmp_path / "unused.ttf",
+        report_audit={
+            "status": "blocked",
+            "model_result_claims_allowed": False,
+            "failures": [],
+        },
+    )
+    text = "\n".join(paragraphs)
+    assert "TPOT=(请求时延-TTFT)/(输出 tokens-1)" in text
+    assert "已扣自身 TTFT" in text and "交错 prefill" in text
+    assert "NUMA node 0" in text and "CPU backing ratio 8" in text
+    assert "不能计作软件机制收益" in text
+    assert "计划 backing 上界与各容量点的实测 allocation 分开记录" in text
+    assert "NUMA receipt 和原始 capacity 证据" in text
+    assert "unexecuted_cli_numa_capacity_adjustment；状态：planned" in text
+    assert "numa_placement_preflight；状态：passed" in text

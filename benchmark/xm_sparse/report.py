@@ -1562,7 +1562,7 @@ def render_report(
             ],
             [
                 "TTFT／请求 TPOT",
-                "原始 HTTP 结果的 mean TTFT、每请求平均 TPOT；保留 prefill、准入、排队影响。",
+                "TTFT 含自身 prefill、准入和排队；请求 TPOT=(请求时延-TTFT)/(输出 tokens-1)，已扣自身 TTFT，但仍含 decode 调度及交错 prefill 的干扰。",
             ],
             [
                 "误差／重复",
@@ -1650,6 +1650,10 @@ def render_report(
         "配置的 cache HBM budget 不是模型、activation、Graph、驱动的总显存预算。"
         "cold NoPD 准入同时需要完整 prefill KV 与已准入/短暂共存的 hot；chunked prefill 不会逐 chunk 释放历史 KV。"
         "max-total-tokens、请求槽位、CPU backing 和准入策略也可能成为上限。已分配 GPU KV 池含 prefill/free reserve，不能全部解释为 live decode hot。"
+    )
+    add(
+        "本轮 pinned-memory 分配域固定为 NUMA node 0，未执行阶段采用 CPU backing ratio 8 是配置可行性调整，不能计作软件机制收益；"
+        "计划 backing 上界与各容量点的实测 allocation 分开记录，实际允许的 NUMA 节点、启动前检查与分配结果以提供的 NUMA receipt 和原始 capacity 证据为准。"
     )
     if capacity:
         for _, data in analyses:
@@ -2185,6 +2189,13 @@ def render_report(
             else None
         )
         add(path.name + (" / " + arm if arm else ""), "heading")
+        add(
+            "原始 receipt 类型："
+            + str(record.get("kind", record.get("phase", "未提供")))
+            + "；状态："
+            + str(record.get("status", "未记录")),
+            "small",
+        )
         if record.get("scope"):
             add("原始 scope：" + str(record["scope"]), "small")
         gpu_tests = record.get("gpu_tests")
