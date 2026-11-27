@@ -605,6 +605,7 @@ def flat_rows(samples, *, min_intervals=16):
                     "client_concurrency": sample["client_concurrency"],
                     "actual_batch": batch,
                     "repeat": sample["repeat"],
+                    "graph_enabled": sample["graph_enabled"],
                     "eligible": len(intervals) >= min_intervals,
                     "measured_intervals": len(intervals),
                     "mean_tbt_ms": gap,
@@ -897,6 +898,50 @@ def attention_profile(database, scope, *, layer_index=23):
         len(by_launch) == count,
         "Observed main graph launches differ from verified scope",
     )
+    devices = {row["device"] for rows in by_launch.values() for row in rows}
+    require(len(devices) == 1, "Main graph kernel inventory needs one device")
+    all_named = defaultdict(list)
+    graph_inventory = []
+    for correlation, rows in sorted(by_launch.items()):
+        durations = defaultdict(list)
+        for row in rows:
+            duration = (row["end"] - row["start"]) / 1000
+            all_named[row["name"]].append(duration)
+            durations[row["name"]].append(duration)
+        first, last = min(r["start"] for r in rows), max(r["end"] for r in rows)
+        active = union_ns((r["start"], r["end"]) for r in rows) / 1000
+        graph_inventory.append(
+            {
+                "correlation_id": correlation,
+                "parent_kernel_envelope_us": (last - first) / 1000,
+                "parent_kernel_active_union_us": active,
+                "parent_kernel_internal_idle_us": (last - first) / 1000 - active,
+                "kernel_invocations": {name: len(v) for name, v in durations.items()},
+                "kernel_duration_sums_us": {
+                    name: sum(v) for name, v in durations.items()
+                },
+            }
+        )
+    inventory = {
+        "graph_id": graph,
+        "device_id": next(iter(devices)),
+        "observed_decode_steps": count,
+        "kernels": {
+            name: {
+                "duration_per_invocation_us": summary(values),
+                "invocations_per_decode_step": summary(
+                    step["kernel_invocations"].get(name, 0) for step in graph_inventory
+                ),
+                "duration_sum_per_decode_step_us": summary(
+                    step["kernel_duration_sums_us"].get(name, 0)
+                    for step in graph_inventory
+                ),
+            }
+            for name, values in sorted(all_named.items())
+        },
+        "per_step": graph_inventory,
+        "scope": "All observed kernels in the verified main CUDA Graph, including before first Quest score and after attention. Child graphs, memcpy, CPU, sampling/HTTP outside this graph are excluded. Kernel-duration sums are not critical-path time or copy-engine duration.",
+    }
     spans, named = [], defaultdict(list)
     for correlation, rows in sorted(by_launch.items()):
         scores = [row for row in rows if row["kind"] == "score"]
@@ -984,6 +1029,7 @@ def attention_profile(database, scope, *, layer_index=23):
         "kernel_mean_duration_us": {
             name: summary(values) for name, values in sorted(named.items())
         },
+        "main_graph_kernel_inventory": inventory,
         "per_step": spans,
         "scope": "First Quest score to last attention/split-merge end; contiguous stage spans include internal idle gaps. Kernel sums are not critical-path time.",
         "limitations": [
@@ -1146,6 +1192,34 @@ def main(argv=None):
             }
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        with args.output.with_suffix(".main-graph-kernels.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as stream:
+            fields = (
+                "kernel",
+                "observed_invocations",
+                "mean_duration_us",
+                "mean_invocations_per_decode_step",
+                "mean_duration_sum_us_per_decode_step",
+            )
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            inventory = report.get("main_graph_kernel_inventory", {}).get("kernels", {})
+            for name, stats in inventory.items():
+                writer.writerow(
+                    dict(
+                        zip(
+                            fields,
+                            (
+                                name,
+                                stats["duration_per_invocation_us"]["samples"],
+                                stats["duration_per_invocation_us"]["mean"],
+                                stats["invocations_per_decode_step"]["mean"],
+                                stats["duration_sum_per_decode_step_us"]["mean"],
+                            ),
+                        )
+                    )
+                )
 
 
 if __name__ == "__main__":

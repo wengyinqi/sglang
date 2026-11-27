@@ -147,6 +147,7 @@ def test_complete_raw_replay_records_hashes_and_observed_batch(tmp_path):
     assert all(len(a["sha256"]) == 64 for a in report["artifacts"])
     assert report["native_source_commits"] == ["c" * 40]
     assert report["rows"][0]["actual_batch"] == 2
+    assert report["rows"][0]["graph_enabled"] is True
     assert report["rows"][0]["mean_tbt_ms"] == pytest.approx(10)
 
 
@@ -442,3 +443,52 @@ def test_profile_checksum_guard(tmp_path):
     path, scope = profile_fixture(tmp_path)
     with pytest.raises(ValueError, match="differs from verified scope"):
         A.attention_profile(path, {**scope, "sqlite_sha256": "0" * 64})
+
+
+def test_full_parent_inventory_keeps_pre_score_work_and_excludes_child_graph(tmp_path):
+    path, scope = profile_fixture(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO StringIds VALUES (?,?)", (7, "observed_wait_kernel")
+        )
+        connection.execute(
+            "INSERT INTO StringIds VALUES (?,?)", (8, "child_copy_kernel")
+        )
+        for correlation in (1, 2):
+            start = correlation * 10000
+            connection.execute(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?,?,?)",
+                (start - 20, start - 10, 0, 1, correlation, 7, 7),
+            )
+            connection.execute(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?,?,?)",
+                (start - 20, start + 4000, 0, 9, correlation, 8, 8),
+            )
+    scope["sqlite_sha256"] = A.identity(path)["sha256"]
+    result = A.attention_profile(path, scope)
+    inventory = result["main_graph_kernel_inventory"]
+    wait = inventory["kernels"]["observed_wait_kernel"]
+    assert wait["duration_per_invocation_us"]["mean"] == pytest.approx(0.01)
+    assert wait["invocations_per_decode_step"]["mean"] == 1
+    assert wait["duration_sum_per_decode_step_us"]["mean"] == pytest.approx(0.01)
+    assert "child_copy_kernel" not in inventory["kernels"]
+    assert "child_checkpoint_kernel" not in inventory["kernels"]
+    assert "observed_wait_kernel" not in result["kernel_mean_duration_us"]
+    assert result["total_path_span_us"]["mean"] == pytest.approx(0.09)
+
+
+def test_parent_kernel_per_step_statistics_include_observed_absent_steps(tmp_path):
+    path, scope = profile_fixture(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("INSERT INTO StringIds VALUES (?,?)", (7, "one_step_kernel"))
+        connection.execute(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?,?,?)",
+            (9980, 9990, 0, 1, 1, 7, 7),
+        )
+    scope["sqlite_sha256"] = A.identity(path)["sha256"]
+    kernel = A.attention_profile(path, scope)["main_graph_kernel_inventory"]["kernels"][
+        "one_step_kernel"
+    ]
+    assert kernel["duration_per_invocation_us"]["samples"] == 1
+    assert kernel["invocations_per_decode_step"]["mean"] == 0.5
+    assert kernel["duration_sum_per_decode_step_us"]["mean"] == pytest.approx(0.005)

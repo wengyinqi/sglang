@@ -23,6 +23,109 @@ def write(path, value):
     return path
 
 
+def populate_raw_correctness(root, native, *, long_round=None):
+    """Synthetic complete raw execution, with no claim of GPU/model validation."""
+    output_len = 20
+    settings = native["settings"]
+    settings.update(
+        output_len=output_len,
+        logprob_atol=0.02,
+        chunked_prefill_size=4096,
+        prefill_max_requests=1,
+        output_dir=str(root),
+    )
+    long_round = list(long_round or settings["input_lens"])
+    comparison = {
+        "exact_greedy_token_match": True,
+        "max_abs_logprob_error": 0.0,
+        "logprob_atol": 0.02,
+    }
+    for group in native["groups"]:
+        gid = group["variant"] + ("-eager" if group["eager"] else "-graph")
+        group.update(
+            id=gid,
+            rounds=[long_round, [65, 4097], long_round],
+            trace_dir=str(root / (gid + "-trace")),
+            comparison_to_cpu_hisparse=copy.deepcopy(comparison),
+            slot_reuse_comparison=copy.deepcopy(comparison),
+        )
+        rows = [
+            {
+                "type": "session",
+                "schema_version": 1,
+                "tp_size": 1,
+                "pp_size": 1,
+                "dp_size": 1,
+                "disaggregation_mode": "null",
+                "enable_mixed_chunk": False,
+                "enable_two_batch_overlap": False,
+                "speculative_algorithm": None,
+                "disable_radix_cache": True,
+                "disable_overlap_schedule": True,
+            }
+        ]
+
+        def forward(mode, ids, chunks=None):
+            rows.append(
+                {
+                    "type": "forward",
+                    "sequence": sum(row.get("type") == "forward" for row in rows),
+                    "forward_mode": mode,
+                    "request_ids": ids,
+                    "extend_lens": chunks,
+                    "success": True,
+                    "stream_id": 1,
+                }
+            )
+
+        for index, lengths in enumerate(group["rounds"]):
+            ids = [f"{gid}-round{index}-r{i}" for i in range(len(lengths))]
+            write(
+                root / f"{gid}-round{index}.json",
+                {
+                    "input_ids": [[1] * n for n in lengths],
+                    "responses": [
+                        {
+                            "output_ids": [1] * output_len,
+                            "meta_info": {
+                                "id": rid,
+                                "prompt_tokens": n,
+                                "completion_tokens": output_len,
+                                "output_token_logprobs": [[-0.1, 1, None]] * output_len,
+                            },
+                        }
+                        for rid, n in zip(ids, lengths)
+                    ],
+                },
+            )
+            for rid, length in zip(ids, lengths):
+                while length:
+                    chunk = min(length, 4096)
+                    forward("extend", [rid], [chunk])
+                    length -= chunk
+            for _ in range(output_len - 1):
+                forward("decode", ids)
+        rows.append(
+            {
+                "type": "idle_flush",
+                "last_sequence": sum(row.get("type") == "forward" for row in rows) - 1,
+            }
+        )
+        trace_path = Path(group["trace_dir"]) / "forward.jsonl"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        write(
+            root / (gid + "-server-info.json"),
+            {
+                "disable_cuda_graph": group["eager"],
+                "internal_states": [{"cuda_graph_bs": [1, 2, len(long_round)]}],
+            },
+        )
+    return native
+
+
 @pytest.fixture
 def contracts(tmp_path, monkeypatch):
     campaign_tool = REPORT.report_tool("campaign")
@@ -44,8 +147,9 @@ def contracts(tmp_path, monkeypatch):
             {
                 "arm": "fused",
                 "input_len": 32768,
-                "client_concurrency": 4,
-                "actual_batch": 4,
+                "client_concurrency": 1,
+                "actual_batch": 1,
+                "graph_enabled": True,
                 "repeat": 0,
                 "eligible": True,
                 "mean_tbt_ms": 10,
@@ -75,7 +179,7 @@ def contracts(tmp_path, monkeypatch):
     )
     comparison = {
         "exact_greedy_token_match": True,
-        "max_abs_logprob_error": 0.001,
+        "max_abs_logprob_error": 0.0,
         "logprob_atol": 0.02,
     }
     native = {
@@ -85,7 +189,7 @@ def contracts(tmp_path, monkeypatch):
         "settings": {
             "execute": True,
             "model": "/models/qwen",
-            "input_lens": [32768],
+            "input_lens": [16384, 32768],
             "workload_sha256": workload["sha256"],
         },
         "runtime": {
@@ -114,6 +218,7 @@ def contracts(tmp_path, monkeypatch):
             for eager in (True, False)
         ],
     }
+    populate_raw_correctness(tmp_path, native)
     native_path = write(tmp_path / "native-correctness.json", native)
     proof = {
         "phase": "correctness",
@@ -122,7 +227,7 @@ def contracts(tmp_path, monkeypatch):
         "workload_identity": workload,
         "settings": {
             "model": "/models/qwen",
-            "input_lens": [32768],
+            "input_lens": [16384, 32768],
             "disable_cuda_graph": False,
         },
         "cases": [
@@ -161,6 +266,240 @@ def test_complete_same_source_model_gate_allows_measurements(contracts):
     assert audit["status"] == "passed" and audit["model_result_claims_allowed"]
     assert audit["accepted_model_receipts"][0]["correctness_round_sizes"] == [2]
     assert "small HBM" in audit["scope"]
+    receipt = audit["accepted_model_receipts"][0]
+    assert receipt["hbm_context_batch_sizes"] == []
+    assert receipt["hbm_single_request_context_lengths"] == [16384, 32768]
+    replay = receipt["actual_execution"]
+    assert replay["status"] == "passed"
+    assert replay["groups"][0]["rounds"][0]["observed_actual_batches"] == [2]
+    assert "no per-forward" in replay["graph_scope"]
+
+
+def test_requested_mixed_batch_cannot_prove_same_context_main_performance(contracts):
+    contracts.data["rows"][0]["actual_batch"] = 2
+    contracts.replay.update(copy.deepcopy(contracts.data))
+    audit = REPORT.audit_report_evidence(contracts.analyses, contracts.evidence)
+    assert audit["status"] == "blocked"
+    assert "16 consecutive complete cohort" in audit["failures"][0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "output_ids",
+        "tokens",
+        "logprobs",
+        "input_length",
+        "reuse_input",
+        "missing_decode",
+        "duplicate_member",
+        "foreign_member",
+        "missing_sequence",
+        "missing_flush",
+        "mixed_stream",
+        "graph_mode",
+        "missing_graph_shape",
+    ],
+)
+def test_raw_execution_is_replayed_instead_of_trusting_success(contracts, mutation):
+    native = contracts.native
+    root = Path(contracts.evidence[1][0]).parent
+    group = native["groups"][0]
+    path = root / (group["id"] + "-round0.json")
+    payload = REPORT.read(path)
+    if mutation in ("output_ids", "tokens", "logprobs", "input_length", "reuse_input"):
+        if mutation == "output_ids":
+            payload["responses"][0]["output_ids"][0] = 9
+        elif mutation == "tokens":
+            payload["responses"][0]["output_ids"][0] = 9
+            payload["responses"][0]["meta_info"]["output_token_logprobs"][0][1] = 9
+        elif mutation == "logprobs":
+            payload["responses"][0]["meta_info"]["output_token_logprobs"][0][0] += 0.001
+        elif mutation == "input_length":
+            payload["input_ids"][0].pop()
+        else:
+            payload["input_ids"][0][0] = 9
+        write(path, payload)
+    elif mutation in ("graph_mode", "missing_graph_shape"):
+        graph = native["groups"][1]
+        path = root / (graph["id"] + "-server-info.json")
+        payload = REPORT.read(path)
+        if mutation == "graph_mode":
+            payload["cuda_graph_config"] = {"decode": {"backend": "disabled"}}
+        else:
+            payload["internal_states"][0]["cuda_graph_bs"] = [1]
+        write(path, payload)
+    else:
+        path = Path(group["trace_dir"]) / "forward.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        selected = next(row for row in rows if row.get("forward_mode") == "decode")
+        if mutation == "missing_decode":
+            rows.remove(selected)
+            forwards = [row for row in rows if row.get("type") == "forward"]
+            for i, row in enumerate(forwards):
+                row["sequence"] = i
+            rows[-1]["last_sequence"] = len(forwards) - 1
+        elif mutation == "duplicate_member":
+            selected["request_ids"].append(selected["request_ids"][0])
+        elif mutation == "foreign_member":
+            selected["request_ids"].append("unrelated-request")
+        elif mutation == "missing_sequence":
+            selected["sequence"] += 1
+        elif mutation == "missing_flush":
+            rows.pop()
+        else:
+            selected["stream_id"] = 2
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+    audit = REPORT.audit_report_evidence(contracts.analyses, contracts.evidence)
+    assert audit["status"] == "blocked", audit
+    assert not audit["model_result_claims_allowed"]
+
+
+def test_both_long_rounds_need_16_consecutive_complete_cohort_forwards(contracts):
+    native = contracts.native
+    root = Path(contracts.evidence[1][0]).parent
+    native["settings"]["input_lens"] = [32768]
+    populate_raw_correctness(root, native, long_round=[32768] * 2)
+    args = {"required_batches": [(32768, 2, True)]}
+    good = REPORT.replay_correctness_execution(contracts.evidence[1][0], native, **args)
+    assert all(
+        item["rounds"][2]["max_consecutive_full_forwards"] == 19
+        for item in good["groups"]
+    )
+    group = native["groups"][1]
+    path = Path(group["trace_dir"]) / "forward.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    target_ids = set(
+        REPORT.read(root / (group["id"] + "-round2.json"))["responses"][i]["meta_info"][
+            "id"
+        ]
+        for i in range(2)
+    )
+    changed, full = [], 0
+    for row in rows:
+        if (
+            row.get("forward_mode") == "decode"
+            and set(row["request_ids"]) == target_ids
+        ):
+            full += 1
+            if full > 15:
+                changed.extend(
+                    dict(row, request_ids=[rid]) for rid in row["request_ids"]
+                )
+                continue
+        changed.append(row)
+    forwards = [row for row in changed if row.get("type") == "forward"]
+    for i, row in enumerate(forwards):
+        row["sequence"] = i
+    changed[-1]["last_sequence"] = len(forwards) - 1
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in changed), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="16 consecutive complete cohort"):
+        REPORT.replay_correctness_execution(contracts.evidence[1][0], native, **args)
+
+
+def test_relocated_raw_correctness_uses_native_manifest_directory(contracts):
+    for group in contracts.native["groups"]:
+        group["trace_dir"] = "/results/unavailable/" + group["id"] + "-trace"
+    receipt = REPORT.replay_correctness_execution(
+        contracts.evidence[1][0], contracts.native, required_batches=[(32768, 1, True)]
+    )
+    assert receipt["status"] == "passed"
+
+
+def test_mixed_b2_member_graph_coverage_uses_actual_cohort_capture(contracts):
+    root = Path(contracts.evidence[1][0]).parent
+    for group in contracts.native["groups"]:
+        if not group["eager"]:
+            path = root / (group["id"] + "-server-info.json")
+            payload = REPORT.read(path)
+            payload["internal_states"][0]["cuda_graph_bs"] = [2]
+            write(path, payload)
+    replay = REPORT.replay_correctness_execution(
+        contracts.evidence[1][0], contracts.native, required_batches=[(32768, 1, True)]
+    )
+    assert replay["status"] == "passed"
+    assert replay["groups"][1]["rounds"][0]["observed_actual_batches"] == [2]
+
+
+def test_legacy_flat_row_recovers_actual_eager_mode_from_matching_sample(contracts):
+    data = copy.deepcopy(contracts.data)
+    data["rows"][0].pop("graph_enabled")
+    data["samples"] = [dict(data["rows"][0], graph_enabled=False)]
+    assert REPORT._required_correctness_batches(data, "fused") == [(32768, 1, False)]
+    assert REPORT.measurement_scope(data)[3] is False
+    data["samples"] = []
+    with pytest.raises(ValueError, match="actual measurement Graph mode"):
+        REPORT.measurement_scope(data)
+
+
+@pytest.mark.parametrize("measurement_graph", [True, False])
+@pytest.mark.parametrize("missing", ["cohort", "second_long_round", "capture"])
+def test_small_hbm_capacity_coverage_intersects_required_modes_and_long_rounds(
+    contracts, measurement_graph, missing
+):
+    native = contracts.native
+    root = Path(contracts.evidence[1][0]).parent
+    native["settings"]["input_lens"] = [32768]
+    populate_raw_correctness(root, native, long_round=[32768] * 2)
+    graph = next(
+        group
+        for group in native["groups"]
+        if group["variant"] == "hbm" and not group["eager"]
+    )
+    if missing == "capture":
+        path = root / (graph["id"] + "-server-info.json")
+        payload = REPORT.read(path)
+        payload["internal_states"][0]["cuda_graph_bs"] = [1]
+        write(path, payload)
+    else:
+        path = Path(graph["trace_dir"]) / "forward.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        targets = {
+            response["meta_info"]["id"]
+            for response in REPORT.read(root / (graph["id"] + "-round2.json"))[
+                "responses"
+            ]
+        }
+        changed = []
+        for row in rows:
+            if row.get("forward_mode") == "decode" and (
+                missing == "cohort" or set(row["request_ids"]) == targets
+            ):
+                changed.extend(
+                    dict(row, request_ids=[rid]) for rid in row["request_ids"]
+                )
+            else:
+                changed.append(row)
+        forwards = [row for row in changed if row.get("type") == "forward"]
+        for i, row in enumerate(forwards):
+            row["sequence"] = i
+        changed[-1]["last_sequence"] = len(forwards) - 1
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in changed), encoding="utf-8"
+        )
+    data = copy.deepcopy(contracts.data)
+    data["phase"] = "capacity"
+    data["rows"][0].update(actual_batch=2, graph_enabled=measurement_graph)
+    receipts = REPORT.verify_model_receipt(
+        contracts.evidence[0][0],
+        contracts.proof,
+        contracts.evidence,
+        data,
+        {"/models/qwen"},
+    )
+    assert receipts[0]["hbm_context_batch_sizes"] == (
+        [] if measurement_graph else [(32768, 2)]
+    )
+    assert receipts[0]["hbm_batch_coverage_modes"] == (
+        ["eager", "graph"] if measurement_graph else ["eager"]
+    )
+    assert receipts[0]["hbm_single_request_context_lengths"] == (
+        [] if measurement_graph and missing == "capture" else [32768]
+    )
 
 
 @pytest.mark.parametrize(
@@ -361,17 +700,23 @@ def test_two_analyses_can_bind_different_same_source_correctness_proofs(
 ):
     first = contracts.data
     second = copy.deepcopy(first)
-    second["rows"][0]["actual_batch"] = 8
+    second["rows"][0]["actual_batch"] = 2
     proof = copy.deepcopy(contracts.proof)
-    proof["settings"]["control_batch"] = 4
-    proof_path = write(tmp_path / "correctness-b4.json", proof)
+    proof["settings"].update(control_batch=2, input_lens=[32768])
+    second_native = copy.deepcopy(contracts.native)
+    second_native["settings"]["input_lens"] = [32768]
+    native_root = tmp_path / "second-proof" / "evidence"
+    populate_raw_correctness(native_root, second_native, long_round=[32768] * 2)
+    write(native_root / "manifest.json", second_native)
+    proof["cases"][0]["stage_path"] = str(native_root.parent / "stage.json")
+    proof_path = write(tmp_path / "correctness-b2.json", proof)
     campaign = write(
         tmp_path / "campaign-b4.json",
         {"phase": "performance", "correctness_gate": REPORT.identity(proof_path)},
     )
     second["artifacts"][0] = REPORT.identity(campaign)
     path = write(tmp_path / "analysis-b4.json", second)
-    campaign_tool = REPORT.report_tool("campaign")
+    real_tool = REPORT.report_tool
     replays = {
         first["artifacts"][0]["path"]: first,
         second["artifacts"][0]["path"]: second,
@@ -385,7 +730,7 @@ def test_two_analyses_can_bind_different_same_source_correctness_proofs(
                 equal=lambda a, b: a == b,
             )
             if name == "analyze"
-            else campaign_tool
+            else real_tool(name)
         ),
     )
     audit = REPORT.audit_report_evidence(
@@ -398,7 +743,7 @@ def test_two_analyses_can_bind_different_same_source_correctness_proofs(
         len(bindings) == 2
         and bindings[0]["proof"]["sha256"] != bindings[1]["proof"]["sha256"]
     )
-    assert [b["actual_measurement_batches"] for b in bindings] == [[4], [8]]
+    assert [b["actual_measurement_batches"] for b in bindings] == [[1], [2]]
 
 
 def test_unbound_original_campaign_cannot_borrow_another_passed_proof(contracts):
@@ -511,9 +856,9 @@ def large_contracts(contracts, tmp_path):
         small["settings"].update(
             input_lens=[length], workload_sha256=workload["sha256"]
         )
-        for group in small["groups"]:
-            group["rounds"] = [[length, length]]
-        path = write(tmp_path / ("small-" + arm + ".json"), small)
+        raw_root = tmp_path / ("small-" + arm) / "evidence"
+        populate_raw_correctness(raw_root, small, long_round=[length] * 2)
+        path = write(raw_root / "manifest.json", small)
         small_natives[arm] = (path, small)
         evidence.append((path, small))
         proof["cases"].append(

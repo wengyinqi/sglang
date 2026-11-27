@@ -324,6 +324,26 @@ def _native_correctness(proof_path, case, evidence):
     return candidates[0]
 
 
+def measurement_graph(data, row, *, arm=None):
+    if type(row.get("graph_enabled")) is bool:
+        return row["graph_enabled"]
+    arm = arm or row.get("arm")
+    matches = {
+        sample.get("graph_enabled")
+        for sample in data.get("samples", [])
+        if sample.get("arm") == arm
+        and all(
+            sample.get(key) == row.get(key)
+            for key in ("input_len", "client_concurrency", "repeat")
+        )
+    }
+    require(
+        len(matches) == 1 and all(type(value) is bool for value in matches),
+        "Missing unambiguous actual measurement Graph mode",
+    )
+    return matches.pop()
+
+
 def measurement_scope(data):
     arms, lengths, graph = set(), set(), False
     rows = data.get("rows", []) + data.get("samples", [])
@@ -335,16 +355,331 @@ def measurement_scope(data):
     for row in rows:
         arms.add(row["arm"])
         lengths.add(row["input_len"])
-        graph |= row.get("graph_enabled", not data.get("samples")) is True
+        graph |= measurement_graph(data, row)
     for row in data.get("same_actual_batch_comparisons", []):
         arms.update((row["baseline"], row["changed"]))
         lengths.add(row["input_len"])
-        graph |= row.get("graph_enabled", True) is True
+        graph |= measurement_graph(data, row, arm=row["baseline"])
     for row in data.get("observed_stable_capacity_points", []):
         arms.add(row["arm"])
         lengths.add(row["input_len"])
-        graph |= row.get("graph_enabled", True) is True
+        graph |= measurement_graph(data, row)
     return observed, arms, lengths, graph
+
+
+def replay_correctness_execution(native_path, native, *, required_batches=()):
+    """Replay raw single-compute rounds; requested concurrency is not batch proof.
+
+    ``required_batches`` contains ``(context_length, actual_batch, graph_enabled)``.
+    B1 can be covered by a member of a mixed-context cohort. B>1 requires the
+    same-context complete cohort in both long rounds, including 16 consecutive
+    decode forwards. Graph evidence is server mode/captured shape/cohort only.
+    """
+    tool = report_tool("summary_batch_correctness")
+    compare, run = tool.CORRECTNESS.COMPARE, tool.CORRECTNESS.RUN
+    settings = native.get("settings", {})
+    output_len, atol = settings.get("output_len"), settings.get("logprob_atol")
+    require(
+        type(output_len) is int and output_len >= 2, "Missing correctness output length"
+    )
+    number(atol)
+    require(atol <= 0.02, "Correctness replay cannot loosen frozen logprob tolerance")
+    groups = native.get("groups", [])
+    require(
+        groups and groups[0].get("variant") == "cpu",
+        "Missing first CPU correctness reference",
+    )
+    require(
+        len({g.get("id") for g in groups}) == len(groups),
+        "Duplicate correctness group identity",
+    )
+    for _, _, graph in required_batches:
+        require(
+            {g.get("variant") for g in groups if g.get("eager") is not graph}
+            >= {"cpu", "hbm"},
+            "Required actual correctness Graph/eager CPU/HBM groups are missing",
+        )
+    reference, reference_inputs, receipts, used_ids = None, None, [], set()
+    for group in groups:
+        require(
+            group.get("status") == "success",
+            "Cannot replay failed correctness group as passed",
+        )
+        gid = group.get("id")
+        require(
+            isinstance(gid, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", gid),
+            "Missing safe correctness group identity",
+        )
+        root = Path(native_path).parent
+        declared = Path(group.get("trace_dir", ""))
+        trace_dir = declared if declared.is_dir() else root / (gid + "-trace")
+        paths = sorted(trace_dir.glob("*.jsonl"))
+        require(
+            len(paths) == 1, "Require one complete single-compute correctness trace"
+        )
+        trace = [
+            json.loads(line)
+            for line in paths[0].read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        require(
+            trace and trace[-1].get("type") == "idle_flush",
+            "Missing final correctness idle flush",
+        )
+        run.ANALYZE._validate_session(trace[0])
+        require(
+            trace[0].get("disable_overlap_schedule") is True,
+            "Correctness replay requires disabled overlap scheduler",
+        )
+        require(
+            sum(row.get("type") == "session" for row in trace) == 1,
+            "Correctness trace has multiple scheduler lifetimes",
+        )
+        forwards = [row for row in trace if row.get("type") == "forward"]
+        require(
+            forwards
+            and [row.get("sequence") for row in forwards] == list(range(len(forwards)))
+            and trace[-1].get("last_sequence") == len(forwards) - 1,
+            "Incomplete or reordered correctness forward trace",
+        )
+        info_path = root / f"{gid}-server-info.json"
+        info = read(info_path)
+        enabled = run.decode_graph_enabled(info)
+        require(
+            type(group.get("eager")) is bool and enabled is not group["eager"],
+            "Observed server Graph mode differs from correctness group",
+        )
+        states = info.get("internal_states", [])
+        require(len(states) == 1, "Missing single-compute correctness server state")
+        shapes = states[0].get("cuda_graph_bs", [])
+        rounds = group.get("rounds", [])
+        require(
+            len(rounds) == 3 and rounds[0] == rounds[2],
+            "Correctness requires complete long-short-long rounds",
+        )
+        require(
+            set(settings.get("input_lens", [])) <= set(rounds[0]),
+            "Correctness long round misses declared contexts",
+        )
+        normalized, inputs, round_receipts = [], [], []
+        for index, lengths in enumerate(rounds):
+            response_path = root / f"{gid}-round{index}.json"
+            payload = read(response_path)
+            outputs = payload.get("responses")
+            records = compare.normalize_outputs(outputs, lengths, output_len)
+            prompt_ids = payload.get("input_ids")
+            require(
+                isinstance(prompt_ids, list)
+                and len(prompt_ids) == len(lengths)
+                and all(
+                    isinstance(ids, list)
+                    and len(ids) == n
+                    and all(type(token) is int for token in ids)
+                    for ids, n in zip(prompt_ids, lengths)
+                ),
+                "Raw correctness inputs differ from requested prompt lengths",
+            )
+            require(
+                all(
+                    output.get("output_ids") == record["tokens"]
+                    for output, record in zip(outputs, records)
+                ),
+                "Raw output token IDs differ from logprob token IDs",
+            )
+            ids = [output["meta_info"].get("id") for output in outputs]
+            require(
+                all(isinstance(rid, str) and rid for rid in ids)
+                and len(set(ids)) == len(ids)
+                and not used_ids.intersection((gid, rid) for rid in ids),
+                "Missing or reused correctness request identities",
+            )
+            used_ids.update((gid, rid) for rid in ids)
+            members = set(ids)
+            rows = [
+                row
+                for row in forwards
+                if members.intersection(row.get("request_ids", []))
+            ]
+            require(
+                rows
+                and all(
+                    row.get("success") is True
+                    and set(row.get("request_ids", [])) <= members
+                    and len(row["request_ids"]) == len(set(row["request_ids"]))
+                    for row in rows
+                ),
+                "Mixed, duplicate, or failed correctness round forwards",
+            )
+            streams = {row.get("stream_id") for row in rows}
+            require(
+                len(streams) == 1 and None not in streams,
+                "Correctness round requires one actual compute stream",
+            )
+            require(
+                not any(
+                    rows[0]["sequence"] <= row["sequence"] <= rows[-1]["sequence"]
+                    and not members.intersection(row.get("request_ids", []))
+                    for row in forwards
+                ),
+                "Unrelated forwards overlap correctness round",
+            )
+            prefill, decode = dict.fromkeys(ids, 0), dict.fromkeys(ids, 0)
+            for row in rows:
+                if row.get("forward_mode") == "extend":
+                    chunks = row.get("extend_lens")
+                    require(
+                        isinstance(chunks, list)
+                        and len(chunks) == len(row["request_ids"])
+                        and all(type(n) is int and n > 0 for n in chunks),
+                        "Missing actual correctness prefill chunks",
+                    )
+                    require(
+                        len(chunks) <= settings.get("prefill_max_requests", 0)
+                        and sum(chunks) <= settings.get("chunked_prefill_size", 0),
+                        "Correctness prefill exceeded guarded request/chunk configuration",
+                    )
+                    for rid, count in zip(row["request_ids"], chunks):
+                        prefill[rid] += count
+                elif row.get("forward_mode") == "decode":
+                    for rid in row["request_ids"]:
+                        decode[rid] += 1
+                else:
+                    raise ValueError("Unknown correctness forward mode")
+            require(
+                prefill == dict(zip(ids, lengths))
+                and decode == dict.fromkeys(ids, output_len - 1),
+                "Actual correctness prefill/decode counts differ from complete responses",
+            )
+            full = [
+                row["sequence"]
+                for row in rows
+                if row["forward_mode"] == "decode"
+                and set(row["request_ids"]) == members
+            ]
+            streak = longest = 0
+            previous = None
+            for sequence in full:
+                streak = (
+                    streak + 1
+                    if previous is not None and sequence == previous + 1
+                    else 1
+                )
+                longest = max(longest, streak)
+                previous = sequence
+            round_receipts.append(
+                {
+                    "round": index,
+                    "context_lengths": lengths,
+                    "request_ids": ids,
+                    "response": identity(response_path),
+                    "observed_actual_batches": sorted(
+                        {
+                            len(row["request_ids"])
+                            for row in rows
+                            if row["forward_mode"] == "decode"
+                        }
+                    ),
+                    "full_actual_decode_sequences": full,
+                    "max_consecutive_full_forwards": longest,
+                    "complete_request_decode_forwards": decode,
+                    "request_observed_actual_batches": {
+                        rid: sorted(
+                            {
+                                len(row["request_ids"])
+                                for row in rows
+                                if row["forward_mode"] == "decode"
+                                and rid in row["request_ids"]
+                            }
+                        )
+                        for rid in ids
+                    },
+                }
+            )
+            normalized.append(records)
+            inputs.append(prompt_ids)
+        require(inputs[0] == inputs[2], "Long-round slot reuse inputs changed")
+        if reference is None:
+            reference, reference_inputs = normalized, inputs
+        require(inputs == reference_inputs, "CPU/HBM correctness prompts differ")
+        recomputed = compare.compare(reference, normalized, atol)
+        reuse = compare.compare([normalized[0]], [normalized[2]], atol)
+        require(
+            recomputed == group.get("comparison_to_cpu_hisparse")
+            and reuse == group.get("slot_reuse_comparison"),
+            "Correctness token/logprob or slot-reuse receipt differs from raw responses",
+        )
+        for length, batch, graph in required_batches:
+            if enabled != graph:
+                continue
+            for item in (round_receipts[0], round_receipts[2]):
+                require(
+                    length in item["context_lengths"],
+                    "Measured context lacks complete actual correctness execution",
+                )
+                if graph:
+                    require(
+                        all(
+                            set(
+                                item["request_observed_actual_batches"][rid]
+                            ).intersection(shapes)
+                            for rid, n in zip(
+                                item["request_ids"], item["context_lengths"]
+                            )
+                            if n == length
+                        ),
+                        "Actual correctness cohort shape is absent from Graph capture configuration",
+                    )
+                if batch > 1:
+                    require(
+                        item["context_lengths"] == [length] * batch
+                        and item["max_consecutive_full_forwards"] >= 16,
+                        f"Actual B={batch}, input={length} lacks 16 consecutive complete cohort decode forwards in both long correctness rounds",
+                    )
+                    require(
+                        not graph or batch in shapes,
+                        "Actual correctness batch shape is absent from Graph capture configuration",
+                    )
+        receipts.append(
+            {
+                "id": gid,
+                "variant": group.get("variant"),
+                "eager": group["eager"],
+                "actual_graph_enabled": enabled,
+                "captured_shapes": shapes,
+                "trace": identity(paths[0]),
+                "server_info": identity(info_path),
+                "rounds": round_receipts,
+                "comparison_to_cpu_hisparse": recomputed,
+                "slot_reuse_comparison": reuse,
+            }
+        )
+    return {
+        "kind": "cpu_replay_actual_correctness_batch",
+        "status": "passed",
+        "graph_scope": "Actual server mode, captured shapes and request cohort; this observer emits no per-forward Graph replay flag",
+        "groups": receipts,
+    }
+
+
+def _required_correctness_batches(data, arm):
+    if data.get("phase") != "performance":
+        return []
+    required = set()
+    for row in data.get("rows", []):
+        if row.get("arm") == arm and row.get("eligible") is True:
+            required.add(
+                (row["input_len"], row["actual_batch"], measurement_graph(data, row))
+            )
+    for row in data.get("same_actual_batch_comparisons", []):
+        if arm in (row.get("baseline"), row.get("changed")):
+            required.add(
+                (
+                    row["input_len"],
+                    row["actual_batch_size"],
+                    measurement_graph(data, row, arm=arm),
+                )
+            )
+    return sorted(required)
 
 
 def verify_model_receipt(proof_path, proof, evidence, data, benchmark_models):
@@ -460,6 +795,46 @@ def verify_model_receipt(proof_path, proof, evidence, data, benchmark_models):
                 and {"abort_prefill", "abort_decode", "retract_decode"} <= lifecycle,
                 "Missing actual abort/retract recovery proof",
             )
+        actual_execution = replay_correctness_execution(
+            native_path,
+            native,
+            required_batches=_required_correctness_batches(data, arm),
+        )
+        hbm_groups = [
+            group
+            for group in actual_execution["groups"]
+            if group["variant"] == "hbm" and group["eager"] in modes
+        ]
+        hbm_coverage, hbm_single_coverage = [], []
+        for group in hbm_groups:
+            round_pairs, round_contexts = [], []
+            for item in (group["rounds"][0], group["rounds"][2]):
+                size = len(item["request_ids"])
+                round_pairs.append(
+                    {(item["context_lengths"][0], size)}
+                    if len(set(item["context_lengths"])) == 1
+                    and item["full_actual_decode_sequences"]
+                    and (group["eager"] or size in group["captured_shapes"])
+                    else set()
+                )
+                round_contexts.append(
+                    {
+                        length
+                        for length in set(item["context_lengths"])
+                        if group["eager"]
+                        or all(
+                            set(
+                                item["request_observed_actual_batches"][rid]
+                            ).intersection(group["captured_shapes"])
+                            for rid, n in zip(
+                                item["request_ids"], item["context_lengths"]
+                            )
+                            if n == length
+                        )
+                    }
+                )
+            hbm_coverage.append(set.intersection(*round_pairs))
+            hbm_single_coverage.append(set.intersection(*round_contexts))
         accepted.append(
             {
                 "arm": arm,
@@ -469,15 +844,12 @@ def verify_model_receipt(proof_path, proof, evidence, data, benchmark_models):
                 "correctness_round_sizes": sorted(
                     {len(r) for g in groups for r in g.get("rounds", [])}
                 ),
-                "hbm_context_batch_sizes": sorted(
-                    {
-                        (length, len(round_))
-                        for group in groups
-                        if group.get("variant") == "hbm"
-                        for round_ in group.get("rounds", [])
-                        for length in round_
-                    }
+                "hbm_context_batch_sizes": sorted(set.intersection(*hbm_coverage)),
+                "hbm_batch_coverage_modes": ["eager", "graph"] if graph else ["eager"],
+                "hbm_single_request_context_lengths": sorted(
+                    set.intersection(*hbm_single_coverage)
                 ),
+                "actual_execution": actual_execution,
             }
         )
     return accepted
@@ -740,6 +1112,10 @@ def audit_large_capacity_controls(data, proof_path, proof, receipts, evidence):
     covered = {
         item["arm"]: item.get("hbm_context_batch_sizes", []) for item in receipts
     }
+    single_requests = {
+        item["arm"]: item.get("hbm_single_request_context_lengths", [])
+        for item in receipts
+    }
     required = set()
     rows = [row for row in data.get("rows", []) if row.get("eligible") is True]
     rows += data.get("observed_stable_capacity_points", [])
@@ -752,7 +1128,10 @@ def audit_large_capacity_controls(data, proof_path, proof, receipts, evidence):
             "combined",
             "combined-protected",
         ):
-            small = max((b for n, b in covered.get(arm, []) if n == length), default=0)
+            small = max(
+                (b for n, b in covered.get(arm, []) if n == length),
+                default=int(length in single_requests.get(arm, [])),
+            )
             if batch > small:
                 require(
                     arm == "combined-protected",
